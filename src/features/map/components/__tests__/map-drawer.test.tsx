@@ -1,7 +1,8 @@
-import { ScrollView, Text, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 import { CryptidThemes } from '@/constants/cryptid-theme';
+import { GRIP_HEIGHT, TAB_BAR_HEIGHT } from '../../core/drawer-detents';
 import { MapDrawer } from '../map-drawer';
 
 type PanEvent = { translationY: number; velocityY: number };
@@ -69,6 +70,7 @@ jest.mock('react-native-reanimated', () => {
     runOnJS: (fn: () => void) => fn,
     withSpring: (value: number) => value,
     withTiming: (value: number) => value,
+    withDelay: (_delay: number, value: number) => value,
   };
 });
 jest.mock('../island-tabs', () => ({ IslandTabs: () => null }));
@@ -145,7 +147,11 @@ describe('MapDrawer grip', () => {
   it('leaves a downward drag to a list that is scrolled down', () => {
     const onDetentChange = render('full', 900);
     act(() => {
-      renderer.root.findByType(ScrollView).props.onScroll.onScroll({ contentOffset: { y: 300 } });
+      renderer.root.findByType(ScrollView).props.onScroll.onScroll({
+        contentOffset: { y: 300 },
+        contentSize: { height: 900 },
+        layoutMeasurement: { height: 600 },
+      });
       const body = mockPans[mockPans.length - 1];
       body.start?.();
       body.update?.({ translationY: 200, velocityY: 0 });
@@ -167,6 +173,15 @@ describe('MapDrawer grip', () => {
 
   it('scrolls a body that does not fit', () => {
     render('full', 900);
+    expect(renderer.root.findByType(ScrollView).props.scrollEnabled).toBe(true);
+  });
+
+  // The roster reported at full on iPhone: the docked sheet's tab row takes the 34pt bottom inset
+  // back as padding inside the drawer, and a list overflowing by less than that was judged to fit,
+  // so every drag on it resized the panel instead of scrolling.
+  it('scrolls at full a list that overflows only into the docked tab row', () => {
+    const full = 844 - 59 - 16;
+    render('full', full - TAB_BAR_HEIGHT - GRIP_HEIGHT - 10);
     expect(renderer.root.findByType(ScrollView).props.scrollEnabled).toBe(true);
   });
 
@@ -465,6 +480,41 @@ describe('MapDrawer header', () => {
     render('peek');
     const content = renderer.root.findByType(ScrollView).props.contentContainerStyle;
     expect(content).toEqual(expect.arrayContaining([{ paddingTop: 34 }]));
+  });
+
+  // Drawn by the drawer on every platform: a native indicator is inset on iOS only, and Android's
+  // would run under the floating header.
+  it('draws its own scroll thumb under the header, sized to the list, gone once it rests', () => {
+    render('full');
+    const list = renderer.root.findByType(ScrollView);
+    expect(list.props.showsVerticalScrollIndicator).toBe(false);
+    const thumb = () =>
+      StyleSheet.flatten(
+        renderer.root.findAll((node) => node.props.testID === 'map-drawer-scroll-indicator')[0]
+          .props.style
+      );
+    const relayout = (height: number) =>
+      act(() => {
+        measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height } } });
+      });
+    expect(thumb().opacity).toBe(0);
+    // Ten pixels in: the header is still showing, so the track starts below it.
+    act(() => {
+      list.props.onScroll.onScroll({
+        contentOffset: { y: 10 },
+        contentSize: { height: 1000 },
+        layoutMeasurement: { height: 500 },
+      });
+    });
+    relayout(600);
+    const top = 3 + 34 - 10;
+    const track = 500 - top - 3;
+    const size = (track * 500) / 1000;
+    expect(thumb()).toMatchObject({ height: size, top: top + ((track - size) * 10) / 500 });
+    expect(thumb().opacity).toBeGreaterThan(0);
+    act(() => list.props.onScroll.onEndDrag());
+    relayout(700);
+    expect(thumb().opacity).toBe(0);
   });
 
   it('is a handle: dragging it down shrinks the drawer', () => {

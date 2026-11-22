@@ -12,6 +12,7 @@ import Animated, {
   useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
+  withDelay,
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
@@ -29,6 +30,7 @@ import {
   TAB_BAR_HEIGHT,
   type DrawerDetent,
 } from '../core/drawer-detents';
+import { formatColor, parseColor } from '../theme/derive-chrome';
 import { DrawerProgressContext } from './drawer-progress';
 import { GlassFill, useGlassAvailable } from './glass-surface';
 import { IslandTabs, type IslandTab } from './island-tabs';
@@ -68,6 +70,32 @@ const MIN_EDGE_GAP = Spacing.two;
 
 /** Scroll (px) over which a floating header's backdrop fades in once the list runs under it. */
 const HEADER_BACKDROP_SPAN = 12;
+
+/**
+ * The floating header's backdrop: the island's own tint, strongest behind the title and fading to
+ * nothing a little below it, so rows pass under a soft edge rather than an opaque bar. It was a
+ * solid `chrome.island` with a hairline, which over liquid glass — mostly map showing through —
+ * read as a white slab laid on the sheet. Alphas are the tint's, over whatever the sheet is.
+ */
+const HEADER_TINT_TOP = 0.7;
+const HEADER_TINT_EDGE = 0.45;
+/** How far (px) below the header the backdrop keeps fading. */
+const HEADER_FADE = 16;
+
+/**
+ * The list's scroll indicator is drawn here, not by the platform. Native indicators differ in
+ * every way that matters on this surface — iOS insets its own and flashes it, Android has no inset
+ * at all and would run its thumb under the floating header — and the drawer has been bitten once
+ * already by a list that behaved on one platform and not the other. One thumb, same everywhere.
+ */
+const INDICATOR_WIDTH = 3;
+const INDICATOR_INSET = 3;
+const INDICATOR_MIN = 32;
+/** The thumb is `chrome.steel` at this strength: legible on daybreak's white and the night sheets. */
+const INDICATOR_ALPHA = 0.55;
+/** How long (ms) the thumb stays after the list comes to rest, and how long it takes to go. */
+const INDICATOR_LINGER = 600;
+const INDICATOR_FADE = 250;
 
 interface MapDrawerProps {
   readonly children: ReactNode;
@@ -183,6 +211,10 @@ export function MapDrawer({
   const scrollY = useSharedValue(0);
   const headerSpan = useSharedValue(0);
   const headerHidden = useSharedValue(0);
+  // What the scroll events report about the list's geometry, for the drawn indicator.
+  const scrollContent = useSharedValue(0);
+  const scrollFrame = useSharedValue(0);
+  const indicatorOpacity = useSharedValue(0);
 
   const detents = useMemo(() => allowedDetents(maxDetent, minDetent), [maxDetent, minDetent]);
   const topDetent = detents[detents.length - 1];
@@ -241,8 +273,18 @@ export function MapDrawer({
    */
   // `collapsed` is a one-line summary even when it is the only stop: a body pinned there is far
   // taller than the row it shows, and treating it as a list would let that clipped readout scroll.
-  const listScrolls =
-    effective !== 'collapsed' && headerHeight + contentHeight > resolved - bodyChrome + 1;
+  //
+  // The frame is net of the DOCK too: as the sheet docks, the tab row takes the island's bottom
+  // margin back as padding (`tabPadStyle`), and that padding is inside the drawer. Leaving it out
+  // over-stated the frame at `full` by the bottom inset — 34pt on an iPhone, a few or none on
+  // Android — so a roster that overflowed by less than that was judged to fit, lost its scrolling,
+  // and turned every drag into a resize. That is why only iOS showed it.
+  const dockSpread = heights[topDetent] > heights[detents[0]];
+  const restDock = dockSpread
+    ? Math.min(1, Math.max(0, (resolved - (heights.full - DOCK_SPAN)) / DOCK_SPAN))
+    : 0;
+  const restFrame = resolved - bodyChrome - restMargin * restDock;
+  const listScrolls = effective !== 'collapsed' && headerHeight + contentHeight > restFrame + 1;
 
   /**
    * Where the drawer stands between `collapsed` and `peek`, frame by frame, for the body to morph
@@ -397,6 +439,10 @@ export function MapDrawer({
       const y = event.contentOffset.y;
       const dy = y - scrollY.value;
       scrollY.value = y;
+      scrollContent.value = event.contentSize.height;
+      scrollFrame.value = event.layoutMeasurement.height;
+      // Plain assignment, which also cancels a fade the end of a drag queued before momentum.
+      if (dy !== 0) indicatorOpacity.value = 1;
       headerHidden.value =
         y <= 0 ? 0 : Math.min(headerSpan.value, Math.max(0, headerHidden.value + dy));
     },
@@ -405,6 +451,10 @@ export function MapDrawer({
     },
     onEndDrag: () => {
       gestureActive.value = false;
+      indicatorOpacity.value = withDelay(
+        INDICATOR_LINGER,
+        withTiming(0, { duration: INDICATOR_FADE })
+      );
       const span = headerSpan.value;
       const hidden = headerHidden.value;
       if (hidden > 0 && hidden < span) {
@@ -414,6 +464,10 @@ export function MapDrawer({
       }
     },
     onMomentumEnd: () => {
+      indicatorOpacity.value = withDelay(
+        INDICATOR_LINGER,
+        withTiming(0, { duration: INDICATOR_FADE })
+      );
       const span = headerSpan.value;
       const hidden = headerHidden.value;
       if (hidden > 0 && hidden < span) {
@@ -429,6 +483,23 @@ export function MapDrawer({
   const headerBackdropStyle = useAnimatedStyle(() => ({
     opacity: interpolate(scrollY.value, [0, HEADER_BACKDROP_SPAN], [0, 1], 'clamp'),
   }));
+  // The thumb's track starts under the header as far as the header is showing, so it slides up
+  // with the header as that hides and never runs beneath the title.
+  const indicatorStyle = useAnimatedStyle(() => {
+    const frame = scrollFrame.value;
+    const content = scrollContent.value;
+    const range = content - frame;
+    const top = INDICATOR_INSET + headerSpan.value - headerHidden.value;
+    const track = frame - top - INDICATOR_INSET;
+    if (range <= 0.5 || track <= 0) return { opacity: 0, height: 0, top: 0 };
+    const thumb = Math.min(track, Math.max(INDICATOR_MIN, (track * frame) / content));
+    const at = Math.min(1, Math.max(0, scrollY.value / range));
+    return {
+      opacity: INDICATOR_ALPHA * indicatorOpacity.value,
+      height: thumb,
+      top: top + (track - thumb) * at,
+    };
+  });
 
   const dockStyle = useAnimatedStyle(() => {
     const dock =
@@ -505,6 +576,16 @@ export function MapDrawer({
 
   const expand = useCallback(() => step(1), [step]);
 
+  const headerBackdrop = useMemo(() => {
+    const parsed = parseColor(chrome.island);
+    if (!parsed) return { backgroundColor: chrome.island };
+    const at = (alpha: number) => formatColor(parsed.rgb, alpha);
+    const solid = headerHeight > 0 ? (headerHeight / (headerHeight + HEADER_FADE)) * 100 : 0;
+    return {
+      backgroundImage: `linear-gradient(to bottom, ${at(HEADER_TINT_TOP)} 0%, ${at(HEADER_TINT_EDGE)} ${solid.toFixed(1)}%, ${at(0)} 100%)`,
+    };
+  }, [chrome.island, headerHeight]);
+
   return (
     <Animated.View
       style={[
@@ -566,12 +647,7 @@ export function MapDrawer({
                 >
                   <Animated.View
                     pointerEvents="none"
-                    style={[
-                      StyleSheet.absoluteFill,
-                      styles.headerBackdrop,
-                      { backgroundColor: chrome.island, borderBottomColor: chrome.islandBorder },
-                      headerBackdropStyle,
-                    ]}
+                    style={[styles.headerBackdrop, headerBackdrop, headerBackdropStyle]}
                   />
                   {/* Not an accessibility element itself: what is inside it (the summary, the
                       add button) is, and the grip already offers the same step to assistive tech. */}
@@ -602,7 +678,9 @@ export function MapDrawer({
                 scrollEnabled={listScrolls}
                 onScroll={scrollHandler}
                 scrollEventThrottle={16}
+                // Drawn below instead, identically on every platform (see `INDICATOR_WIDTH`).
                 showsVerticalScrollIndicator={false}
+                showsHorizontalScrollIndicator={false}
                 style={styles.body}
                 contentContainerStyle={[styles.bodyContent, { paddingTop: headerHeight }]}
               >
@@ -614,6 +692,11 @@ export function MapDrawer({
                 </View>
               </Animated.ScrollView>
             </GestureDetector>
+            <Animated.View
+              pointerEvents="none"
+              style={[styles.indicator, { backgroundColor: chrome.steel }, indicatorStyle]}
+              testID="map-drawer-scroll-indicator"
+            />
           </View>
         </GestureDetector>
       </View>
@@ -671,7 +754,18 @@ const styles = StyleSheet.create({
     zIndex: 1,
   },
   headerBackdrop: {
-    borderBottomWidth: StyleSheet.hairlineWidth,
+    bottom: -HEADER_FADE,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  indicator: {
+    borderRadius: INDICATOR_WIDTH / 2,
+    position: 'absolute',
+    right: INDICATOR_INSET,
+    width: INDICATOR_WIDTH,
+    zIndex: 2,
   },
   bodyContent: {
     flexGrow: 1,
