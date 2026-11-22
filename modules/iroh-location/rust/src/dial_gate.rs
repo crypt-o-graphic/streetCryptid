@@ -101,6 +101,17 @@ impl DataMode {
             DataMode::Realtime => Some(Duration::ZERO),
         }
     }
+
+    /// The shortest gap between two refreshes of friends' profiles. A profile changes when its
+    /// owner edits a name or a repeater card. Refreshing one costs a QUIC sync with the stash per
+    /// friend, ~13 MB a day for 14 friends at half-hourly.
+    pub fn profile_refresh_floor(self) -> Duration {
+        match self {
+            DataMode::Saver => Duration::from_secs(24 * 60 * 60),
+            DataMode::Balanced => Duration::from_secs(6 * 60 * 60),
+            DataMode::Realtime => Duration::from_secs(30 * 60),
+        }
+    }
 }
 
 /// Evidence older than this is no longer evidence. The answer rate falls from 62 % to 18 %
