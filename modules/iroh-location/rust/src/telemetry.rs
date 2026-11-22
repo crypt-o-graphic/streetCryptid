@@ -53,8 +53,33 @@ const DEFAULT_FILTER: &str = concat!(
     "iroh::socket::transports::ip=debug,",
     "iroh::socket::transports::relay=debug,",
     "iroh::socket::transports::custom=debug,",
+    // iroh 1.4's per-connection and per-path event stream (`conn::connecting`, `path::open`, …):
+    // ~120 k log records a day on a phone with 14 friends (2026-11-21), each one already a
+    // count on `net.conns`.
+    "iroh::_events=warn,",
     "iroh_relay=info,iroh_gossip=info,iroh_docs=info,iroh_location=debug",
 );
+
+/// Whether a span goes to Tempo. The iroh internals below are INFO `#[instrument]` spans opened
+/// per datagram, per path event or per blob-store operation. On 2026-11-21 they were 1.3 M of the
+/// Pixel 10's 1.5 M spans a day: relay `tx` 546 k, `handle_message` 611 k, `select_path`,
+/// `handle_path_event`, `do_holepunching`, and iroh-blobs' `persist` / `observe` / `export_bao`.
+/// That is about 600 MB a day of uploads to describe traffic that `net.health` and `net.conns`
+/// already count. They are dropped from the trace export only ([`ledger::CapSpanEvents`] never
+/// hands them to the exporter): the events inside them still reach Loki, and `RelayTap` still sees
+/// the `active-relay` span it reads the host from.
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
+pub(crate) fn exported_span(meta: &tracing::Metadata<'_>) -> bool {
+    if !meta.is_span() {
+        return true;
+    }
+    let target = meta.target();
+    let noisy = target.starts_with("iroh::socket::remote_map")
+        || target.starts_with("iroh_blobs::store")
+        || (target.starts_with("iroh::socket::transports::relay") && meta.name() == "tx")
+        || (target.starts_with("iroh::net_report") && meta.name().starts_with("QAD"));
+    !noisy
+}
 
 /// How much the exporter is holding in memory for spans that have not ended.
 ///
@@ -128,6 +153,12 @@ pub(crate) mod ledger {
         }
 
         fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            // A span the exporter never hears of is never exported: everything else it is told
+            // about the span finds no data on it and is ignored (`super::exported_span`). Not a
+            // per-layer filter, which a reloaded layer never registers.
+            if !super::exported_span(attrs.metadata()) {
+                return;
+            }
             self.0.on_new_span(attrs, id, ctx);
         }
 
@@ -559,11 +590,19 @@ mod imp {
                 let Some(client) = client else {
                     return PostOutcome::Retry;
                 };
-                let sent = client
+                // Gzipped: OTLP protobuf repeats every attribute key and source path in every
+                // span, and went out raw. Telemetry was a few hundred MB a day of a phone's data on
+                // 2026-11-21; the collector's OTLP receiver takes gzip as it is.
+                let request = client
                     .post(&self.url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
-                    .body(body.to_vec())
-                    .send();
+                    .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf");
+                let request = match gzip(body) {
+                    Some(packed) => request
+                        .header(reqwest::header::CONTENT_ENCODING, "gzip")
+                        .body(packed),
+                    None => request.body(body.to_vec()),
+                };
+                let sent = request.send();
                 match sent {
                     Ok(response) => {
                         let status = response.status();
@@ -578,6 +617,16 @@ mod imp {
                     Err(_) => PostOutcome::Retry,
                 }
             }
+        }
+
+        fn gzip(body: &[u8]) -> Option<Vec<u8>> {
+            use std::io::Write as _;
+            let mut encoder = flate2::write::GzEncoder::new(
+                Vec::with_capacity(body.len() / 4),
+                flate2::Compression::default(),
+            );
+            encoder.write_all(body).ok()?;
+            encoder.finish().ok()
         }
 
         pub(super) struct SpanSpool {
@@ -892,6 +941,37 @@ mod tests {
             "ab12cd34ef"
         );
         assert_eq!(short_hex(&[0x01]), "01");
+    }
+
+    /// The per-datagram and per-path iroh spans stay out of Tempo, and nothing around them does.
+    #[test]
+    fn noisy_iroh_spans_are_not_exported() {
+        macro_rules! check {
+            ($target:literal, $name:literal, $kept:expr) => {{
+                let span = tracing::info_span!(target: $target, $name);
+                let meta = span.metadata().expect("the registry enables every span");
+                assert_eq!(exported_span(meta), $kept, "{}:{}", $target, $name);
+            }};
+        }
+        let subscriber = tracing_subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            check!("iroh::socket::transports::relay::actor", "tx", false);
+            check!(
+                "iroh::socket::transports::relay::actor",
+                "active-relay",
+                true
+            );
+            check!(
+                "iroh::socket::remote_map::remote_state",
+                "handle_message",
+                false
+            );
+            check!("iroh_blobs::store::fs", "persist", false);
+            check!("iroh::net_report", "QADv4", false);
+            check!("iroh::net_report", "reportgen-actor", true);
+            check!("iroh_docs::engine::live", "connect", true);
+            check!("iroh_location", "trail.push", true);
+        });
     }
 
     /// The per-datagram `poll_send` span is filtered out, and nothing around it is.
