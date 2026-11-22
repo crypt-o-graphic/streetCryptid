@@ -57,6 +57,11 @@ const DEFAULT_FILTER: &str = concat!(
     // ~120 k log records a day on a phone with 14 friends (2026-11-21), each one already a
     // count on `net.conns`.
     "iroh::_events=warn,",
+    // Spans opened per path event and per blob-store operation (`handle_message`, `select_path`,
+    // `persist`, `export_bao`, …): ~700 k a day on the Pixel 10, each a registry slot, a ledger
+    // entry and an exporter decision, for nothing `net.conns` does not already count. Off at the
+    // source rather than only dropped from export, so they cost no CPU either.
+    "iroh::socket::remote_map=warn,iroh_blobs::store=warn,",
     "iroh_relay=info,iroh_gossip=info,iroh_docs=info,iroh_location=debug",
 );
 
