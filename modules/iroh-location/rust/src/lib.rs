@@ -4959,7 +4959,10 @@ impl LocationNode {
 
             // Reopened profile replicas are not syncing. Wait for known friends' cards alongside
             // the trail pass, then persist what arrived before a native-only node can shut down.
-            let profile_budget = if friend_namespaces.is_empty() || !claim_profile_refresh() {
+            // Floored only when a stash or repeater is there to carry a missed edit later.
+            let profile_budget = if friend_namespaces.is_empty()
+                || (dial_gate::active() && !claim_profile_refresh())
+            {
                 std::time::Duration::ZERO
             } else {
                 deadline

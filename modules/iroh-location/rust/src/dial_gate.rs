@@ -186,14 +186,16 @@ pub(crate) fn set_friends(friends: impl IntoIterator<Item = [u8; 32]>, has_carri
     });
 }
 
-/// The mode the rule applies: with nothing else to carry fixes, friends' phones are dialled as in
-/// `Realtime` (gossip aside, which is never a carrier).
-fn effective(mode: DataMode, has_carrier: bool) -> DataMode {
-    if has_carrier {
-        mode
-    } else {
-        DataMode::Realtime
-    }
+/// Whether a stash or repeater carries fixes, so the data mode applies at all ([`gating`]).
+pub(crate) fn active() -> bool {
+    with_state(|s| gating(s.has_carrier))
+}
+
+/// Whether the gate decides anything. With no stash and no repeater, friends' phones and the
+/// gossip between them are the only way a fix travels, so every dial goes out as it always did:
+/// no mode, no coalescing, no cooldown.
+fn gating(has_carrier: bool) -> bool {
+    has_carrier
 }
 
 /// An entry `author` wrote at `entry_ts_us` (microseconds since the epoch, iroh-docs' stamp)
@@ -265,15 +267,10 @@ fn verdict(mode: DataMode, peer: Option<&Peer>, alpn: &'static str, now: Instant
 /// the same rule to every dial anyway; this only keeps cold friends out of the spans.
 pub(crate) fn allow_friend(friend: &[u8; 32]) -> bool {
     with_state(|s| {
-        if !s.friends.contains(friend) {
+        if !gating(s.has_carrier) || !s.friends.contains(friend) {
             return true;
         }
-        verdict(
-            effective(s.mode, s.has_carrier),
-            s.peers.get(friend),
-            "sync",
-            Instant::now(),
-        ) == Verdict::Allow
+        verdict(s.mode, s.peers.get(friend), "sync", Instant::now()) == Verdict::Allow
     })
 }
 
@@ -281,6 +278,10 @@ pub(crate) fn allow_friend(friend: &[u8; 32]) -> bool {
 /// screen) never ask.
 pub(crate) fn claim_background_pull() -> bool {
     with_state(|s| {
+        // Without a stash or repeater, a background pull is the only way friends' fixes arrive.
+        if !gating(s.has_carrier) {
+            return true;
+        }
         let Some(floor) = s.mode.background_pull_floor() else {
             return false;
         };
@@ -335,16 +336,14 @@ impl EndpointHooks for DialGateHook {
             No,
         }
         let next = with_state(|s| {
+            if !gating(s.has_carrier) {
+                return Next::Go;
+            }
             let gossip_any = label == "gossip" && s.mode != DataMode::Realtime;
             if !s.friends.contains(&id) && !gossip_any {
                 return Next::Go;
             }
-            let mode = if label == "gossip" {
-                s.mode
-            } else {
-                effective(s.mode, s.has_carrier)
-            };
-            match verdict(mode, s.peers.get(&id), label, now) {
+            match verdict(s.mode, s.peers.get(&id), label, now) {
                 Verdict::Refuse(reason) => {
                     *s.refused.entry((reason, label)).or_default() += 1;
                     Next::No
@@ -466,12 +465,8 @@ pub(crate) fn take_window() -> Window {
             .friends
             .iter()
             .filter(|f| {
-                verdict(
-                    effective(s.mode, s.has_carrier),
-                    s.peers.get(*f),
-                    "sync",
-                    now,
-                ) == Verdict::Allow
+                !gating(s.has_carrier)
+                    || verdict(s.mode, s.peers.get(*f), "sync", now) == Verdict::Allow
             })
             .count() as u64;
         let cooling = s
@@ -599,8 +594,8 @@ mod tests {
 
     #[test]
     fn without_a_carrier_friends_are_the_only_path_and_are_dialled() {
-        assert_eq!(effective(DataMode::Saver, false), DataMode::Realtime);
-        assert_eq!(effective(DataMode::Balanced, true), DataMode::Balanced);
+        assert!(!gating(false));
+        assert!(gating(true));
     }
 
     #[test]
