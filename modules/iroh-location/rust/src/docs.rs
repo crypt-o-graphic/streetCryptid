@@ -869,6 +869,9 @@ async fn watch_namespace(
                     record_serving_peer(&mut peers, entry.key(), from, entry.timestamp())
                 };
                 if let Some(author) = author {
+                    // Its author was awake when it wrote this; a recent one makes it worth a dial
+                    // (`dial_gate`), whoever handed it over.
+                    crate::dial_gate::note_fresh(author, entry.timestamp());
                     batch.insert(from, author, entry.content_hash(), content_status);
                 }
             }
@@ -923,6 +926,10 @@ pub struct TrailDocs {
     watchers: std::sync::Mutex<HashMap<[u8; 32], AbortOnDropHandle<()>>>,
     /// Which stranded slots [`Self::settle_stranded`] is leaving alone for now, and until when.
     stranded_backoff: StrandedBackoff,
+    /// Content hashes the stash has accepted over HTTP in this process, so a push re-sends only
+    /// what is new. Every push used to PUT the newest bytes of EVERY key in our namespace again,
+    /// a TLS handshake and a dozen envelopes every five minutes for slots that had not changed.
+    uploaded: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 
 impl TrailDocs {
@@ -990,6 +997,7 @@ impl TrailDocs {
             observer,
             watchers: std::sync::Mutex::new(HashMap::new()),
             stranded_backoff: StrandedBackoff::default(),
+            uploaded: Default::default(),
         };
         let live: Vec<Doc> = docs.handles.lock().await.values().cloned().collect();
         for doc in live {
@@ -1125,6 +1133,14 @@ impl TrailDocs {
                 continue;
             }
             let hash = entry.content_hash();
+            if self
+                .uploaded
+                .lock()
+                .expect("uploaded lock")
+                .contains(hash.as_bytes())
+            {
+                continue;
+            }
             // A slot whose bytes we no longer hold cannot be offered, and cannot be fixed by
             // retrying it: skip it rather than failing the slots that follow.
             let bytes = match self.blobs.blobs().get_bytes(hash).await {
@@ -1192,10 +1208,20 @@ impl TrailDocs {
                     "trail content upload: stash is not tracking this slot yet; skipping"
                 );
                 report.untracked += 1;
+                // A stash that does not know a slot may have lost what it held: offer everything
+                // again next time.
+                self.uploaded.lock().expect("uploaded lock").clear();
                 continue;
             }
             match response.error_for_status() {
-                Ok(_) => report.uploaded += 1,
+                Ok(_) => {
+                    report.uploaded += 1;
+                    let mut uploaded = self.uploaded.lock().expect("uploaded lock");
+                    if uploaded.len() >= 4096 {
+                        uploaded.clear();
+                    }
+                    uploaded.insert(*hash.as_bytes());
+                }
                 Err(error) => {
                     report.transport_failed += 1;
                     last_transport_error = Some(error.into());

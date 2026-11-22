@@ -46,6 +46,12 @@ mod ratchet;
 #[path = "../../rust/src/relay.rs"]
 mod relay;
 
+// `docs.rs` tells the phone's dial gate when a fresh entry lands. The browser dials nobody it
+// could gate, so there is nothing to tell.
+mod dial_gate {
+    pub(crate) fn note_fresh(_author: [u8; 32], _entry_ts_us: u64) {}
+}
+
 mod telemetry {
     pub(crate) fn short_hex(bytes: &[u8]) -> String {
         bytes

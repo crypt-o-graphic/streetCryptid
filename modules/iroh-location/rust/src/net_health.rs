@@ -547,8 +547,17 @@ pub fn record_network_health(trigger: String, context: Option<NetworkContext>) {
 /// `net.conns`: the same window by connection (`conn_ledger`). A span of its own because
 /// `net.health` is at tracing's 32-field limit.
 fn record_connections(conns: &crate::conn_ledger::Window, endpoint: Option<Counters>) {
+    // And what the dial gate refused in the same window, so a gated dial and a dial that went out
+    // and failed read apart (`dial_gate`).
+    let gate = crate::dial_gate::take_window();
     let span = tracing::info_span!(
         "net.conns",
+        gate.mode = gate.mode,
+        gate.refused = gate.refused,
+        gate.refused_by = tracing::field::Empty,
+        gate.coalesced = gate.coalesced,
+        gate.warm_friends = gate.warm_friends,
+        gate.cooling = gate.cooling,
         conn.tx_bytes = conns.tx_bytes,
         conn.rx_bytes = conns.rx_bytes,
         conn.lost_bytes = conns.lost_bytes,
@@ -579,6 +588,7 @@ fn record_connections(conns: &crate::conn_ledger::Window, endpoint: Option<Count
         ("conn.top_tx", &conns.top_tx),
         ("conn.top_attempts", &conns.top_attempts),
         ("conn.by_alpn", &conns.by_alpn),
+        ("gate.refused_by", &gate.refused_by),
     ] {
         if !value.is_empty() {
             span.record(field, value.as_str());

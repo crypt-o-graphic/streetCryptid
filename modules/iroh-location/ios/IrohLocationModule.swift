@@ -602,6 +602,29 @@ public final class IrohLocationModule: Module {
     }
 
     /// Remember the transport settings, so the background runtime can `start` without JS.
+    /// How much mobile data the node may spend reaching friends' phones directly: `saver`,
+    /// `balanced` or `realtime` (`dial_gate`). The node remembers it for every later start, the
+    /// background runtime's included.
+    AsyncFunction("setDataMode") { (mode: String) async throws in
+      guard let node = self.node else { throw Exception(name: "NoNode", description: "call createNode first") }
+      let parsed: DataMode
+      switch mode {
+      case "saver": parsed = .saver
+      case "realtime": parsed = .realtime
+      default: parsed = .balanced
+      }
+      try await node.setDataMode(mode: parsed)
+    }
+
+    Function("dataMode") { () throws -> String in
+      guard let node = self.node else { throw Exception(name: "NoNode", description: "call createNode first") }
+      switch node.dataMode() {
+      case .saver: return "saver"
+      case .balanced: return "balanced"
+      case .realtime: return "realtime"
+      }
+    }
+
     AsyncFunction("setTransportConfig") {
       (relayUrls: [String], relayAuthToken: String, relayEnabled: Bool, ipEnabled: Bool,
         bleEnabled: Bool) async throws in

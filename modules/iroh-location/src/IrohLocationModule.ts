@@ -13,6 +13,7 @@ import type {
   BlePeer,
   BluetoothRadioState,
   BumpResolution,
+  DataMode,
   NativeRatchetEvent,
   NativeLocationFix,
   IsolationStatus,
@@ -60,6 +61,13 @@ export declare class IrohLocationNativeModule
    * OPTIONAL: absent on binaries built before the native drain path.
    */
   setTransportConfig?(config?: TransportConfig): Promise<void>;
+  /**
+   * How much mobile data the node may spend reaching friends' phones directly (`dial_gate.rs`).
+   * Remembered natively for every later start. OPTIONAL: absent on binaries before 2026-11-22.
+   */
+  setDataMode?(mode: DataMode): Promise<void>;
+  /** The data mode in force. Throws without a node. OPTIONAL, like {@link setDataMode}. */
+  dataMode?(): DataMode;
   /**
    * Run one captured fix through the native gate → outbox → seal → own docs namespace → push.
    *

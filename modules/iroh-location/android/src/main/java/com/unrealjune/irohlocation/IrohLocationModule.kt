@@ -26,6 +26,7 @@ import uniffi.iroh_location.BatteryState
 import uniffi.iroh_location.BleCapabilities
 import uniffi.iroh_location.BlePeer
 import uniffi.iroh_location.BumpResolution
+import uniffi.iroh_location.DataMode
 import uniffi.iroh_location.DeliveryConfig
 import uniffi.iroh_location.RatchetEvent
 import uniffi.iroh_location.RecipientKey
@@ -695,6 +696,28 @@ class IrohLocationModule : Module() {
     /// Resolves to whether it is granted; the caller starts the service regardless, because a
     /// denial costs visibility rather than function.
     AsyncFunction("ensureNotificationPermission") Coroutine { -> ensurePostNotifications() }
+
+    /// How much mobile data the node may spend reaching friends' phones directly: `saver`,
+    /// `balanced` or `realtime` (`dial_gate`). The node remembers it for every later start, the
+    /// foreground service's included.
+    AsyncFunction("setDataMode") Coroutine { mode: String ->
+      val parsed =
+        when (mode) {
+          "saver" -> DataMode.SAVER
+          "realtime" -> DataMode.REALTIME
+          else -> DataMode.BALANCED
+        }
+      requireNode().setDataMode(parsed)
+      Unit
+    }
+
+    Function("dataMode") {
+      when (requireNode().dataMode()) {
+        DataMode.SAVER -> "saver"
+        DataMode.BALANCED -> "balanced"
+        DataMode.REALTIME -> "realtime"
+      }
+    }
 
     /// Remember the transport settings, so the background service can `start` without JS.
     AsyncFunction("setTransportConfig") Coroutine
