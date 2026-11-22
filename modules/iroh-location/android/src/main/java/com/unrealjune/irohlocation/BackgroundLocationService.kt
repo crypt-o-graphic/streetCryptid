@@ -7,6 +7,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.Sensor
+import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -71,20 +75,54 @@ class BackgroundLocationService : Service() {
 
   private val listener =
     LocationListener { location ->
+      reporter.noteDelivery(location)
+      if (stopped) {
+        // A passive or network position while stopped. Near the stop it confirms the stop, which
+        // the ticker's parked heartbeat already says; only a position clearly elsewhere is news.
+        val anchor = stopAnchor
+        val slack = if (location.hasAccuracy()) location.accuracy else 0f
+        if (anchor != null && location.distanceTo(anchor) < DEPART_RADIUS_M + slack) {
+          return@LocationListener
+        }
+        enterMoving("departure")
+      }
+      lastLocation = location
       // Stamped before the launch, not inside it: the ticker asks "did the provider deliver in this
       // slot", and a coroutine that has been dispatched but not yet run still answers yes.
       lastDeliveryAtMs = System.currentTimeMillis()
-      reporter.noteDelivery(location)
       // Straight into the native path. No JS, no headless bridge, no spool.
       scope.launch { publish(location) }
     }
 
   /**
-   * When the provider last handed us a location, or 0 before the first one.
+   * `moving` or `stopped`, the Android counterpart of the iOS runtime's states (June, 2026-11-22:
+   * make Android like iOS, reporting while moving and only doing maintenance otherwise).
    *
-   * The only state the stationary ticker needs. Deliberately not a "moving/stopped" state machine
-   * like the iOS runtime's: that exists there because Core Location has to be re-tiered to a
-   * cheaper stream to keep the process ALIVE, and a foreground service has no such problem.
+   * It was a single state with GPS and network requested every minute for as long as sharing ran,
+   * because a foreground service stays alive regardless. Staying alive was never the problem; the
+   * GPS was. A phone that has delivered nothing for [STOP_AFTER_MS] (the 50 m filter means it has
+   * not moved) turns GPS off and listens only to the passive provider, which costs nothing because
+   * it only sees fixes other apps asked for, and to the significant-motion sensor, a one-shot
+   * hardware trigger for walking or driving. Either one returns it to `moving`. While stopped the
+   * ticker still heartbeats `parked`, and the core floors those to the data mode's maintenance
+   * cadence (`publish.rs`).
+   */
+  @Volatile private var stopped = false
+  @Volatile private var stopAnchor: Location? = null
+  @Volatile private var lastLocation: Location? = null
+  private var sensorManager: SensorManager? = null
+  private var significantMotion: Sensor? = null
+
+  private val motionTrigger =
+    object : TriggerEventListener() {
+      override fun onTrigger(event: TriggerEvent?) {
+        enterMoving("significant_motion")
+      }
+    }
+
+  /**
+   * When the provider last handed us a location, or 0 before the first one. The ticker reads it to
+   * fill slots nothing delivered into, and to decide the phone has stopped (see [stopped]).
    */
   @Volatile private var lastDeliveryAtMs: Long = 0L
 
@@ -124,6 +162,8 @@ class BackgroundLocationService : Service() {
     } else {
       ServiceRecovery.noteStarted(applicationContext)
     }
+    sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+    significantMotion = sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
     startLocationUpdates()
     startStationaryTicker()
     // Off the main thread: configuring telemetry loads the native library. A process restarted
@@ -181,6 +221,7 @@ class BackgroundLocationService : Service() {
     reporter.stopPulse()
     stationaryTicker?.cancel()
     stationaryTicker = null
+    significantMotion?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
     locationManager?.removeUpdates(listener)
     locationManager = null
     // Release the directory claims so a mounted app can take them back immediately, rather than
@@ -203,12 +244,62 @@ class BackgroundLocationService : Service() {
     locationManager = manager
     // Both providers, deliberately. GPS alone goes quiet indoors, which is where a phone spends
     // most of its day, and the network provider is what keeps a trail alive in a building.
-    for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+    request(
+      manager,
+      listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER),
+      MIN_UPDATE_INTERVAL_MS,
+      cadenceDistanceM,
+    )
+  }
+
+  /** While stopped: what costs nothing, plus the network provider only without a motion sensor. */
+  private fun startStoppedUpdates() {
+    val manager = locationManager ?: return
+    val providers = mutableListOf(LocationManager.PASSIVE_PROVIDER)
+    if (significantMotion == null) providers += LocationManager.NETWORK_PROVIDER
+    request(manager, providers, STOPPED_UPDATE_INTERVAL_MS, DEPART_RADIUS_M)
+  }
+
+  @Synchronized
+  private fun enterStopped(reason: String) {
+    if (stopped || !running) return
+    stopped = true
+    stopAnchor = lastLocation
+    locationManager?.removeUpdates(listener)
+    startStoppedUpdates()
+    val armed =
+      significantMotion?.let { sensorManager?.requestTriggerSensor(motionTrigger, it) } ?: false
+    reporter.event(
+      LocationRuntimeKind.TRANSITION,
+      reason = reason,
+      detail = "moving->stopped gps=off significant_motion=$armed",
+    )
+  }
+
+  @Synchronized
+  private fun enterMoving(reason: String) {
+    if (!stopped || !running) return
+    stopped = false
+    significantMotion?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
+    locationManager?.removeUpdates(listener)
+    // A full window to find the first fix before the ticker may decide the phone stopped again.
+    lastDeliveryAtMs = System.currentTimeMillis()
+    startLocationUpdates()
+    reporter.event(LocationRuntimeKind.TRANSITION, reason = reason, detail = "stopped->moving")
+  }
+
+  private fun request(
+    manager: LocationManager,
+    providers: List<String>,
+    intervalMs: Long,
+    distanceM: Float,
+  ) {
+    for (provider in providers) {
       try {
         manager.requestLocationUpdates(
           provider,
-          MIN_UPDATE_INTERVAL_MS,
-          cadenceDistanceM,
+          intervalMs,
+          distanceM,
           listener,
           Looper.getMainLooper(),
         )
@@ -272,6 +363,10 @@ class BackgroundLocationService : Service() {
           val since = System.currentTimeMillis() - lastDeliveryAtMs
           // A delivery inside this slot means `publish` has already run the gate for it.
           if (lastDeliveryAtMs != 0L && since < slotMs) continue
+          // Nothing delivered for long enough with a 50 m filter: the phone is not moving.
+          if (!stopped && (lastDeliveryAtMs == 0L || since >= STOP_AFTER_MS)) {
+            enterStopped("dwell")
+          }
           heartbeat()
         }
       }
@@ -448,6 +543,15 @@ class BackgroundLocationService : Service() {
      * from turning the ticker into a spin loop.
      */
     private const val MIN_TICK_INTERVAL_MS = 60_000L
+
+    /** No delivery for this long, with the 50 m filter, and the phone is taken to have stopped. */
+    private const val STOP_AFTER_MS = 10 * 60_000L
+
+    /** While stopped, how far a passive or network position must be from the stop to mean "left". */
+    private const val DEPART_RADIUS_M = 150f
+
+    /** While stopped, the least interval asked of the passive (and fallback network) provider. */
+    private const val STOPPED_UPDATE_INTERVAL_MS = 5 * 60_000L
 
     /** The user turned sharing on (or the cadence changed while it was on). */
     fun start(context: Context) {

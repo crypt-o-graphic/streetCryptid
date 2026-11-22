@@ -471,7 +471,15 @@ const TRANSPORT_POLL_ROLLUP_EVERY = 60;
  * to do — and with React deferred on background launches, servicing one means booting the whole
  * bundle, which is the cost the deferral exists to remove. Mirrors the gate in `register-task.ts`.
  */
-const JS_BACKGROUND_TASKS_SUPPORTED = Platform.OS === 'android';
+/**
+ * Whether sharing schedules JavaScript background work (the revive fence and the periodic refresh).
+ * No platform does any more. Android's `BackgroundLocationService` captures, heartbeats and pulls
+ * natively, and `ServiceRecovery` brings the service back (watchdog alarm, boot receiver, resume
+ * notification). The JS tasks only woke a JS context to do work that was already done: on
+ * 2026-11-21 a Pixel 10's revive fence alone fired ~1,750 times a day on a phone sitting still.
+ * {@link retireJsBackgroundTasks} removes what earlier builds registered.
+ */
+const JS_BACKGROUND_TASKS_SUPPORTED = false;
 
 const BUMP_EXPIRY_CHECK_MS = 1000;
 
@@ -3231,6 +3239,7 @@ export class LocationSharingService {
         if (asked) await savePermissionAsked(this.kv, 'notifications').catch(() => undefined);
       }
       this.setNativeBackground(true);
+      void retireJsBackgroundTasks();
       // Arm the revive fence around where we are now.
       //
       // ANDROID ONLY now. It cannot relaunch a terminated app there, but a geofence event is a
@@ -4602,6 +4611,10 @@ export class LocationSharingService {
    * The app came back on screen: resume what the background stopped, and close the gap it left.
    */
   private onEnterForeground(): void {
+    // Android pauses the JS heartbeat off screen (see `onEnterBackground`); bring it back.
+    if (Platform.OS === 'android' && this.backgroundSharing && !this.heartbeatTimer) {
+      this.armHeartbeat(SHARE_INTERVAL_MS);
+    }
     // Resume the pairing loop, and close the gap rather than only re-arming it: the poll
     // also drains `pollProfileEvents` and runs `reconcileCompletedPairs`, so a friend who
     // finished pairing while we were backgrounded is reconciled now, not in four seconds.
@@ -4626,7 +4639,7 @@ export class LocationSharingService {
     // outside it only makes the exit fire sooner), but keeping it current stops a user who
     // never leaves a 200 m radius from having a tripwire they can't trip.
     const fix = this.engine?.getState().lastAcceptedFix;
-    if (fix) {
+    if (fix && JS_BACKGROUND_TASKS_SUPPORTED) {
       void import('./background/revive-task')
         .then(({ armReviveFence }) => armReviveFence(fix))
         .catch(() => undefined);
@@ -4657,6 +4670,13 @@ export class LocationSharingService {
     // The bump loop is left alone too: it expires against `isBumpActive()` inside a two-minute
     // window a human opened.
     this.pairingPoll.background();
+    // On Android the heartbeat timer DOES stop. `BackgroundLocationService` fills every slot of a
+    // parked phone natively, and off screen it ingests captures itself rather than handing them
+    // up, so a JS timer here only woke the JS thread every few minutes to repeat that work.
+    if (Platform.OS === 'android' && this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   /**
@@ -5348,4 +5368,24 @@ interface PairingPollReads {
   readonly profileEvents?: ProfileView[];
   readonly sessions?: PairStateRecord[];
   readonly ble?: Promise<{ peers: BlePeer[]; caps: BleCapabilities }>;
+}
+
+/**
+ * Unregister the JS background work earlier builds scheduled: the revive fence and the periodic
+ * refresh. Both are persisted by the OS and would keep waking a JS context after an update even
+ * though nothing schedules them any more. Idempotent and best-effort.
+ */
+async function retireJsBackgroundTasks(): Promise<void> {
+  try {
+    const { disarmReviveFence } = await import('./background/revive-task');
+    await disarmReviveFence();
+  } catch {
+    // Nothing armed, or no native module: nothing to retire.
+  }
+  try {
+    const { cancelBackgroundRefresh } = await import('./background/refresh-task');
+    await cancelBackgroundRefresh();
+  } catch {
+    // Same.
+  }
 }

@@ -501,6 +501,10 @@ class IrohLocationModule : Module() {
    */
   private inner class ReplicaBridge : ReplicaListener {
     override fun onFriendEntries(authors: List<ByteArray>) {
+      // Off screen the app has nothing to draw, and each event woke the JS thread to decrypt and
+      // re-render a map nobody was looking at. Coming back to the foreground re-reads the whole
+      // replica (`syncTrail`), so a dropped notification costs nothing.
+      if (!NativeBackgroundRuntime.appInForeground()) return
       sendEvent("onReplicaChanged", mapOf("authors" to authors.map { it.toHex() }))
     }
   }

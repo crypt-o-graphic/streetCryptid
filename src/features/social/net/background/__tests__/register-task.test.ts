@@ -72,10 +72,10 @@ describe('background task registration', () => {
     expect(mockDefineRevive).not.toHaveBeenCalled();
   });
 
-  it('still registers both on Android', () => {
+  it('registers nothing on Android either, where the foreground service covers it', () => {
     loadOn('android');
-    expect(mockDefineRefresh).toHaveBeenCalledTimes(1);
-    expect(mockDefineRevive).toHaveBeenCalledTimes(1);
+    expect(mockDefineRefresh).not.toHaveBeenCalled();
+    expect(mockDefineRevive).not.toHaveBeenCalled();
   });
 
   it('is side-effect-free to import', () => {

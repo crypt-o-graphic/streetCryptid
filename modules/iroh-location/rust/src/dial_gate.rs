@@ -206,6 +206,21 @@ pub(crate) fn set_friends(friends: impl IntoIterator<Item = [u8; 32]>, has_carri
     });
 }
 
+/// How often a phone that stays parked publishes, when the data mode limits it; `None` when it
+/// publishes every slot (Real time, or no stash or repeater to fall back on).
+pub(crate) fn parked_heartbeat_floor() -> Option<Duration> {
+    with_state(|s| {
+        if !gating(s.has_carrier) {
+            return None;
+        }
+        match s.mode {
+            DataMode::Saver => Some(Duration::from_secs(60 * 60)),
+            DataMode::Balanced => Some(Duration::from_secs(30 * 60)),
+            DataMode::Realtime => None,
+        }
+    })
+}
+
 /// Whether a stash or repeater carries fixes, so the data mode applies at all ([`gating`]).
 pub(crate) fn active() -> bool {
     with_state(|s| gating(s.has_carrier))

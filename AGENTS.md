@@ -888,6 +888,19 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   links the library with a build id and soname, ships it stripped, and stages the copy with its
   symbol table. Without a build id a profile cannot be matched to symbols, so keep those link
   args.
+- **Android does not wake JavaScript in the background, and stops GPS when stopped** (2026-11-22).
+  `BackgroundLocationService` hands a capture or parked tick to the app only while the app is on
+  screen (`NativeBackgroundRuntime.routeToApp`). Off screen it ingests natively, does not forward
+  replica notifications or pull results to JS, and the JS heartbeat timer is paused
+  (`onEnterBackground`). The JS revive fence and periodic refresh are no longer scheduled on any
+  platform: `ServiceRecovery` restarts the service, and `retireJsBackgroundTasks` unregisters
+  what older builds left. The service has `moving` and `stopped` states. After 10 min with no
+  delivery it turns GPS off and listens to the passive provider and the significant-motion
+  sensor, and either one brings it back. While a phone stays parked the core publishes on the
+  data mode's maintenance cadence (Balanced 30 min, Saver 60 min, one envelope for all the
+  slots missed; `publish.rs`, `dial_gate::parked_heartbeat_floor`). That deliberately trades
+  away the uniform-cadence rule above while parked: the stash can now tell a parked phone from a
+  moving one by how often it publishes.
 - Guard newly added native exports anyway (`typeof mod.configureTelemetry === 'function'`). Not
   because of bindgen now, but because a phone can be running an older binary than the JS bundle.
 

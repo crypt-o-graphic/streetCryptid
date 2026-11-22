@@ -779,7 +779,32 @@ impl<S: PublishSink> DrainEngine<'_, S> {
         stamped.record("engine.heartbeat");
 
         gate::regrid(&mut state, interval_ms);
-        let plan = gate::due_slots(now_ms, interval_ms, state.last_published_slot);
+        let mut plan = gate::due_slots(now_ms, interval_ms, state.last_published_slot);
+        // A phone that stays parked has nothing new to say: one envelope covers every slot it
+        // missed (they would all carry the same position), and between those it publishes on the
+        // data mode's maintenance cadence rather than every slot (`dial_gate`). A change of
+        // `parked` is not held back by this; `publish_news` below sends it at once. June,
+        // 2026-11-22: report when moving, and otherwise only do maintenance. The trade is that
+        // the cadence the stash sees is no longer uniform while parked.
+        if before == Some(FIX_STATE_PARKED)
+            && state.last_state == Some(FIX_STATE_PARKED)
+            && plan.due > 0
+        {
+            if let Some(floor) = crate::dial_gate::parked_heartbeat_floor() {
+                let floor_ms = floor.as_millis() as u64;
+                let recent = state
+                    .last_published_at
+                    .is_some_and(|at| now_ms.saturating_sub(at) < floor_ms);
+                if recent {
+                    plan.skipped += plan.due;
+                    plan.due = 0;
+                    state.last_published_slot = Some(plan.current_slot);
+                } else {
+                    plan.skipped += plan.due - 1;
+                    plan.due = 1;
+                }
+            }
+        }
         let mut overflow_dropped = 0u32;
         for _ in 0..plan.due {
             overflow_dropped += self.queue.enqueue(known.clone())?.overflow_dropped;
