@@ -81,6 +81,10 @@ const ANDROID_ONLY: Record<string, string> = {
   batteryOptimizationExempt:
     'the Android battery-optimisation exemption that lets the foreground service restart itself; iOS has no equivalent',
   requestBatteryOptimizationExemption: 'the prompt for batteryOptimizationExempt',
+  motionActivityAvailable:
+    'whether Google Play services activity recognition can run, for the physical-activity permission step; iOS reads motion through Core Location',
+  refreshMotionActivity:
+    'tells the Android foreground service the physical-activity permission was answered; iOS has no such service',
 };
 
 /** Declared for OLDER binaries a newer JS bundle may still meet; no current binary exports them. */
