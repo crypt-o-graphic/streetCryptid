@@ -1231,6 +1231,7 @@ impl LocationNode {
         base_url: &str,
         psk: Option<&str>,
         publish: bool,
+        pull: bool,
         timeout: std::time::Duration,
     ) -> Result<(), batch_client::BatchFailure> {
         use streetcryptid_repeater::stash_batch::{BatchRequest, PublishStatus, BATCH_VERSION};
@@ -1266,7 +1267,11 @@ impl LocationNode {
             } else {
                 (Vec::new(), 0)
             };
-            let cursors = trail.pull_cursors().await;
+            let cursors = if pull {
+                trail.pull_cursors().await
+            } else {
+                Vec::new()
+            };
             current.record("batch.publish", publish_entries.len());
             current.record("batch.pull", cursors.len());
             let request = BatchRequest {
@@ -5050,7 +5055,7 @@ impl LocationNode {
                         .unwrap_or(std::time::Duration::from_secs(15))
                         .min(std::time::Duration::from_secs(15));
                     if self
-                        .stash_batch(base_url, psk.as_deref(), false, timeout)
+                        .stash_batch(base_url, psk.as_deref(), false, true, timeout)
                         .await
                         .is_ok()
                     {
@@ -6240,7 +6245,17 @@ impl publish::PublishSink for NodeSink<'_> {
         if let Some((base_url, psk)) = config.stash() {
             let timeout = budget.min(std::time::Duration::from_secs(15));
             if node
-                .stash_batch(base_url, psk.as_deref(), true, timeout)
+                // Friends' news rides along only when a background pull is due anyway: every
+                // friend heartbeats every five minutes, and reading all of them on every publish
+                // is ~14 MB a day with 14 friends. Taking the floor here also means the platform's
+                // own background pull skips this hour.
+                .stash_batch(
+                    base_url,
+                    psk.as_deref(),
+                    true,
+                    dial_gate::claim_background_pull(),
+                    timeout,
+                )
                 .await
                 .is_ok()
             {
