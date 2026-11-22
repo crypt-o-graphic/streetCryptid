@@ -31,6 +31,18 @@ Modifications by the streetCryptid project
         after one accept task panicked. The panicked task's (namespace, peer) state may stay
         marked running, which costs that one pair its syncs, not the node.
 
+2026-11-22 — dropped subscriptions were kept until their namespace next had an event:
+
+  * src/sync.rs, src/engine/live.rs
+      - `Subscribers::subscribe` (both: the replica's and the live actor's) first drops every sender
+        whose receiver is closed. Each `Engine::subscribe` makes two `async_channel::bounded(256)`
+        channels, which preallocate their slots (~46 KB). A sender was removed only when an event
+        failed to reach it, so a namespace that got no events (a friend whose phone was asleep)
+        kept one pair per subscribe. The phone subscribes to every namespace on every pull. A
+        heapprofd profile of a Pixel 10 attributed the largest live share of its Rust heap to
+        exactly these channels, `RpcActor::handle` → `async_channel::bounded::<Event>`, on a
+        heap that grew ~20 MB an hour to 1.7 GB.
+
 The crate's Cargo.lock, Cargo.toml.orig, .cargo_vcs_info.json, CI config, examples, tests and
 proptest regressions were not vendored, and the [[example]] / [[test]] entries are removed from
 Cargo.toml. No other file differs from the published 0.101.0 crate.
