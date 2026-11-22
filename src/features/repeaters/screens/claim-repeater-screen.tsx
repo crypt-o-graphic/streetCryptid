@@ -4,7 +4,6 @@ import * as WebBrowser from 'expo-web-browser';
 import { type ReactNode, useState } from 'react';
 import {
   Keyboard,
-  KeyboardAvoidingView,
   Pressable,
   StyleSheet,
   Text,
@@ -15,11 +14,11 @@ import {
 import Animated, { FadeIn, FadeOut, useReducedMotion } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { KeyboardLiftView } from '@/components/keyboard-lift-view';
 import { Spacing } from '@/constants/theme';
 import { successHaptic, warningHaptic } from '@/features/haptics/haptics';
 import { PairingSignalField } from '@/features/social/components/pairing-signal-field';
 import { PressableAction } from '@/features/social/components/pressable-action';
-import { useKeyboardShown } from '@/hooks/use-keyboard-shown';
 
 import {
   IslandPanel,
@@ -89,9 +88,7 @@ export default function ClaimRepeaterScreen() {
   const [carry, setCarry] = useState(true);
   // Unknown until the rosters are read; a later machine takes the roster's policy as it is.
   const firstRepeater = repeaters.status === 'ready' && repeaters.sections.mine === null;
-  const keyboardShown = useKeyboardShown();
-  // The keyboard covers the home indicator, so its inset is not owed while it is up.
-  const panelMargin = keyboardShown ? Spacing.two : Math.max(insets.bottom, Spacing.two);
+  const panelMargin = Math.max(insets.bottom, Spacing.two);
 
   const machine = 'link' in state ? claimLinkMachineId(state.link) : null;
   const machineShort = machine ? shortId(machine) : null;
@@ -379,14 +376,10 @@ export default function ClaimRepeaterScreen() {
         onBack={back}
         paddingTop={Math.max(insets.top, Spacing.three)}
       />
-      {/* As on the pairing screen: the panel rides up with the keyboard on both platforms, and a
-          tap on the stage puts the keyboard away. */}
-      <KeyboardAvoidingView behavior="padding" style={styles.body}>
-        <Pressable
-          accessible={false}
-          onPress={Keyboard.dismiss}
-          style={[styles.stage, keyboardShown ? styles.stageClipped : null]}
-        >
+      {/* As on the pairing screen: only the panel rides up with the keyboard, and a tap on the
+          stage puts the keyboard away. */}
+      <View style={styles.body}>
+        <Pressable accessible={false} onPress={Keyboard.dismiss} style={styles.stage}>
           <Animated.View
             key={state.step}
             entering={reducedMotion ? undefined : FadeIn.duration(260)}
@@ -396,8 +389,9 @@ export default function ClaimRepeaterScreen() {
             {stage}
           </Animated.View>
         </Pressable>
-        {panel}
-      </KeyboardAvoidingView>
+        {/* The keyboard covers the home indicator, so its inset is not owed while it is up. */}
+        <KeyboardLiftView coverableBottom={panelMargin - Spacing.two}>{panel}</KeyboardLiftView>
+      </View>
     </View>
   );
 }
@@ -412,7 +406,6 @@ const styles = StyleSheet.create({
     minHeight: 0,
     paddingHorizontal: 18,
   },
-  stageClipped: { overflow: 'hidden' },
   centred: { alignItems: 'center', gap: 10, justifyContent: 'center' },
   claimed: { alignItems: 'center', gap: 14 },
   machineId: {

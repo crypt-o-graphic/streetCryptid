@@ -18,6 +18,9 @@ jest.mock('react-native-reanimated', () => {
     FadeIn: { duration: () => undefined },
     FadeOut: { duration: () => undefined },
     useReducedMotion: () => true,
+    // KeyboardLiftView: the keyboard is never up under Jest.
+    useAnimatedStyle: () => ({}),
+    useSharedValue: (value: unknown) => ({ value }),
   };
 });
 jest.mock('@/features/social/components/pressable-action', () => ({

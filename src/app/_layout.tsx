@@ -15,6 +15,7 @@ import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { StyleSheet } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
@@ -59,32 +60,36 @@ export default function RootLayout() {
 
   return (
     <GestureHandlerRootView style={StyleSheet.absoluteFill}>
-      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-        <CryptidProfileProvider>
-          <AnimatedSplashOverlay />
-          <CryptidAccountGate>
-            {/* In front of the provider, so node init finds every permission already decided
+      {/* Native keyboard tracking for panels that ride above it (`KeyboardLiftView`). The app is
+        edge-to-edge, so the provider must leave the system bars and the window alone. */}
+      <KeyboardProvider navigationBarTranslucent preserveEdgeToEdge statusBarTranslucent>
+        <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+          <CryptidProfileProvider>
+            <AnimatedSplashOverlay />
+            <CryptidAccountGate>
+              {/* In front of the provider, so node init finds every permission already decided
               instead of prompting over whatever is on screen. */}
-            <PermissionsGate>
-              <LocationSharingProvider>
-                {/* No tab bar, no header: the map is the app, and everything else
+              <PermissionsGate>
+                <LocationSharingProvider>
+                  {/* No tab bar, no header: the map is the app, and everything else
                   is a floating island or a sheet pushed over it. */}
-                <Stack screenOptions={{ headerShown: false }}>
-                  <Stack.Screen name="index" />
-                  <Stack.Screen
-                    name="pairing"
-                    options={{ animation: 'fade', gestureEnabled: false }}
-                  />
-                  <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
-                </Stack>
-                {/* Pairing interrupts are global: a verification challenge or a
+                  <Stack screenOptions={{ headerShown: false }}>
+                    <Stack.Screen name="index" />
+                    <Stack.Screen
+                      name="pairing"
+                      options={{ animation: 'fade', gestureEnabled: false }}
+                    />
+                    <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
+                  </Stack>
+                  {/* Pairing interrupts are global: a verification challenge or a
                   discovery can land while you are anywhere in the app. */}
-                <PairingOverlays />
-              </LocationSharingProvider>
-            </PermissionsGate>
-          </CryptidAccountGate>
-        </CryptidProfileProvider>
-      </ThemeProvider>
+                  <PairingOverlays />
+                </LocationSharingProvider>
+              </PermissionsGate>
+            </CryptidAccountGate>
+          </CryptidProfileProvider>
+        </ThemeProvider>
+      </KeyboardProvider>
     </GestureHandlerRootView>
   );
 }

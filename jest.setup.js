@@ -20,3 +20,8 @@ jest.mock('expo-glass-effect', () => {
     isGlassEffectAPIAvailable: () => false,
   };
 });
+
+/** The library's own mock: no native keyboard tracking under Jest, so the keyboard is always down. */
+jest.mock('react-native-keyboard-controller', () =>
+  require('react-native-keyboard-controller/jest')
+);
