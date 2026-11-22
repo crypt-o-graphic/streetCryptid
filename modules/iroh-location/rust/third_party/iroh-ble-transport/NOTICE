@@ -201,3 +201,13 @@ No other upstream source files were modified (src/transport/mod.rs gained the `s
     case where a peer receives before its first send. The old hardcoded
     generation timed out depending on actor scheduling; the registry's
     stale-generation rejection remains unchanged.
+
+2026-11-22 — The transport's standing scan uses the low duty cycle:
+
+  * src/transport/transport.rs — the scan started at construction, which runs
+    for the app's whole life including the background, is `ScanMode::LowPower`
+    instead of the default `LowLatency`. A CPU profile of a Pixel 10 in a
+    pocket overnight showed BLE scan callbacks on the main looper; at low
+    latency the radio listens continuously. Pairing's own scan windows (the
+    app's `ble.rs`) still scan at low latency while they run, then return to
+    low power.

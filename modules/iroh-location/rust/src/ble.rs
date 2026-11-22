@@ -484,6 +484,16 @@ mod imp {
                 Ok(None) | Err(_) => break,
             }
         }
+        // Back to the low duty cycle the transport scans at between windows: a low-latency scan
+        // left running after a Bump kept the radio listening flat out for the life of the process,
+        // which on 2026-11-22 was a Pixel scanning all night in a pocket.
+        let _ = central.stop_scan().await;
+        let _ = central
+            .start_scan(ScanFilter {
+                mode: blew::central::ScanMode::LowPower,
+                ..ScanFilter::default()
+            })
+            .await;
         ScanResult {
             devices: devices.into_values().collect(),
             heard,
