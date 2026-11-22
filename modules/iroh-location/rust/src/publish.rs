@@ -791,7 +791,10 @@ impl<S: PublishSink> DrainEngine<'_, S> {
             && plan.due > 0
         {
             if let Some(floor) = crate::dial_gate::parked_heartbeat_floor() {
-                let floor_ms = floor.as_millis() as u64;
+                // One slot of slack: the Android service wakes on this same interval, and a wake
+                // a few seconds early must not be refused and push the next envelope a whole
+                // interval later.
+                let floor_ms = (floor.as_millis() as u64).saturating_sub(interval_ms);
                 let recent = state
                     .last_published_at
                     .is_some_and(|at| now_ms.saturating_sub(at) < floor_ms);

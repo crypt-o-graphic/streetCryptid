@@ -30,6 +30,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import uniffi.iroh_location.BatteryState
+import uniffi.iroh_location.DataMode
 import uniffi.iroh_location.LocationFix
 import uniffi.iroh_location.LocationRuntimeKind
 
@@ -285,6 +286,8 @@ class BackgroundLocationService : Service() {
     // A full window to find the first fix before the ticker may decide the phone stopped again.
     lastDeliveryAtMs = System.currentTimeMillis()
     startLocationUpdates()
+    // The ticker may be asleep for a whole maintenance interval; back to slot cadence now.
+    startStationaryTicker()
     reporter.event(LocationRuntimeKind.TRANSITION, reason = reason, detail = "stopped->moving")
   }
 
@@ -358,18 +361,70 @@ class BackgroundLocationService : Service() {
       scope.launch {
         while (isActive && running) {
           val slotMs = slotIntervalMs.toLong().coerceAtLeast(MIN_TICK_INTERVAL_MS)
-          delay(slotMs)
+          // Moving (or deciding whether it has stopped): every slot. Stopped: the maintenance
+          // interval, which [enterMoving] cuts short by restarting this loop.
+          delay(if (stopped) maintenanceIntervalMs(slotMs) else slotMs)
           if (!running) break
+          if (stopped) {
+            maintenance()
+            continue
+          }
           val since = System.currentTimeMillis() - lastDeliveryAtMs
           // A delivery inside this slot means `publish` has already run the gate for it.
           if (lastDeliveryAtMs != 0L && since < slotMs) continue
           // Nothing delivered for long enough with a 50 m filter: the phone is not moving.
-          if (!stopped && (lastDeliveryAtMs == 0L || since >= STOP_AFTER_MS)) {
+          if (lastDeliveryAtMs == 0L || since >= STOP_AFTER_MS) {
             enterStopped("dwell")
           }
           heartbeat()
         }
       }
+  }
+
+  /**
+   * How long a stopped phone sleeps between maintenance wakes: the data mode's parked cadence
+   * (Balanced 30 min, Saver 60 min, Real time every slot), the same floor the core applies to a
+   * parked heartbeat (`dial_gate::parked_heartbeat_floor`). June, 2026-11-22: "we should still
+   * wake the phone up every so often because we can, but certainly not every 5".
+   */
+  private fun maintenanceIntervalMs(slotMs: Long): Long {
+    val mode =
+      try {
+        NodeStorage.host.current()?.dataMode()
+      } catch (e: Exception) {
+        null
+      }
+    return when (mode) {
+      DataMode.REALTIME -> slotMs
+      DataMode.SAVER -> 60 * 60_000L
+      else -> 30 * 60_000L
+    }.coerceAtLeast(slotMs)
+  }
+
+  /**
+   * A stopped phone's periodic wake: the parked heartbeat (which also pulls friends, floored), and
+   * one cheap network position to catch a departure the motion sensor missed. A phone found away
+   * from its stop goes back to `moving`.
+   */
+  private suspend fun maintenance() {
+    reporter.event(LocationRuntimeKind.PULSE, reason = "maintenance")
+    heartbeat()
+    val manager = locationManager ?: return
+    val anchor = stopAnchor ?: return
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+    try {
+      manager.getCurrentLocation(LocationManager.NETWORK_PROVIDER, null, mainExecutor) { location ->
+        if (location == null || !stopped) return@getCurrentLocation
+        val slack = if (location.hasAccuracy()) location.accuracy else 0f
+        if (location.distanceTo(anchor) >= DEPART_RADIUS_M + slack) {
+          enterMoving("maintenance_check")
+        }
+      }
+    } catch (e: SecurityException) {
+      Log.w(TAG, "maintenance position refused", e)
+    } catch (e: IllegalArgumentException) {
+      Log.i(TAG, "network provider unavailable for the maintenance check")
+    }
   }
 
   private suspend fun heartbeat() {
