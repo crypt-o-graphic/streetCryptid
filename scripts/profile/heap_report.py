@@ -27,9 +27,10 @@ LIB = 'libiroh_location.so'
 PLUMBING = re.compile(
     r'^(malloc|calloc|realloc|posix_memalign|aligned_alloc|memalign|operator new|scudo|je_|'
     r'__rust_|__rg_|__rdl_|_rjem_|'
-    r'iroh_location::alloc_stats|alloc::|core::|std::alloc|hashbrown::|smallvec::|bytes::|'
+    r'iroh_location::alloc_stats|<iroh_location::alloc_stats|alloc::|core::|std::alloc|hashbrown::|smallvec::|bytes::|'
     r'<alloc::|<core::|<hashbrown::|<smallvec::|<bytes::|<std::|std::collections|'
-    r'tokio::runtime::task::|<tokio::runtime::task::|serde::|<serde|postcard::|<postcard)'
+    r'tokio::runtime::task::|<tokio::runtime::task::|serde::|<serde|postcard::|<postcard|'
+    r'<concurrent_queue::|concurrent_queue::|async_channel::|<async_channel::)'
 )
 
 

@@ -361,6 +361,105 @@ pub(crate) mod ledger {
     }
 }
 
+/// `adb logcat` output for the core, written straight to liblog.
+///
+/// It was `paranoid_android`'s writer, which takes each message buffer from a process-wide
+/// `sharded_slab` pool and keeps it, capacity and all, when it is handed back. On 2026-11-22 a
+/// nine-hour heapprofd profile of a Pixel 10 found 74 MiB still held by those buffers and growing
+/// with every event, about a third of the Rust heap's growth. Every event the global filter let
+/// through was also formatted for logcat, `iroh=debug` included, which nobody reads off a phone in
+/// a pocket: Loki has them. So logcat gets warnings, plus this crate's own events at info.
+#[cfg(target_os = "android")]
+mod logcat {
+    use std::ffi::{c_char, c_int};
+    use std::io::Write;
+
+    use tracing::Level;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::Layer;
+
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    /// logd truncates at 4096 bytes.
+    const MAX_LINE: usize = 4000;
+    const TAG: &[u8] = b"streetcryptid\0";
+
+    pub(super) fn layer<S>() -> impl Layer<S> + Send + Sync
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(Logcat)
+            .with_filter(
+                Targets::new()
+                    .with_target("iroh_location", Level::INFO)
+                    .with_default(Level::WARN),
+            )
+    }
+
+    struct Logcat;
+
+    /// One event's text, sent when the formatter drops it.
+    struct Line {
+        priority: c_int,
+        text: Vec<u8>,
+    }
+
+    impl<'a> MakeWriter<'a> for Logcat {
+        type Writer = Line;
+
+        fn make_writer(&'a self) -> Line {
+            Line {
+                priority: 4,
+                text: Vec::new(),
+            }
+        }
+
+        fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Line {
+            let priority = match *meta.level() {
+                Level::ERROR => 6,
+                Level::WARN => 5,
+                Level::INFO => 4,
+                Level::DEBUG => 3,
+                Level::TRACE => 2,
+            };
+            Line {
+                priority,
+                text: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for Line {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.text.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for Line {
+        fn drop(&mut self) {
+            for chunk in self.text.chunks(MAX_LINE) {
+                let mut line: Vec<u8> = chunk.iter().copied().filter(|b| *b != 0).collect();
+                line.push(0);
+                // SAFETY: both strings are NUL-terminated and outlive the call.
+                unsafe {
+                    __android_log_write(self.priority, TAG.as_ptr().cast(), line.as_ptr().cast());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "otel")]
 mod imp {
     use std::sync::{Mutex, OnceLock};
@@ -417,13 +516,7 @@ mod imp {
             .with(crate::net_health::RelayTap);
 
         #[cfg(target_os = "android")]
-        let registry = registry.with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(paranoid_android::AndroidLogMakeWriter::new(
-                    "streetcryptid".to_owned(),
-                )),
-        );
+        let registry = registry.with(super::logcat::layer());
 
         if registry.try_init().is_ok() {
             let _ = RELOAD_HANDLE.set(handle);
@@ -835,14 +928,12 @@ mod imp {
         #[cfg(target_os = "android")]
         {
             use tracing_subscriber::prelude::*;
-            use tracing_subscriber::{fmt, EnvFilter};
+            use tracing_subscriber::EnvFilter;
             let filter = EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(super::DEFAULT_FILTER));
             let _ = tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer().with_ansi(false).with_writer(
-                    paranoid_android::AndroidLogMakeWriter::new("streetcryptid".to_owned()),
-                ))
+                .with(super::logcat::layer())
                 .try_init();
         }
     }
