@@ -843,6 +843,16 @@ class IrohLocationModule : Module() {
       ServiceRecovery.requestBatteryOptimizationExemption(context)
     }
 
+    /// Whether Google Play services' activity recognition can run here: the physical-activity
+    /// permission step is shown only when it can.
+    Function("motionActivityAvailable") {
+      val context = appContext.reactContext?.applicationContext ?: return@Function false
+      PlayServices.available(context)
+    }
+
+    /// The physical-activity permission was answered; let a running service act on it now.
+    Function("refreshMotionActivity") { BackgroundLocationService.refreshMotionActivity() }
+
     Function("stopNativeBackground") {
       sink = null
       BackgroundLocationService.stop(

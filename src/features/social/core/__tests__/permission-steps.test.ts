@@ -9,7 +9,7 @@ import {
   type PermissionContext,
 } from '../permission-steps';
 
-const NATIVE = { bluetooth: true, localNetwork: true, battery: true };
+const NATIVE = { bluetooth: true, localNetwork: true, battery: true, motion: true };
 
 function ctx(overrides: Partial<PermissionContext> = {}): PermissionContext {
   return {
@@ -41,6 +41,7 @@ describe('pendingPermissionSteps', () => {
       'bluetooth',
       'local-network',
       'notifications',
+      'motion',
       'battery',
     ]);
   });
@@ -68,6 +69,7 @@ describe('pendingPermissionSteps', () => {
       bluetooth: true,
       'local-network': true,
       notifications: true,
+      motion: true,
       battery: true,
     };
     expect(pendingPermissionSteps(ctx({ granted }))).toEqual(['location']);
@@ -85,7 +87,7 @@ describe('pendingPermissionSteps', () => {
       recorded: true,
       granted: { location: true },
     });
-    expect(pendingPermissionSteps(next)).toEqual(['notifications', 'battery']);
+    expect(pendingPermissionSteps(next)).toEqual(['notifications', 'motion', 'battery']);
   });
 
   it('folds local network into the Bluetooth dialog before Android 17', () => {
@@ -101,6 +103,7 @@ describe('pendingPermissionSteps', () => {
     });
     expect(pendingPermissionSteps({ ...next, granted: { location: true } })).toEqual([
       'background-location',
+      'motion',
       'battery',
     ]);
   });
@@ -126,15 +129,15 @@ describe('pendingPermissionSteps', () => {
   it('leaves out steps an older binary cannot ask', () => {
     const old = ctx({
       platform: 'ios',
-      native: { bluetooth: false, localNetwork: false, battery: false },
+      native: { bluetooth: false, localNetwork: false, battery: false, motion: false },
     });
     expect(pendingPermissionSteps(old)).toEqual(['location']);
   });
 
   describe('an install onboarded before this flow', () => {
-    it('is owed only the battery step, like the gate it replaced', () => {
+    it('is owed only the steps the old init path never asked: motion and battery', () => {
       const legacy = ctx({ androidApi: 34, disclosure: 'accepted', granted: { location: true } });
-      expect(pendingPermissionSteps(legacy)).toEqual(['battery']);
+      expect(pendingPermissionSteps(legacy)).toEqual(['motion', 'battery']);
     });
 
     it('is owed Android 17 local network when it is still missing', () => {
@@ -142,7 +145,7 @@ describe('pendingPermissionSteps', () => {
         disclosure: 'accepted',
         granted: { location: true, 'local-network': false },
       });
-      expect(pendingPermissionSteps(legacy)).toEqual(['local-network', 'battery']);
+      expect(pendingPermissionSteps(legacy)).toEqual(['local-network', 'motion', 'battery']);
     });
 
     it('is owed nothing on iOS, where local network cannot be read', () => {
@@ -158,7 +161,7 @@ describe('pendingPermissionSteps', () => {
         asked: new Set(['battery']),
         granted: { location: true },
       });
-      expect(pendingPermissionSteps(legacy)).toEqual([]);
+      expect(pendingPermissionSteps(legacy)).toEqual(['motion']);
     });
 
     it('stops being legacy once anything is recorded', () => {
@@ -177,8 +180,11 @@ describe('seedLegacyInstall', () => {
     const legacy = ctx({ androidApi: 34, disclosure: 'accepted', granted: { location: true } });
     const seeded = seedLegacyInstall(legacy);
     expect(seeded?.recorded).toBe(true);
-    expect(pendingPermissionSteps(seeded!)).toEqual(['battery']);
-    const answered = { ...seeded!, asked: new Set([...seeded!.asked, 'battery' as const]) };
+    expect(pendingPermissionSteps(seeded!)).toEqual(['motion', 'battery']);
+    const answered = {
+      ...seeded!,
+      asked: new Set([...seeded!.asked, 'motion' as const, 'battery' as const]),
+    };
     expect(pendingPermissionSteps(answered)).toEqual([]);
   });
 
@@ -196,6 +202,7 @@ describe('projectedPermissionSteps', () => {
       'bluetooth',
       'local-network',
       'notifications',
+      'motion',
       'battery',
     ]);
   });
@@ -225,6 +232,7 @@ describe('permissionJourney', () => {
       'upcoming',
       'upcoming',
       'upcoming',
+      'upcoming',
     ]);
   });
 
@@ -248,14 +256,16 @@ describe('permissionJourney', () => {
       { step: 'bluetooth', state: 'current' },
       { step: 'local-network', state: 'upcoming' },
       { step: 'notifications', state: 'skipped' },
+      { step: 'motion', state: 'skipped' },
       { step: 'battery', state: 'skipped' },
     ]);
   });
 
-  it('is one row for an install owed one step', () => {
+  it('is only the rows an older install is owed', () => {
     const legacy = ctx({ disclosure: 'accepted', androidApi: 34, granted: { location: true } });
     expect(permissionJourney(projectedPermissionSteps(legacy), legacy, {})).toEqual([
-      { step: 'battery', state: 'current' },
+      { step: 'motion', state: 'current' },
+      { step: 'battery', state: 'upcoming' },
     ]);
   });
 });

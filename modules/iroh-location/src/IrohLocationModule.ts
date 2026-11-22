@@ -165,6 +165,16 @@ export declare class IrohLocationNativeModule
    */
   requestBatteryOptimizationExemption?(): boolean;
   /**
+   * Android: whether Google Play services' activity recognition is available, which is what the
+   * physical-activity permission step is for. ANDROID ONLY, OPTIONAL.
+   */
+  motionActivityAvailable?(): boolean;
+  /**
+   * Android: re-subscribe the running service to activity transitions, after the permission was
+   * granted. ANDROID ONLY, OPTIONAL.
+   */
+  refreshMotionActivity?(): void;
+  /**
    * iOS: Bluetooth authorization, read from `CBManager.authorization` WITHOUT creating a manager â€”
    * creating one is what shows the alert. IOS ONLY, OPTIONAL (Android reads its runtime permissions
    * from JS).

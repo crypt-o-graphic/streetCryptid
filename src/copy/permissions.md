@@ -251,6 +251,37 @@ It stays up for as long as sharing is on, so you can always tell.
 
 Allow notifications
 
+## motion
+
+### name
+
+Physical activity
+
+### title
+
+Turn GPS off when you stop
+
+### lede
+
+Your phone can tell when you are walking, driving or sitting still. streetCryptid uses that to
+switch GPS off while you stay put and back on when you move, which saves battery and data.
+
+### summary
+
+Use GPS only while you are moving.
+
+### card: STAYS ON YOUR PHONE (green)
+
+Only "moving" or "still" is used, to decide when to run GPS. It is never shared or sent anywhere.
+
+### note
+
+If you skip it, streetCryptid notices a stop more slowly and keeps GPS on a little longer.
+
+### action
+
+Allow physical activity
+
 ## battery
 
 ### name

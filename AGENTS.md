@@ -894,9 +894,17 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   replica notifications or pull results to JS, and the JS heartbeat timer is paused
   (`onEnterBackground`). The JS revive fence and periodic refresh are no longer scheduled on any
   platform: `ServiceRecovery` restarts the service, and `retireJsBackgroundTasks` unregisters
-  what older builds left. The service has `moving` and `stopped` states. After 10 min with no
-  delivery it turns GPS off and listens to the passive provider and the significant-motion
-  sensor, and either one brings it back. While a phone stays parked the core publishes on the
+  what older builds left. The service has `moving` and `stopped` states, and uses the platform's
+  own signals for both wherever Google Play services exists, with a fallback that needs none of
+  it (a phone without Google must still share). Positions: the fused provider, else
+  `LocationManager` (`LocationSource.kt`). Stopping: activity recognition's `STILL` (the `motion`
+  permission step), else 10 min with nothing past the 50 m filter. Leaving: activity recognition,
+  a Play services exit geofence on the stop, and a passive or maintenance position 150 m away,
+  else the significant-motion sensor (`MotionSignals.kt`; `location.runtime{event=started}`
+  says which a phone got). Stopped means GPS off. **The service's clock is an `AlarmManager`
+  alarm, never a coroutine `delay`**: that clock stops while the CPU sleeps, and with GPS off
+  nothing wakes it, so a 30-minute wait could last for hours. Work after a wake holds a partial
+  wake lock (`launchAwake`). While a phone stays parked the core publishes on the
   data mode's maintenance cadence (Balanced 30 min, Saver 60 min, one envelope for all the
   slots missed; `publish.rs`, `dial_gate::parked_heartbeat_floor`). That deliberately trades
   away the uniform-cadence rule above while parked: the stash can now tell a parked phone from a
