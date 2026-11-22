@@ -422,6 +422,7 @@ pub fn record_network_health(trigger: String, context: Option<NetworkContext>) {
     let (node_state, endpoint) = live_endpoint(host.current());
     let view = endpoint.map(|ep| endpoint_view(generation, &ep));
     let tally = take_tally();
+    let conns = crate::conn_ledger::take_window();
 
     let known = relay_hosts();
     let relay_errors: u64 = tally.relay.values().sum();
@@ -537,6 +538,50 @@ pub fn record_network_health(trigger: String, context: Option<NetworkContext>) {
             if let Some(value) = value {
                 span.record(field, value);
             }
+        }
+    }
+    drop(span.entered());
+    record_connections(&conns, view.as_ref().map(|v| v.delta));
+}
+
+/// `net.conns`: the same window by connection (`conn_ledger`). A span of its own because
+/// `net.health` is at tracing's 32-field limit.
+fn record_connections(conns: &crate::conn_ledger::Window, endpoint: Option<Counters>) {
+    let span = tracing::info_span!(
+        "net.conns",
+        conn.tx_bytes = conns.tx_bytes,
+        conn.rx_bytes = conns.rx_bytes,
+        conn.lost_bytes = conns.lost_bytes,
+        conn.attempts = conns.attempts,
+        conn.handshakes = conns.handshakes,
+        conn.closed = conns.closed,
+        conn.live = conns.live,
+        conn.top_tx = tracing::field::Empty,
+        conn.top_attempts = tracing::field::Empty,
+        conn.by_alpn = tracing::field::Empty,
+        conn.unattributed_tx = tracing::field::Empty,
+        runtime.tokio_tasks = tracing::field::Empty,
+    );
+    // Every task alive on the node's runtime. Beside `conn.live`, the first thing to read when
+    // `memory.rust_live_bytes` climbs: a leaked task holds its whole future.
+    if let Some(tasks) = crate::conn_ledger::tokio_alive_tasks() {
+        span.record("runtime.tokio_tasks", tasks);
+    }
+    // What the endpoint sent that no connection accounts for: handshakes that never completed,
+    // relay framing, probes. Both sides are this window's.
+    if let Some(d) = endpoint {
+        span.record(
+            "conn.unattributed_tx",
+            (d.send_ip_bytes + d.send_relay_bytes).saturating_sub(conns.tx_bytes),
+        );
+    }
+    for (field, value) in [
+        ("conn.top_tx", &conns.top_tx),
+        ("conn.top_attempts", &conns.top_attempts),
+        ("conn.by_alpn", &conns.by_alpn),
+    ] {
+        if !value.is_empty() {
+            span.record(field, value.as_str());
         }
     }
     drop(span.entered());

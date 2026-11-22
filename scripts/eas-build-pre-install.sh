@@ -116,6 +116,7 @@ cache_ready() {
     [[ -s "$stage/bindings/iroh_location/iroh_location.kt" ]] || return 1
     for abi in $SC_ANDROID_ABIS; do
       [[ -s "$stage/$abi/libiroh_location.so" ]] || return 1
+      [[ -s "$stage/symbols/$abi/libiroh_location.so" ]] || return 1
     done
   else
     [[ -s "$stage/IrohLocationFFI.xcframework/Info.plist" &&
@@ -179,20 +180,54 @@ if [[ "$platform" == "android" ]]; then
       cargo install cargo-ndk --version 4.1.2 --locked
   fi
 
+  # Built with its symbol table and a GNU build id, then stripped for the APK below, with the
+  # symbol copy kept in the stage. A heapprofd profile records only a library's build id and
+  # offsets into it, and on 2026-11-21 a Pixel's 1.7 GB Rust heap could not be named because the
+  # shipped library had neither: no build id to match a copy by, and no copy with symbols. The
+  # APK's library is as small as before. `scripts/profile/android-heap.sh` symbolizes against
+  # the copy, which the workflows publish as the `android-native-symbols` artifact.
   (
     cd "$crate_dir"
+    export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+    # The soname is what an unwinder names a library mapped straight out of the APK by
+    # (`base.apk!libiroh_location.so`); without one a profile shows a bare `base.apk`.
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,--build-id=sha1 -C link-arg=-Wl,-soname,libiroh_location.so"
     sc_profile_run 'cargo-build' \
       cargo ndk "${ndk_args[@]}" -o "$jni_libs" build --locked --release --timings
   )
   sc_profile_collect_cargo_timings
+
+  symbols_dir="$target_dir/android-symbols"
+  rm -rf "$symbols_dir"
+  ndk_home="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
+  llvm_strip=''
+  for candidate in "$ndk_home"/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+    "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}"/ndk/*/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
+    if [[ -x "$candidate" ]]; then
+      llvm_strip="$candidate"
+      break
+    fi
+  done
+  for abi in $SC_ANDROID_ABIS; do
+    mkdir -p "$symbols_dir/$abi"
+    cp "$jni_libs/$abi/libiroh_location.so" "$symbols_dir/$abi/"
+    if [[ -n "$llvm_strip" ]]; then
+      "$llvm_strip" --strip-all "$jni_libs/$abi/libiroh_location.so"
+    else
+      # Gradle strips native libraries itself when it finds the NDK, so the worst this ships is a
+      # symbol table, never a broken library.
+      echo "eas-build-pre-install: no llvm-strip found; $abi keeps its symbol table" >&2
+    fi
+  done
 
   # Stage what was just built so the next run -- and, from the main-branch warm job, every open
   # pull request -- can skip all of the above.
   rm -rf "$stage"
   mkdir -p "$stage"
   for abi in $SC_ANDROID_ABIS; do
-    mkdir -p "$stage/$abi"
+    mkdir -p "$stage/$abi" "$stage/symbols/$abi"
     cp "$jni_libs/$abi/libiroh_location.so" "$stage/$abi/"
+    cp "$symbols_dir/$abi/libiroh_location.so" "$stage/symbols/$abi/"
   done
   cp -R "$bindings_dir" "$stage/bindings"
   exit 0

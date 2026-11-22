@@ -196,6 +196,12 @@ for abi in arm64-v8a armeabi-v7a x86_64; do
     fail "the first Android run did not produce $abi"
 done
 grep -q 'bindgen android' "$build_log" || fail "the first Android run skipped binding generation"
+# The symbol copy travels with the library: a heapprofd profile of a cache-hit build is symbolized
+# against it (scripts/profile/android-heap.sh).
+for abi in arm64-v8a armeabi-v7a x86_64; do
+  compgen -G "$test_root/cache/android/*/symbols/$abi/libiroh_location.so" > /dev/null ||
+    fail "the first Android run did not stage symbols for $abi"
+done
 
 # --- 2. A different checkout of the same sources hits, and a subset hits -----
 
