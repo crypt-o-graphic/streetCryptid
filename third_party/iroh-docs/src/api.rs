@@ -96,6 +96,7 @@ impl DocsApi {
                     DocsProtocol::SetHash(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Get(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetExact(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::InsertRemote(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ImportFile(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ExportFile(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Del(msg) => local.send((msg, tx)).await,
