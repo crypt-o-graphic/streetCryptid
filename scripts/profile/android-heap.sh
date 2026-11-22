@@ -171,7 +171,9 @@ symbols_for() { # symbols_for <--run ID | --commit SHA | --symbols DIR>
       local dir="$CACHE/symbols/$run"
       if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"
-        gh run download "$run" --name android-native-symbols --dir "$dir" ||
+        local target="$dir"
+        command -v cygpath > /dev/null 2>&1 && target="$(cygpath -m "$dir")"
+        gh run download "$run" --name android-native-symbols --dir "$target" ||
           die "run $run has no android-native-symbols artifact (built before 2026-11-21?)"
       fi
       printf '%s\n' "$dir"
@@ -187,7 +189,7 @@ cmd_report() {
     trace="$(ls -t "$OUT"/*/heap.perfetto-trace 2> /dev/null | head -n1 || true)"
     [[ -n "$trace" ]] || die "no trace under $OUT; run \`$0 pull\` first"
   fi
-  local symbols symbolizer py
+  local symbols symbolizer py script
   symbols="$(symbols_for "$mode" "$value")"
   symbolizer="$(find_symbolizer)" ||
     die "llvm-symbolizer not found: install the NDK or put llvm-symbolizer on PATH"
@@ -197,10 +199,13 @@ cmd_report() {
     trace="$(cygpath -m "$trace")"
     symbols="$(cygpath -m "$symbols")"
     symbolizer="$(cygpath -m "$symbolizer")"
+    script="$(cygpath -m "$here/heap_report.py")"
+  else
+    script="$here/heap_report.py"
   fi
   echo "trace:   $trace" >&2
   echo "symbols: $symbols" >&2
-  "$py" "$here/heap_report.py" --trace "$trace" --symbols "$symbols" --symbolizer "$symbolizer"
+  "$py" "$script" --trace "$trace" --symbols "$symbols" --symbolizer "$symbolizer"
 }
 
 case "${1:-}" in
