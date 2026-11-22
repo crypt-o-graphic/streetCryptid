@@ -76,6 +76,24 @@ pub mod transport;
 /// The docs-path key epoch is the per-wrap `i` in the v3 ratchet header (§4.7), not this.
 pub const DOCS_MESH_EPOCH: u32 = 0;
 
+/// How often a pull also refreshes friends' profiles. A profile changes when its owner edits a
+/// name or a repeater card, not between two pulls. Every pull used to sync every friend's profile
+/// namespace with the stash as well as the trail: 14 more connections at ~19 KB each, and the app
+/// on screen pulls every 20 to 90 s (2026-11-21).
+const PROFILE_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Whether this pull may refresh profiles, and if so, mark it as having done so.
+fn claim_profile_refresh() -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if last.is_some_and(|at| now.saturating_duration_since(at) < PROFILE_REFRESH_FLOOR) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
 /// Where [`LocationNode::set_data_mode`] keeps the mode, in `state_dir`, as its name.
 const DATA_MODE_FILE: &str = "data_mode";
 pub mod host;
@@ -4941,7 +4959,7 @@ impl LocationNode {
 
             // Reopened profile replicas are not syncing. Wait for known friends' cards alongside
             // the trail pass, then persist what arrived before a native-only node can shut down.
-            let profile_budget = if friend_namespaces.is_empty() {
+            let profile_budget = if friend_namespaces.is_empty() || !claim_profile_refresh() {
                 std::time::Duration::ZERO
             } else {
                 deadline
