@@ -110,6 +110,13 @@ const INBOUND_WARM: Duration = Duration::from_secs(5 * 60);
 const FRESH_WARM: Duration = Duration::from_secs(5 * 60);
 /// A BLE / LAN contact this recent means the friend is still close by.
 const LOCAL_WARM: Duration = Duration::from_secs(15 * 60);
+/// In `Balanced`, the least time between two direct exchanges with one friend that is not nearby.
+/// Evidence of being awake is itself made by direct exchanges: A's push to B is an inbound
+/// connection for B, which makes B push to A, which is an inbound connection for A, and two phones
+/// that never sleep would keep each other warm indefinitely, 2 × 288 pushes a day. A friend who is
+/// being watched is also polled through the stash every 20 to 90 s, so a quarter of an hour
+/// between direct exchanges costs nobody a live dot.
+const DIRECT_EVERY: Duration = Duration::from_secs(15 * 60);
 /// How long later dials to the same friend wait for the first one's handshake.
 const COALESCE_WAIT: Duration = Duration::from_secs(10);
 
@@ -131,6 +138,8 @@ struct Peer {
     local: Option<Instant>,
     fresh: Option<Instant>,
     cooldown_until: Option<Instant>,
+    /// When the last dial to it that was not waiting on another went out.
+    last_lead: Option<Instant>,
     /// A dial in flight: when it started, which one it is, and where its outcome is announced.
     inflight: Option<(Instant, u64, tokio::sync::watch::Sender<Option<bool>>)>,
 }
@@ -270,8 +279,19 @@ pub(crate) fn allow_friend(friend: &[u8; 32]) -> bool {
         if !gating(s.has_carrier) || !s.friends.contains(friend) {
             return true;
         }
-        verdict(s.mode, s.peers.get(friend), "sync", Instant::now()) == Verdict::Allow
+        let now = Instant::now();
+        let peer = s.peers.get(friend);
+        verdict(s.mode, peer, "sync", now) == Verdict::Allow && !rate_limited(s.mode, peer, now)
     })
+}
+
+/// Whether a new direct exchange with this friend would come too soon after the last
+/// ([`DIRECT_EVERY`]). Nearby friends are never limited: that costs no mobile data.
+fn rate_limited(mode: DataMode, peer: Option<&Peer>, now: Instant) -> bool {
+    mode == DataMode::Balanced
+        && peer.is_some_and(|p| {
+            !recent(p.local, LOCAL_WARM, now) && recent(p.last_lead, DIRECT_EVERY, now)
+        })
 }
 
 /// Whether a background pull may run now, and if so, mark it as run. Foreground pulls (the app on
@@ -350,6 +370,7 @@ impl EndpointHooks for DialGateHook {
                 }
                 Verdict::Allow => {
                     let dial = s.next_dial;
+                    let mode = s.mode;
                     let peer = s.peers.entry(id).or_default();
                     match &peer.inflight {
                         Some((started, _, tx))
@@ -359,9 +380,14 @@ impl EndpointHooks for DialGateHook {
                             s.coalesced += 1;
                             Next::Wait(rx)
                         }
+                        _ if rate_limited(mode, Some(&*peer), now) => {
+                            *s.refused.entry(("rate", label)).or_default() += 1;
+                            Next::No
+                        }
                         _ => {
                             let (tx, _rx) = tokio::sync::watch::channel(None);
                             peer.inflight = Some((now, dial, tx.clone()));
+                            peer.last_lead = Some(now);
                             s.next_dial += 1;
                             Next::Lead(dial, tx)
                         }
@@ -590,6 +616,28 @@ mod tests {
             verdict(DataMode::Balanced, Some(&nearby), "sync", now),
             Verdict::Allow
         );
+    }
+
+    #[test]
+    fn balanced_spaces_direct_exchanges_unless_the_friend_is_nearby() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let just_dialled = Peer {
+            last_lead: at(now, 60),
+            ..Peer::default()
+        };
+        assert!(rate_limited(DataMode::Balanced, Some(&just_dialled), now));
+        assert!(!rate_limited(DataMode::Realtime, Some(&just_dialled), now));
+        let a_while_ago = Peer {
+            last_lead: at(now, 16 * 60),
+            ..Peer::default()
+        };
+        assert!(!rate_limited(DataMode::Balanced, Some(&a_while_ago), now));
+        let nearby = Peer {
+            last_lead: at(now, 60),
+            local: at(now, 60),
+            ..Peer::default()
+        };
+        assert!(!rate_limited(DataMode::Balanced, Some(&nearby), now));
     }
 
     #[test]
