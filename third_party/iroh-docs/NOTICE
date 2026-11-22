@@ -31,6 +31,31 @@ Modifications by the streetCryptid project
         after one accept task panicked. The panicked task's (namespace, peer) state may stay
         marked running, which costs that one pair its syncs, not the node.
 
+2026-11-22 — dropped subscriptions were kept until their namespace next had an event:
+
+  * src/sync.rs, src/engine/live.rs
+      - `Subscribers::subscribe` (both: the replica's and the live actor's) first drops every sender
+        whose receiver is closed. Each `Engine::subscribe` makes two `async_channel::bounded(256)`
+        channels, which preallocate their slots (~46 KB). A sender was removed only when an event
+        failed to reach it, so a namespace that got no events (a friend whose phone was asleep)
+        kept one pair per subscribe. The phone subscribes to every namespace on every pull. A
+        heapprofd profile of a Pixel 10 attributed the largest live share of its Rust heap to
+        exactly these channels, `RpcActor::handle` → `async_channel::bounded::<Event>`, on a
+        heap that grew ~20 MB an hour to 1.7 GB.
+
+2026-11-22 — entries handed over outside a sync (the stash's HTTP batch, `/v1/batch`):
+
+  * src/api.rs, src/api/protocol.rs, src/api/actor.rs
+      - `Doc::get_many_signed`: `get_many` without dropping each entry's signatures, so an entry
+        can be handed to another replica intact.
+      - `Doc::insert_remote` / `InsertRemoteRequest`: insert an entry another replica signed
+        through the replica actor's existing `insert_remote` (the path sync uses), recording the
+        delivering peer and whether the content is already local. The replica verifies the
+        signatures and applies its newer-wins rule as it would for a synced entry.
+    The stash serves a phone's whole pull, and takes its publishes, in one HTTPS request instead of
+    one QUIC connection per namespace and per blob (~20-40 KB of handshake and path probing each,
+    measured 2026-11-21).
+
 The crate's Cargo.lock, Cargo.toml.orig, .cargo_vcs_info.json, CI config, examples, tests and
 proptest regressions were not vendored, and the [[example]] / [[test]] entries are removed from
 Cargo.toml. No other file differs from the published 0.101.0 crate.
