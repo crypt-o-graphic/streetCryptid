@@ -46,7 +46,7 @@ helm install trail-stash oci://ghcr.io/<owner>/charts/trail-stash \
 
 | Key                                         | Default                                 | Notes                                                                                                                               |
 | ------------------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `image.repository` / `image.tag`            | `ghcr.io/unrealjune/trail-stash` / `""` | Tag defaults to chart `appVersion`. Pin an immutable tag in prod.                                                                   |
+| `image.repository` / `image.tag`            | `ghcr.io/crypt-o-graphic/trail-stash` / `""` | Tag defaults to chart `appVersion`. Pin an immutable tag in prod.                                                                   |
 | `secret.existingSecret`                     | `""`                                    | **Recommended.** Name of a Secret holding the keys below.                                                                           |
 | `secret.secretKey`                          | `""`                                    | Inline `TRAIL_STASH_SECRET_KEY` (only when `existingSecret` empty). Required then.                                                  |
 | `secret.psk`                                | `""`                                    | Inline `TRAIL_STASH_PSK` (control-API bearer). Unset ⇒ open API (warned).                                                           |
