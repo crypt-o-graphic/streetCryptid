@@ -18,6 +18,8 @@
 
 /// Rust's share of the native heap, counted by a wrapper around the system allocator.
 mod alloc_stats;
+/// The phone's half of the stash's `POST /v1/batch` (module docs).
+mod batch_client;
 mod ble;
 /// QUIC bytes per (ALPN, remote) for `net.conns`, from an endpoint hook (see the module docs).
 mod conn_ledger;
@@ -1218,6 +1220,113 @@ impl LocationNode {
     /// [`stash`]). Does nothing when the stash is not opted into. The HTTP runs on its own task, so
     /// no caller ever waits on the stash; what this awaits is local (the delivery store and one
     /// docs ticket).
+    /// One request to the stash's batch endpoint: our entries written since the last batch that
+    /// stored them (when `publish`), and every friend namespace newer than what we hold. What comes
+    /// back is inserted into the replica as a sync would, delivered by the stash.
+    ///
+    /// `Err` means the batch did not do its job and the caller should use iroh as before: the
+    /// stash has no batch endpoint, could not be reached, or did not store everything published.
+    async fn stash_batch(
+        &self,
+        base_url: &str,
+        psk: Option<&str>,
+        publish: bool,
+        timeout: std::time::Duration,
+    ) -> Result<(), batch_client::BatchFailure> {
+        use streetcryptid_repeater::stash_batch::{BatchRequest, PublishStatus, BATCH_VERSION};
+        use tracing::Instrument;
+        static PUBLISHED_UNTIL_US: AtomicU64 = AtomicU64::new(0);
+
+        let span = tracing::info_span!(
+            "stash.batch",
+            sc.author = %telemetry::short_hex(&self.author),
+            batch.publish = tracing::field::Empty,
+            batch.stored = tracing::field::Empty,
+            batch.pull = tracing::field::Empty,
+            batch.entries_in = tracing::field::Empty,
+            batch.inserted = tracing::field::Empty,
+            batch.refused = tracing::field::Empty,
+            batch.bytes_out = tracing::field::Empty,
+            batch.bytes_in = tracing::field::Empty,
+            batch.truncated = tracing::field::Empty,
+            batch.outcome = tracing::field::Empty,
+        );
+        async {
+            let current = tracing::Span::current();
+            let started = self
+                .live()
+                .await
+                .map_err(|e| batch_client::BatchFailure::Transport(e.to_string()))?;
+            let trail = started.trail.clone();
+            let (publish_entries, newest) = if publish {
+                trail
+                    .own_signed_since(PUBLISHED_UNTIL_US.load(Ordering::Relaxed))
+                    .await
+                    .map_err(|e| batch_client::BatchFailure::Transport(e.to_string()))?
+            } else {
+                (Vec::new(), 0)
+            };
+            let cursors = trail.pull_cursors().await;
+            current.record("batch.publish", publish_entries.len());
+            current.record("batch.pull", cursors.len());
+            let request = BatchRequest {
+                v: BATCH_VERSION,
+                publish: publish_entries,
+                pull: cursors,
+            };
+            let outcome = batch_client::post(base_url, psk, &request, timeout).await;
+            let (response, sent, received) = match outcome {
+                Ok(answer) => answer,
+                Err(failure) => {
+                    current.record(
+                        "batch.outcome",
+                        match failure {
+                            batch_client::BatchFailure::Unsupported => "unsupported",
+                            batch_client::BatchFailure::Status(_) => "status",
+                            batch_client::BatchFailure::Transport(_) => "transport",
+                            batch_client::BatchFailure::Decode(_) => "decode",
+                        },
+                    );
+                    return Err(failure);
+                }
+            };
+            current.record("batch.bytes_out", sent);
+            current.record("batch.bytes_in", received);
+            current.record("batch.truncated", response.truncated);
+            let stored = response
+                .published
+                .iter()
+                .filter(|status| **status == PublishStatus::Stored)
+                .count();
+            current.record("batch.stored", stored);
+            current.record("batch.entries_in", response.entries.len());
+            let stash = self.peer_roles().await.stash().copied().unwrap_or([0; 32]);
+            let (inserted, refused) = trail.import_batch(response.entries, stash).await;
+            current.record("batch.inserted", inserted);
+            current.record("batch.refused", refused);
+            if response
+                .published
+                .iter()
+                .any(|status| *status == PublishStatus::UnknownNamespace)
+            {
+                // The stash forgot us (a restart): grant again, and push through iroh this time.
+                self.grant_stash(StashGrant::All { floored: true }, "batch")
+                    .await;
+            }
+            if stored < request.publish.len() || response.published.len() < request.publish.len() {
+                current.record("batch.outcome", "partial");
+                return Err(batch_client::BatchFailure::Status(207));
+            }
+            if publish {
+                PUBLISHED_UNTIL_US.fetch_max(newest, Ordering::Relaxed);
+            }
+            current.record("batch.outcome", "ok");
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+
     async fn grant_stash(&self, scope: StashGrant, reason: &'static str) {
         use tracing::Instrument;
         let Some(live) = self.live_opt().await else {
@@ -4813,6 +4922,9 @@ impl LocationNode {
             // background pull did not run at all (`floor`: the data mode's pull floor).
             sync.peers_gated = tracing::field::Empty,
             sync.gated = tracing::field::Empty,
+            // The stash answered this pull through its batch endpoint (`stash_batch`), so it was
+            // not synced over QUIC.
+            sync.via_batch = tracing::field::Empty,
             sync.repeater_peers = tracing::field::Empty,
             // Peers that delivered at least one entry this pass — each is a `peer.contact`.
             sync.peers_delivered = tracing::field::Empty,
@@ -4927,6 +5039,28 @@ impl LocationNode {
                 }
             }
             tracing::Span::current().record("sync.peers_gated", gated);
+            // Every friend's trail from the stash in one HTTPS request when it can (see
+            // `stash_batch`), and then no QUIC sync with the stash at all: 18 namespace syncs
+            // and a blob fetch per changed friend, about 1 MB a pull (2026-11-21).
+            let mut shared = shared;
+            if let Ok(config) = self.delivery_config().await {
+                if let Some((base_url, psk)) = config.stash() {
+                    let timeout = deadline
+                        .map(|end| end.saturating_duration_since(n0_future::time::Instant::now()))
+                        .unwrap_or(std::time::Duration::from_secs(15))
+                        .min(std::time::Duration::from_secs(15));
+                    if self
+                        .stash_batch(base_url, psk.as_deref(), false, timeout)
+                        .await
+                        .is_ok()
+                    {
+                        if let Some(stash) = self.peer_roles().await.stash().copied() {
+                            shared.retain(|addr| addr.id.as_bytes() != &stash);
+                        }
+                        tracing::Span::current().record("sync.via_batch", true);
+                    }
+                }
+            }
             let peers = shared;
             let dialed_endpoints: Vec<EndpointId> = dialed_endpoints
                 .into_iter()
@@ -6097,8 +6231,31 @@ impl publish::PublishSink for NodeSink<'_> {
             .in_scope(|| {});
             return Ok(publish::FlushOutcome::Deferred);
         }
+        // The stash first, through its batch endpoint when it has one: the entries and their bytes
+        // in one HTTPS request, instead of a QUIC sync and a QUIC fetch-back (~60 KB a publish,
+        // 2026-11-21). It answers with whatever friends published since, for free. Friends that
+        // look awake and our repeaters are still reached by the push below, without the stash.
+        let mut tickets = config.peer_tickets.clone();
+        let mut batched = false;
+        if let Some((base_url, psk)) = config.stash() {
+            let timeout = budget.min(std::time::Duration::from_secs(15));
+            if node
+                .stash_batch(base_url, psk.as_deref(), true, timeout)
+                .await
+                .is_ok()
+            {
+                batched = true;
+                if let Some(stash) = node.peer_roles().await.stash().copied() {
+                    tickets.retain(|ticket| {
+                        ticket
+                            .parse::<EndpointTicket>()
+                            .map_or(true, |t| t.endpoint_addr().id.as_bytes() != &stash)
+                    });
+                }
+            }
+        }
         // This is the push. Its success or failure is the whole of whether the entries left.
-        node.push_trail_within(config.peer_tickets.clone(), budget)
+        node.push_trail_within(tickets, budget)
             .await
             .map_err(|e| publish::PublishError::Send(e.to_string()))?;
         if let Some(carriers) = carriers_only {
@@ -6124,7 +6281,7 @@ impl publish::PublishSink for NodeSink<'_> {
         //
         // Under a deadline it gets whatever the push left, and is skipped when that is nothing:
         // the push is what the friend's map reads, and the stash reports a missing blob itself.
-        if let Some((base_url, psk)) = config.stash() {
+        if let Some((base_url, psk)) = config.stash().filter(|_| !batched) {
             let upload = node.upload_trail_content(base_url.to_string(), psk);
             let result = match self.deadline {
                 None => Some(upload.await),

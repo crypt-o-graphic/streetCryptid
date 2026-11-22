@@ -1238,6 +1238,116 @@ impl TrailDocs {
         Ok(report)
     }
 
+    /// Our own entries written after `since_us`, signed and with their bytes: what the stash batch
+    /// publishes (`streetcryptid_repeater::stash_batch`). Returns them with the newest timestamp
+    /// among them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn own_signed_since(
+        &self,
+        since_us: u64,
+    ) -> Result<(Vec<streetcryptid_repeater::stash_batch::BatchEntry>, u64)> {
+        let doc = self.doc_for(self.own_ns).await?;
+        let stream = doc
+            .get_many_signed(Query::single_latest_per_key().build())
+            .await?;
+        tokio::pin!(stream);
+        let mut out = Vec::new();
+        let mut newest = since_us;
+        while let Some(signed) = stream.next().await {
+            let signed = signed?;
+            let entry = signed.entry();
+            if entry.timestamp() <= since_us || entry.content_len() == 0 {
+                continue;
+            }
+            let Ok(content) = self.blobs.blobs().get_bytes(entry.content_hash()).await else {
+                continue;
+            };
+            newest = newest.max(entry.timestamp());
+            out.push(streetcryptid_repeater::stash_batch::BatchEntry {
+                namespace: self.own_ns.to_bytes(),
+                entry: postcard::to_allocvec(&signed)?,
+                content: content.to_vec(),
+            });
+        }
+        Ok((out, newest))
+    }
+
+    /// Every friend namespace with the newest entry timestamp this replica holds in it: the
+    /// stash batch's read cursors.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn pull_cursors(&self) -> Vec<streetcryptid_repeater::stash_batch::PullCursor> {
+        let mut cursors = Vec::new();
+        for ns in self.namespaces().await {
+            if ns == self.own_ns {
+                continue;
+            }
+            let mut since_us = 0;
+            if let Ok(doc) = self.doc_for(ns).await {
+                if let Ok(stream) = doc.get_many(Query::single_latest_per_key().build()).await {
+                    tokio::pin!(stream);
+                    while let Some(Ok(entry)) = stream.next().await {
+                        since_us = since_us.max(entry.timestamp());
+                    }
+                }
+            }
+            cursors.push(streetcryptid_repeater::stash_batch::PullCursor {
+                namespace: ns.to_bytes(),
+                since_us,
+            });
+        }
+        cursors
+    }
+
+    /// Put entries the stash handed over into the replica, bytes first, as a sync would: the
+    /// replica verifies both signatures and keeps the newer of two entries for a key, and the
+    /// namespace's watch reports each as delivered by `from`. Returns (inserted, refused).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn import_batch(
+        &self,
+        entries: Vec<streetcryptid_repeater::stash_batch::BatchEntry>,
+        from: [u8; 32],
+    ) -> (usize, usize) {
+        let held: std::collections::HashSet<[u8; 32]> = self
+            .namespaces()
+            .await
+            .into_iter()
+            .map(|ns| ns.to_bytes())
+            .collect();
+        let (mut inserted, mut refused) = (0, 0);
+        for item in entries {
+            let ok = async {
+                if !held.contains(&item.namespace) || item.namespace == self.own_ns.to_bytes() {
+                    return false;
+                }
+                let Ok(signed) = postcard::from_bytes::<iroh_docs::SignedEntry>(&item.entry) else {
+                    return false;
+                };
+                let entry = signed.entry();
+                if entry.namespace().to_bytes() != item.namespace
+                    || entry.content_len() != item.content.len() as u64
+                    || Hash::new(&item.content) != entry.content_hash()
+                {
+                    return false;
+                }
+                match self.blobs.blobs().add_bytes(item.content).await {
+                    Ok(tag) if tag.hash == entry.content_hash() => {}
+                    _ => return false,
+                }
+                let Ok(doc) = self.doc_for(NamespaceId::from(item.namespace)).await else {
+                    return false;
+                };
+                doc.insert_remote(signed, from, true).await.is_ok()
+            }
+            .await;
+            if ok {
+                inserted += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        (inserted, refused)
+    }
+
     /// Fetch a cached [`Doc`] handle for `ns`, or open it from the local replica store.
     async fn doc_for(&self, ns: NamespaceId) -> Result<Doc> {
         if let Some(doc) = self.handles.lock().await.get(&ns.to_bytes()).cloned() {
