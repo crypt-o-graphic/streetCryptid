@@ -971,6 +971,9 @@ struct Subscribers(Vec<async_channel::Sender<Event>>);
 
 impl Subscribers {
     fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
+        // streetCryptid: as `sync::Subscribers::subscribe`, drop subscribers whose receivers are
+        // gone before adding one. See NOTICE (2026-11-22).
+        self.0.retain(|s| !s.is_closed());
         self.0.push(sender)
     }
 

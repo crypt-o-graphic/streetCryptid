@@ -136,6 +136,10 @@ fn same_channel<T>(a: &async_channel::Sender<T>, b: &async_channel::Sender<T>) -
 struct Subscribers(Vec<async_channel::Sender<Event>>);
 impl Subscribers {
     pub fn subscribe(&mut self, sender: async_channel::Sender<Event>) {
+        // streetCryptid: a subscriber whose receiver was dropped is otherwise removed only when
+        // the next event fails to reach it, and a namespace that gets no events keeps every one,
+        // each holding a preallocated 256-slot channel. See NOTICE (2026-11-22).
+        self.0.retain(|s| !s.is_closed());
         self.0.push(sender)
     }
     pub fn unsubscribe(&mut self, sender: &async_channel::Sender<Event>) {
