@@ -152,7 +152,7 @@ mod imp {
     use iroh_ble_transport::{
         is_iroh_key_uuid, key_uuid_matches_endpoint, BleDevice, BlePeerInfo, BlePeerPhase,
         BleResult, BleTransport, Central, CentralConfig, CentralEvent, Peripheral, ScanFilter,
-        IROH_IDENTITY_CHAR_UUID,
+        ScanMode, IROH_IDENTITY_CHAR_UUID,
     };
     use tokio_stream::StreamExt;
     use uuid::Uuid;
@@ -490,7 +490,7 @@ mod imp {
         let _ = central.stop_scan().await;
         let _ = central
             .start_scan(ScanFilter {
-                mode: blew::central::ScanMode::LowPower,
+                mode: ScanMode::LowPower,
                 ..ScanFilter::default()
             })
             .await;

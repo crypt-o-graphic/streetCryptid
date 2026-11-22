@@ -211,3 +211,5 @@ No other upstream source files were modified (src/transport/mod.rs gained the `s
     latency the radio listens continuously. Pairing's own scan windows (the
     app's `ble.rs`) still scan at low latency while they run, then return to
     low power.
+  * src/lib.rs — re-exports `ScanMode` beside `ScanFilter`, so the app can ask
+    for it without depending on blew directly (it does only on Android).
