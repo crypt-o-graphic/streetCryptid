@@ -12,7 +12,6 @@ import Animated, {
   useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
-  withDelay,
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
@@ -30,7 +29,6 @@ import {
   TAB_BAR_HEIGHT,
   type DrawerDetent,
 } from '../core/drawer-detents';
-import { formatColor, parseColor } from '../theme/derive-chrome';
 import { DrawerProgressContext } from './drawer-progress';
 import { GlassFill, useGlassAvailable } from './glass-surface';
 import { IslandTabs, type IslandTab } from './island-tabs';
@@ -68,34 +66,8 @@ const ISLAND_RADIUS = 24;
  */
 const MIN_EDGE_GAP = Spacing.two;
 
-/** Scroll (px) over which a floating header's backdrop fades in once the list runs under it. */
-const HEADER_BACKDROP_SPAN = 12;
-
-/**
- * The floating header's backdrop: the island's own tint, strongest behind the title and fading to
- * nothing a little below it, so rows pass under a soft edge rather than an opaque bar. It was a
- * solid `chrome.island` with a hairline, which over liquid glass — mostly map showing through —
- * read as a white slab laid on the sheet. Alphas are the tint's, over whatever the sheet is.
- */
-const HEADER_TINT_TOP = 0.7;
-const HEADER_TINT_EDGE = 0.45;
-/** How far (px) below the header the backdrop keeps fading. */
-const HEADER_FADE = 16;
-
-/**
- * The list's scroll indicator is drawn here, not by the platform. Native indicators differ in
- * every way that matters on this surface — iOS insets its own and flashes it, Android has no inset
- * at all and would run its thumb under the floating header — and the drawer has been bitten once
- * already by a list that behaved on one platform and not the other. One thumb, same everywhere.
- */
-const INDICATOR_WIDTH = 3;
-const INDICATOR_INSET = 3;
-const INDICATOR_MIN = 32;
-/** The thumb is `chrome.steel` at this strength: legible on daybreak's white and the night sheets. */
-const INDICATOR_ALPHA = 0.55;
-/** How long (ms) the thumb stays after the list comes to rest, and how long it takes to go. */
-const INDICATOR_LINGER = 600;
-const INDICATOR_FADE = 250;
+/** Scroll (px) over which the hairline under a floating header fades in once rows run under it. */
+const HEADER_RULE_SPAN = 12;
 
 interface MapDrawerProps {
   readonly children: ReactNode;
@@ -211,10 +183,6 @@ export function MapDrawer({
   const scrollY = useSharedValue(0);
   const headerSpan = useSharedValue(0);
   const headerHidden = useSharedValue(0);
-  // What the scroll events report about the list's geometry, for the drawn indicator.
-  const scrollContent = useSharedValue(0);
-  const scrollFrame = useSharedValue(0);
-  const indicatorOpacity = useSharedValue(0);
 
   const detents = useMemo(() => allowedDetents(maxDetent, minDetent), [maxDetent, minDetent]);
   const topDetent = detents[detents.length - 1];
@@ -431,18 +399,24 @@ export function MapDrawer({
    * The quick-return header. It slides up by exactly as much as the list scrolls down, up to its
    * own height, and back by as much as the list scrolls up — so it returns over whatever row is
    * there the moment you head back, without waiting for the top. At rest it settles all the way
-   * in or out rather than hanging half-cut. Its backdrop fades in only once rows run under it, so
-   * over an unscrolled list it is the same bare title it always was.
+   * in or out rather than hanging half-cut. A hairline under it fades in only once rows run up to
+   * it, so over an unscrolled list it is the same bare title it always was.
    */
+  const settleHeader = () => {
+    'worklet';
+    const span = headerSpan.value;
+    const hidden = headerHidden.value;
+    if (hidden > 0 && hidden < span) {
+      headerHidden.value = withTiming(scrollY.value > span && hidden > span / 2 ? span : 0, {
+        duration: 160,
+      });
+    }
+  };
   const scrollHandler = useAnimatedScrollHandler({
     onScroll: (event) => {
       const y = event.contentOffset.y;
       const dy = y - scrollY.value;
       scrollY.value = y;
-      scrollContent.value = event.contentSize.height;
-      scrollFrame.value = event.layoutMeasurement.height;
-      // Plain assignment, which also cancels a fade the end of a drag queued before momentum.
-      if (dy !== 0) indicatorOpacity.value = 1;
       headerHidden.value =
         y <= 0 ? 0 : Math.min(headerSpan.value, Math.max(0, headerHidden.value + dy));
     },
@@ -451,55 +425,32 @@ export function MapDrawer({
     },
     onEndDrag: () => {
       gestureActive.value = false;
-      indicatorOpacity.value = withDelay(
-        INDICATOR_LINGER,
-        withTiming(0, { duration: INDICATOR_FADE })
-      );
-      const span = headerSpan.value;
-      const hidden = headerHidden.value;
-      if (hidden > 0 && hidden < span) {
-        headerHidden.value = withTiming(scrollY.value > span && hidden > span / 2 ? span : 0, {
-          duration: 160,
-        });
-      }
+      settleHeader();
     },
     onMomentumEnd: () => {
-      indicatorOpacity.value = withDelay(
-        INDICATOR_LINGER,
-        withTiming(0, { duration: INDICATOR_FADE })
-      );
-      const span = headerSpan.value;
-      const hidden = headerHidden.value;
-      if (hidden > 0 && hidden < span) {
-        headerHidden.value = withTiming(scrollY.value > span && hidden > span / 2 ? span : 0, {
-          duration: 160,
-        });
-      }
+      settleHeader();
     },
   });
   const headerStyle = useAnimatedStyle(() => ({
     transform: [{ translateY: -headerHidden.value }],
   }));
-  const headerBackdropStyle = useAnimatedStyle(() => ({
-    opacity: interpolate(scrollY.value, [0, HEADER_BACKDROP_SPAN], [0, 1], 'clamp'),
+  const headerRuleStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(scrollY.value, [0, HEADER_RULE_SPAN], [0, 1], 'clamp'),
   }));
-  // The thumb's track starts under the header as far as the header is showing, so it slides up
-  // with the header as that hides and never runs beneath the title.
-  const indicatorStyle = useAnimatedStyle(() => {
-    const frame = scrollFrame.value;
-    const content = scrollContent.value;
-    const range = content - frame;
-    const top = INDICATOR_INSET + headerSpan.value - headerHidden.value;
-    const track = frame - top - INDICATOR_INSET;
-    if (range <= 0.5 || track <= 0) return { opacity: 0, height: 0, top: 0 };
-    const thumb = Math.min(track, Math.max(INDICATOR_MIN, (track * frame) / content));
-    const at = Math.min(1, Math.max(0, scrollY.value / range));
-    return {
-      opacity: INDICATOR_ALPHA * indicatorOpacity.value,
-      height: thumb,
-      top: top + (track - thumb) * at,
-    };
-  });
+  /**
+   * The list is CLIPPED at the header's bottom edge instead of running under a backdrop. Nothing
+   * painted behind the title can match the sheet it sits on: over liquid glass every tint — solid
+   * or faded — read as a milky slab across the top of the roster. A clip needs no colour at all.
+   * The frame is shifted down by however much of the header is showing and the list shifted back
+   * up by the same amount, so rows stay where they are and simply end at the header, wherever the
+   * quick-return has it. Transforms only, both on the UI thread: no layout pass per scroll frame.
+   */
+  const listClipStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: headerSpan.value - headerHidden.value }],
+  }));
+  const listUnclipStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: headerHidden.value - headerSpan.value }],
+  }));
 
   const dockStyle = useAnimatedStyle(() => {
     const dock =
@@ -576,16 +527,6 @@ export function MapDrawer({
 
   const expand = useCallback(() => step(1), [step]);
 
-  const headerBackdrop = useMemo(() => {
-    const parsed = parseColor(chrome.island);
-    if (!parsed) return { backgroundColor: chrome.island };
-    const at = (alpha: number) => formatColor(parsed.rgb, alpha);
-    const solid = headerHeight > 0 ? (headerHeight / (headerHeight + HEADER_FADE)) * 100 : 0;
-    return {
-      backgroundImage: `linear-gradient(to bottom, ${at(HEADER_TINT_TOP)} 0%, ${at(HEADER_TINT_EDGE)} ${solid.toFixed(1)}%, ${at(0)} 100%)`,
-    };
-  }, [chrome.island, headerHeight]);
-
   return (
     <Animated.View
       style={[
@@ -647,7 +588,11 @@ export function MapDrawer({
                 >
                   <Animated.View
                     pointerEvents="none"
-                    style={[styles.headerBackdrop, headerBackdrop, headerBackdropStyle]}
+                    style={[
+                      styles.headerRule,
+                      { backgroundColor: chrome.islandBorder },
+                      headerRuleStyle,
+                    ]}
                   />
                   {/* Not an accessibility element itself: what is inside it (the summary, the
                       add button) is, and the grip already offers the same step to assistive tech. */}
@@ -659,44 +604,43 @@ export function MapDrawer({
                 </Animated.View>
               </GestureDetector>
             ) : null}
-            <GestureDetector gesture={nativeScroll}>
-              <Animated.ScrollView
-                ref={scrollRef}
-                // iOS bounces a ScrollView vertically even when its content fits, which made the
-                // ME panel — a body that always fits its own detent — feel like a list that had
-                // somewhere to go and then sprang back. And a list that does scroll does not bounce
-                // either: pulling down past its top is the drawer's (see the list pan), and a
-                // bounce there would be the list and the drawer both answering the same pull.
-                alwaysBounceVertical={false}
-                bounces={false}
-                overScrollMode="never"
-                // A body that fits the detent it is in cannot scroll, rather than scrolling by
-                // whatever the pixel grid happens to leave over. The heights are derived from the
-                // body's own measurement, so at rest that slack is a rounding error — but a
-                // ScrollView will still let you pull on a third of a point and bounce it back,
-                // which is a panel twitching for a reason nobody can see.
-                scrollEnabled={listScrolls}
-                onScroll={scrollHandler}
-                scrollEventThrottle={16}
-                // Drawn below instead, identically on every platform (see `INDICATOR_WIDTH`).
-                showsVerticalScrollIndicator={false}
-                showsHorizontalScrollIndicator={false}
-                style={styles.body}
-                contentContainerStyle={[styles.bodyContent, { paddingTop: headerHeight }]}
-              >
-                {/* Measured at its natural height — that measurement is what `peek` derives from. */}
-                <View onLayout={measureBody}>
-                  <DrawerProgressContext.Provider value={progress}>
-                    {children}
-                  </DrawerProgressContext.Provider>
-                </View>
-              </Animated.ScrollView>
-            </GestureDetector>
-            <Animated.View
-              pointerEvents="none"
-              style={[styles.indicator, { backgroundColor: chrome.steel }, indicatorStyle]}
-              testID="map-drawer-scroll-indicator"
-            />
+            <Animated.View style={[styles.listClip, listClipStyle]}>
+              <GestureDetector gesture={nativeScroll}>
+                <Animated.ScrollView
+                  ref={scrollRef}
+                  // iOS bounces a ScrollView vertically even when its content fits, which made the
+                  // ME panel — a body that always fits its own detent — feel like a list that had
+                  // somewhere to go and then sprang back. And a list that does scroll does not bounce
+                  // either: pulling down past its top is the drawer's (see the list pan), and a
+                  // bounce there would be the list and the drawer both answering the same pull.
+                  alwaysBounceVertical={false}
+                  bounces={false}
+                  overScrollMode="never"
+                  // A body that fits the detent it is in cannot scroll, rather than scrolling by
+                  // whatever the pixel grid happens to leave over. The heights are derived from the
+                  // body's own measurement, so at rest that slack is a rounding error — but a
+                  // ScrollView will still let you pull on a third of a point and bounce it back,
+                  // which is a panel twitching for a reason nobody can see.
+                  scrollEnabled={listScrolls}
+                  onScroll={scrollHandler}
+                  scrollEventThrottle={16}
+                  // The platform's own indicator: a drawn one never moved like the list it described.
+                  // iOS starts it below the header; Android has no inset, and the clip above is what
+                  // keeps its thumb from showing through the title.
+                  scrollIndicatorInsets={{ top: headerHeight }}
+                  showsHorizontalScrollIndicator={false}
+                  style={[styles.body, listUnclipStyle]}
+                  contentContainerStyle={[styles.bodyContent, { paddingTop: headerHeight }]}
+                >
+                  {/* Measured at its natural height — that measurement is what `peek` derives from. */}
+                  <View onLayout={measureBody}>
+                    <DrawerProgressContext.Provider value={progress}>
+                      {children}
+                    </DrawerProgressContext.Provider>
+                  </View>
+                </Animated.ScrollView>
+              </GestureDetector>
+            </Animated.View>
           </View>
         </GestureDetector>
       </View>
@@ -753,19 +697,17 @@ const styles = StyleSheet.create({
     top: 0,
     zIndex: 1,
   },
-  headerBackdrop: {
-    bottom: -HEADER_FADE,
+  headerRule: {
+    bottom: 0,
+    height: StyleSheet.hairlineWidth,
     left: 0,
     position: 'absolute',
     right: 0,
-    top: 0,
   },
-  indicator: {
-    borderRadius: INDICATOR_WIDTH / 2,
-    position: 'absolute',
-    right: INDICATOR_INSET,
-    width: INDICATOR_WIDTH,
-    zIndex: 2,
+  listClip: {
+    flex: 1,
+    minHeight: 0,
+    overflow: 'hidden',
   },
   bodyContent: {
     flexGrow: 1,

@@ -70,7 +70,6 @@ jest.mock('react-native-reanimated', () => {
     runOnJS: (fn: () => void) => fn,
     withSpring: (value: number) => value,
     withTiming: (value: number) => value,
-    withDelay: (_delay: number, value: number) => value,
   };
 });
 jest.mock('../island-tabs', () => ({ IslandTabs: () => null }));
@@ -482,39 +481,36 @@ describe('MapDrawer header', () => {
     expect(content).toEqual(expect.arrayContaining([{ paddingTop: 34 }]));
   });
 
-  // Drawn by the drawer on every platform: a native indicator is inset on iOS only, and Android's
-  // would run under the floating header.
-  it('draws its own scroll thumb under the header, sized to the list, gone once it rests', () => {
+  // Nothing painted behind the title matches liquid glass, so the list ends AT the header instead
+  // of running under a tinted backdrop: its frame moves down by the header's visible height and the
+  // list moves back up by the same, wherever the quick-return has the header.
+  it('clips the list at the header, and leaves the scroll indicator to the platform', () => {
     render('full');
     const list = renderer.root.findByType(ScrollView);
-    expect(list.props.showsVerticalScrollIndicator).toBe(false);
-    const thumb = () =>
-      StyleSheet.flatten(
-        renderer.root.findAll((node) => node.props.testID === 'map-drawer-scroll-indicator')[0]
-          .props.style
-      );
-    const relayout = (height: number) =>
-      act(() => {
-        measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height } } });
-      });
-    expect(thumb().opacity).toBe(0);
-    // Ten pixels in: the header is still showing, so the track starts below it.
+    expect(list.props.showsVerticalScrollIndicator).not.toBe(false);
+    expect(list.props.scrollIndicatorInsets).toEqual({ top: 34 });
+    const shift = (style: unknown) =>
+      (StyleSheet.flatten(style as object) as { transform?: { translateY: number }[] } | undefined)
+        ?.transform?.[0]?.translateY;
+    const clip = () =>
+      renderer.root.findAll(
+        (node) =>
+          typeof node.type !== 'string' &&
+          shift(node.props.style) !== undefined &&
+          node.findAllByType(ScrollView).length > 0 &&
+          node.props.testID !== 'map-drawer-header'
+      )[0];
+    expect(shift(clip().props.style)).toBe(34);
+    expect(shift(renderer.root.findByType(ScrollView).props.style)).toBe(-34);
+    // Ten pixels in: the header has slid up by ten, and the edge with it.
     act(() => {
-      list.props.onScroll.onScroll({
-        contentOffset: { y: 10 },
-        contentSize: { height: 1000 },
-        layoutMeasurement: { height: 500 },
-      });
+      list.props.onScroll.onScroll({ contentOffset: { y: 10 } });
     });
-    relayout(600);
-    const top = 3 + 34 - 10;
-    const track = 500 - top - 3;
-    const size = (track * 500) / 1000;
-    expect(thumb()).toMatchObject({ height: size, top: top + ((track - size) * 10) / 500 });
-    expect(thumb().opacity).toBeGreaterThan(0);
-    act(() => list.props.onScroll.onEndDrag());
-    relayout(700);
-    expect(thumb().opacity).toBe(0);
+    act(() => {
+      measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height: 600 } } });
+    });
+    expect(shift(clip().props.style)).toBe(24);
+    expect(shift(renderer.root.findByType(ScrollView).props.style)).toBe(-24);
   });
 
   it('is a handle: dragging it down shrinks the drawer', () => {
