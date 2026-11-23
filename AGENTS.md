@@ -888,6 +888,27 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   links the library with a build id and soname, ships it stripped, and stages the copy with its
   symbol table. Without a build id a profile cannot be matched to symbols, so keep those link
   args.
+- **Android does not wake JavaScript in the background, and stops GPS when stopped** (2026-11-22).
+  `BackgroundLocationService` hands a capture or parked tick to the app only while the app is on
+  screen (`NativeBackgroundRuntime.routeToApp`). Off screen it ingests natively, does not forward
+  replica notifications or pull results to JS, and the JS heartbeat timer is paused
+  (`onEnterBackground`). The JS revive fence and periodic refresh are no longer scheduled on any
+  platform: `ServiceRecovery` restarts the service, and `retireJsBackgroundTasks` unregisters
+  what older builds left. The service has `moving` and `stopped` states, and uses the platform's
+  own signals for both wherever Google Play services exists, with a fallback that needs none of
+  it (a phone without Google must still share). Positions: the fused provider, else
+  `LocationManager` (`LocationSource.kt`). Stopping: activity recognition's `STILL` (the `motion`
+  permission step), else 10 min with nothing past the 50 m filter. Leaving: activity recognition,
+  a Play services exit geofence on the stop, and a passive or maintenance position 150 m away,
+  else the significant-motion sensor (`MotionSignals.kt`; `location.runtime{event=started}`
+  says which a phone got). Stopped means GPS off. **The service's clock is an `AlarmManager`
+  alarm, never a coroutine `delay`**: that clock stops while the CPU sleeps, and with GPS off
+  nothing wakes it, so a 30-minute wait could last for hours. Work after a wake holds a partial
+  wake lock (`launchAwake`). While a phone stays parked the core publishes on the
+  data mode's maintenance cadence (Balanced 30 min, Saver 60 min, one envelope for all the
+  slots missed; `publish.rs`, `dial_gate::parked_heartbeat_floor`). That deliberately trades
+  away the uniform-cadence rule above while parked: the stash can now tell a parked phone from a
+  moving one by how often it publishes.
 - Guard newly added native exports anyway (`typeof mod.configureTelemetry === 'function'`). Not
   because of bindgen now, but because a phone can be running an older binary than the JS bundle.
 

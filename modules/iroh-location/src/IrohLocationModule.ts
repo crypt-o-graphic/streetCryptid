@@ -13,6 +13,7 @@ import type {
   BlePeer,
   BluetoothRadioState,
   BumpResolution,
+  DataMode,
   NativeRatchetEvent,
   NativeLocationFix,
   IsolationStatus,
@@ -60,6 +61,13 @@ export declare class IrohLocationNativeModule
    * OPTIONAL: absent on binaries built before the native drain path.
    */
   setTransportConfig?(config?: TransportConfig): Promise<void>;
+  /**
+   * How much mobile data the node may spend reaching friends' phones directly (`dial_gate.rs`).
+   * Remembered natively for every later start. OPTIONAL: absent on binaries before 2026-11-22.
+   */
+  setDataMode?(mode: DataMode): Promise<void>;
+  /** The data mode in force. Throws without a node. OPTIONAL, like {@link setDataMode}. */
+  dataMode?(): DataMode;
   /**
    * Run one captured fix through the native gate → outbox → seal → own docs namespace → push.
    *
@@ -156,6 +164,16 @@ export declare class IrohLocationNativeModule
    * ANDROID ONLY, OPTIONAL.
    */
   requestBatteryOptimizationExemption?(): boolean;
+  /**
+   * Android: whether Google Play services' activity recognition is available, which is what the
+   * physical-activity permission step is for. ANDROID ONLY, OPTIONAL.
+   */
+  motionActivityAvailable?(): boolean;
+  /**
+   * Android: re-subscribe the running service to activity transitions, after the permission was
+   * granted. ANDROID ONLY, OPTIONAL.
+   */
+  refreshMotionActivity?(): void;
   /**
    * iOS: Bluetooth authorization, read from `CBManager.authorization` WITHOUT creating a manager â€”
    * creating one is what shows the alert. IOS ONLY, OPTIONAL (Android reads its runtime permissions

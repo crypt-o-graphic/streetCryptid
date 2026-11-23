@@ -33,7 +33,7 @@ jest.mock('../../net/permission-requests', () => ({
   requestPermissionStep: (step: PermissionStepId) => mockRequest(step),
 }));
 
-const NATIVE = { bluetooth: true, localNetwork: true, battery: true };
+const NATIVE = { bluetooth: true, localNetwork: true, battery: true, motion: true };
 
 describe('PermissionsGate', () => {
   let renderer: ReactTestRenderer;
@@ -79,6 +79,7 @@ describe('PermissionsGate', () => {
       'bluetooth upcoming',
       'local-network upcoming',
       'notifications upcoming',
+      'motion upcoming',
       'battery upcoming',
     ]);
 
@@ -94,6 +95,7 @@ describe('PermissionsGate', () => {
       'bluetooth',
       'local-network',
       'notifications',
+      'motion',
       'battery',
     ]);
     expect(mockRequest.mock.calls.map(([id]) => id)).toEqual([
@@ -102,10 +104,11 @@ describe('PermissionsGate', () => {
       'bluetooth',
       'local-network',
       'notifications',
+      'motion',
       'battery',
     ]);
     expect(await loadLocationDisclosureChoice(mockKV)).toBe('accepted');
-    expect([...((await loadPermissionsAsked(mockKV)) ?? [])]).toHaveLength(6);
+    expect([...((await loadPermissionsAsked(mockKV)) ?? [])]).toHaveLength(7);
   });
 
   it('drops what sharing needs after "Not now" on location, without prompting', async () => {
@@ -119,15 +122,17 @@ describe('PermissionsGate', () => {
       'bluetooth current',
       'local-network upcoming',
       'notifications skipped',
+      'motion skipped',
       'battery skipped',
     ]);
   });
 
-  it('opens straight on the battery step for an install that onboarded before the steps', async () => {
+  it('opens straight on the steps an install that onboarded before them is owed', async () => {
     await saveLocationDisclosureChoice(mockKV, 'accepted');
     mockFacts = { ...mockFacts, androidApi: 34, granted: { location: true } };
     await render();
-    expect(states()).toEqual(['battery current']);
+    expect(states()).toEqual(['motion current', 'battery upcoming']);
+    await choose(false);
     await choose(false);
     expect(app()).toBe(true);
     // The answer created the record; the next launch must not read it as an install never asked.
@@ -174,6 +179,7 @@ describe('PermissionsGate', () => {
       'bluetooth',
       'local-network',
       'notifications',
+      'motion',
       'battery',
     ]);
     expect(saveLocationChoice).toHaveBeenCalledWith(true);

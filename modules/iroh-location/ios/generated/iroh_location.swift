@@ -984,6 +984,11 @@ public protocol LocationNodeProtocol: AnyObject, Sendable {
     func currentSeq() async throws  -> UInt64
     
     /**
+     * The data mode in force (see [`Self::set_data_mode`]).
+     */
+    func dataMode()  -> DataMode
+    
+    /**
      * Where the native drain path will push right now. For diagnostics and `device.health`.
      */
     func deliveryConfig() async throws  -> DeliveryConfig
@@ -1392,6 +1397,13 @@ public protocol LocationNodeProtocol: AnyObject, Sendable {
      * re-issue a value, because raising a counter only ever skips.
      */
     func seedSeq(floor: UInt64) async throws  -> Bool
+    
+    /**
+     * How much mobile data to spend reaching friends' phones directly (see [`dial_gate`]).
+     * Takes effect at once, and is remembered for every later start, the app's and the
+     * background runtime's alike.
+     */
+    func setDataMode(mode: DataMode) async throws 
     
     /**
      * Record where a drained envelope must be sent to leave this device — see [`crate::delivery`].
@@ -1964,6 +1976,17 @@ open func currentSeq()async throws  -> UInt64  {
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeLocationError_lift
         )
+}
+    
+    /**
+     * The data mode in force (see [`Self::set_data_mode`]).
+     */
+open func dataMode() -> DataMode  {
+    return try!  FfiConverterTypeDataMode_lift(try! rustCall() {
+    uniffi_iroh_location_fn_method_locationnode_data_mode(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
     /**
@@ -3192,6 +3215,28 @@ open func seedSeq(floor: UInt64)async throws  -> Bool  {
             completeFunc: ffi_iroh_location_rust_future_complete_i8,
             freeFunc: ffi_iroh_location_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeLocationError_lift
+        )
+}
+    
+    /**
+     * How much mobile data to spend reaching friends' phones directly (see [`dial_gate`]).
+     * Takes effect at once, and is remembered for every later start, the app's and the
+     * background runtime's alike.
+     */
+open func setDataMode(mode: DataMode)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_iroh_location_fn_method_locationnode_set_data_mode(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeDataMode_lower(mode)
+                )
+            },
+            pollFunc: ffi_iroh_location_rust_future_poll_void,
+            completeFunc: ffi_iroh_location_rust_future_complete_void,
+            freeFunc: ffi_iroh_location_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypeLocationError_lift
         )
 }
@@ -8600,6 +8645,95 @@ public func FfiConverterTypeTransportDiagnostics_lower(_ value: TransportDiagnos
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * How much mobile data the node may spend reaching friends' phones directly. The stash and the
+ * repeaters are always reachable and always allowed; this decides the rest.
+ */
+
+public enum DataMode: Equatable, Hashable {
+    
+    /**
+     * Never dial a friend's phone over the internet. The stash and repeaters carry everything;
+     * a friend reaches us when it dials us, and nearby friends (BLE / same Wi-Fi) still sync.
+     * Background pulls stop; opening the app pulls.
+     */
+    case saver
+    /**
+     * Dial a friend only on evidence that it is awake (see the module docs). The default.
+     */
+    case balanced
+    /**
+     * Dial every friend as before, with gossip, but coalesced and cooled down after a failure.
+     */
+    case realtime
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension DataMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDataMode: FfiConverterRustBuffer {
+    typealias SwiftType = DataMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DataMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .saver
+        
+        case 2: return .balanced
+        
+        case 3: return .realtime
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DataMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .saver:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .balanced:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .realtime:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDataMode_lift(_ buf: RustBuffer) throws -> DataMode {
+    return try FfiConverterTypeDataMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDataMode_lower(_ value: DataMode) -> RustBuffer {
+    return FfiConverterTypeDataMode.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Why a fix was refused. Stamped on telemetry as `sc.drop_reason: fix-<reason>`.
  */
 
@@ -10947,6 +11081,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_iroh_location_checksum_method_locationnode_current_seq() != 23320) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_iroh_location_checksum_method_locationnode_data_mode() != 62576) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_iroh_location_checksum_method_locationnode_delivery_config() != 3587) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11116,6 +11253,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_iroh_location_checksum_method_locationnode_seed_seq() != 19292) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_iroh_location_checksum_method_locationnode_set_data_mode() != 16103) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_iroh_location_checksum_method_locationnode_set_delivery_config() != 59214) {

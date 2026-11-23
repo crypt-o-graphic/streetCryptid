@@ -123,6 +123,14 @@ jobs:
           bash scripts/test-eas-ci-log-isolation.sh
           bash scripts/test-build-profile-isolation.sh
 
+      # The Rust core's host build, which the EAS step below would run first anyway (UniFFI reads
+      # the bindings from it). Here, with no credential in the environment, its compiler errors are
+      # printed; inside EAS they are withheld with the rest of its output, and a macOS-only compile
+      # error read as nothing but "EAS local ios build failed" (PR #227, 2026-11-22). The EAS step
+      # then finds the target directory built.
+      - name: Compile the Rust core for macOS
+        run: bash scripts/generate-uniffi-bindings.sh ios
+
       - name: Build the standalone Release locally
         id: build
         env:

@@ -26,6 +26,7 @@ import uniffi.iroh_location.BatteryState
 import uniffi.iroh_location.BleCapabilities
 import uniffi.iroh_location.BlePeer
 import uniffi.iroh_location.BumpResolution
+import uniffi.iroh_location.DataMode
 import uniffi.iroh_location.DeliveryConfig
 import uniffi.iroh_location.RatchetEvent
 import uniffi.iroh_location.RecipientKey
@@ -500,6 +501,10 @@ class IrohLocationModule : Module() {
    */
   private inner class ReplicaBridge : ReplicaListener {
     override fun onFriendEntries(authors: List<ByteArray>) {
+      // Off screen the app has nothing to draw, and each event woke the JS thread to decrypt and
+      // re-render a map nobody was looking at. Coming back to the foreground re-reads the whole
+      // replica (`syncTrail`), so a dropped notification costs nothing.
+      if (!NativeBackgroundRuntime.appInForeground()) return
       sendEvent("onReplicaChanged", mapOf("authors" to authors.map { it.toHex() }))
     }
   }
@@ -696,6 +701,28 @@ class IrohLocationModule : Module() {
     /// denial costs visibility rather than function.
     AsyncFunction("ensureNotificationPermission") Coroutine { -> ensurePostNotifications() }
 
+    /// How much mobile data the node may spend reaching friends' phones directly: `saver`,
+    /// `balanced` or `realtime` (`dial_gate`). The node remembers it for every later start, the
+    /// foreground service's included.
+    AsyncFunction("setDataMode") Coroutine { mode: String ->
+      val parsed =
+        when (mode) {
+          "saver" -> DataMode.SAVER
+          "realtime" -> DataMode.REALTIME
+          else -> DataMode.BALANCED
+        }
+      requireNode().setDataMode(parsed)
+      Unit
+    }
+
+    Function("dataMode") {
+      when (requireNode().dataMode()) {
+        DataMode.SAVER -> "saver"
+        DataMode.BALANCED -> "balanced"
+        DataMode.REALTIME -> "realtime"
+      }
+    }
+
     /// Remember the transport settings, so the background service can `start` without JS.
     AsyncFunction("setTransportConfig") Coroutine
       { relayUrls: List<String>,
@@ -815,6 +842,16 @@ class IrohLocationModule : Module() {
           ?: return@Function false
       ServiceRecovery.requestBatteryOptimizationExemption(context)
     }
+
+    /// Whether Google Play services' activity recognition can run here: the physical-activity
+    /// permission step is shown only when it can.
+    Function("motionActivityAvailable") {
+      val context = appContext.reactContext?.applicationContext ?: return@Function false
+      PlayServices.available(context)
+    }
+
+    /// The physical-activity permission was answered; let a running service act on it now.
+    Function("refreshMotionActivity") { BackgroundLocationService.refreshMotionActivity() }
 
     Function("stopNativeBackground") {
       sink = null

@@ -27,9 +27,10 @@ LIB = 'libiroh_location.so'
 PLUMBING = re.compile(
     r'^(malloc|calloc|realloc|posix_memalign|aligned_alloc|memalign|operator new|scudo|je_|'
     r'__rust_|__rg_|__rdl_|_rjem_|'
-    r'iroh_location::alloc_stats|alloc::|core::|std::alloc|hashbrown::|smallvec::|bytes::|'
+    r'iroh_location::alloc_stats|<iroh_location::alloc_stats|alloc::|core::|std::alloc|hashbrown::|smallvec::|bytes::|'
     r'<alloc::|<core::|<hashbrown::|<smallvec::|<bytes::|<std::|std::collections|'
-    r'tokio::runtime::task::|<tokio::runtime::task::|serde::|<serde|postcard::|<postcard)'
+    r'tokio::runtime::task::|<tokio::runtime::task::|serde::|<serde|postcard::|<postcard|'
+    r'<concurrent_queue::|concurrent_queue::|async_channel::|<async_channel::)'
 )
 
 
@@ -122,12 +123,13 @@ def main():
         frames[r.id] = r
         if r.mapping in {m.id for m in ours}:
             rel[r.mapping].add(r.rel_pc)
+    # `rel_pc` is already an address in the library's own address space: trace processor folds the
+    # load bias in (adding `load_bias` again names the wrong functions, checked 2026-11-22).
     names = {}
     for mid, pcs in rel.items():
-        bias = mappings[mid].load_bias or 0
-        resolved = symbolize(args.symbolizer, obj, {pc + bias for pc in pcs})
+        resolved = symbolize(args.symbolizer, obj, set(pcs))
         for pc in pcs:
-            names[(mid, pc)] = resolved.get(pc + bias, '??')
+            names[(mid, pc)] = resolved.get(pc, '??')
 
     def frame_name(fid):
         f = frames[fid]

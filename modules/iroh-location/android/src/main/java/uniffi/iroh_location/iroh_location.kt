@@ -769,6 +769,8 @@ external fun uniffi_iroh_location_checksum_method_locationnode_create_invite(
 ): Int
 external fun uniffi_iroh_location_checksum_method_locationnode_current_seq(
 ): Int
+external fun uniffi_iroh_location_checksum_method_locationnode_data_mode(
+): Int
 external fun uniffi_iroh_location_checksum_method_locationnode_delivery_config(
 ): Int
 external fun uniffi_iroh_location_checksum_method_locationnode_doc_ticket(
@@ -882,6 +884,8 @@ external fun uniffi_iroh_location_checksum_method_locationnode_resync_count(
 external fun uniffi_iroh_location_checksum_method_locationnode_revoke_pair_invite(
 ): Int
 external fun uniffi_iroh_location_checksum_method_locationnode_seed_seq(
+): Int
+external fun uniffi_iroh_location_checksum_method_locationnode_set_data_mode(
 ): Int
 external fun uniffi_iroh_location_checksum_method_locationnode_set_delivery_config(
 ): Int
@@ -1025,6 +1029,8 @@ external fun uniffi_iroh_location_fn_method_locationnode_create_invite(`ptr`: Lo
 ): Long
 external fun uniffi_iroh_location_fn_method_locationnode_current_seq(`ptr`: Long,
 ): Long
+external fun uniffi_iroh_location_fn_method_locationnode_data_mode(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_iroh_location_fn_method_locationnode_delivery_config(`ptr`: Long,
 ): Long
 external fun uniffi_iroh_location_fn_method_locationnode_doc_ticket(`ptr`: Long,
@@ -1138,6 +1144,8 @@ external fun uniffi_iroh_location_fn_method_locationnode_resync_count(`ptr`: Lon
 external fun uniffi_iroh_location_fn_method_locationnode_revoke_pair_invite(`ptr`: Long,`token`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_iroh_location_fn_method_locationnode_seed_seq(`ptr`: Long,`floor`: Long,
+): Long
+external fun uniffi_iroh_location_fn_method_locationnode_set_data_mode(`ptr`: Long,`mode`: RustBuffer.ByValue,
 ): Long
 external fun uniffi_iroh_location_fn_method_locationnode_set_delivery_config(`ptr`: Long,`config`: RustBuffer.ByValue,
 ): Long
@@ -1510,6 +1518,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_iroh_location_checksum_method_locationnode_current_seq() != 23320) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_iroh_location_checksum_method_locationnode_data_mode() != 62576) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_iroh_location_checksum_method_locationnode_delivery_config() != 3587) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1679,6 +1690,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_iroh_location_checksum_method_locationnode_seed_seq() != 19292) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_iroh_location_checksum_method_locationnode_set_data_mode() != 16103) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_iroh_location_checksum_method_locationnode_set_delivery_config() != 59214) {
@@ -2839,6 +2853,11 @@ public interface LocationNodeInterface {
     suspend fun `currentSeq`(): kotlin.ULong
     
     /**
+     * The data mode in force (see [`Self::set_data_mode`]).
+     */
+    fun `dataMode`(): DataMode
+    
+    /**
      * Where the native drain path will push right now. For diagnostics and `device.health`.
      */
     suspend fun `deliveryConfig`(): DeliveryConfig
@@ -3247,6 +3266,13 @@ public interface LocationNodeInterface {
      * re-issue a value, because raising a counter only ever skips.
      */
     suspend fun `seedSeq`(`floor`: kotlin.ULong): kotlin.Boolean
+    
+    /**
+     * How much mobile data to spend reaching friends' phones directly (see [`dial_gate`]).
+     * Takes effect at once, and is remembered for every later start, the app's and the
+     * background runtime's alike.
+     */
+    suspend fun `setDataMode`(`mode`: DataMode)
     
     /**
      * Record where a drained envelope must be sent to leave this device — see [`crate::delivery`].
@@ -3856,6 +3882,22 @@ open class LocationNode: Disposable, AutoCloseable, LocationNodeInterface
         LocationException.ErrorHandler,
     )
     }
+
+    
+    /**
+     * The data mode in force (see [`Self::set_data_mode`]).
+     */override fun `dataMode`(): DataMode {
+            return FfiConverterTypeDataMode.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_iroh_location_fn_method_locationnode_data_mode(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
 
     
     /**
@@ -5306,6 +5348,33 @@ open class LocationNode: Disposable, AutoCloseable, LocationNodeInterface
         { future -> UniffiLib.ffi_iroh_location_rust_future_free_i8(future) },
         // lift function
         { FfiConverterBoolean.lift(it) },
+        // Error FFI converter
+        LocationException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * How much mobile data to spend reaching friends' phones directly (see [`dial_gate`]).
+     * Takes effect at once, and is remembered for every later start, the app's and the
+     * background runtime's alike.
+     */
+    @Throws(LocationException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `setDataMode`(`mode`: DataMode) {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_iroh_location_fn_method_locationnode_set_data_mode(
+                uniffiHandle,
+                FfiConverterTypeDataMode.lower(`mode`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_iroh_location_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_iroh_location_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_iroh_location_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
         // Error FFI converter
         LocationException.ErrorHandler,
     )
@@ -10292,6 +10361,56 @@ public object FfiConverterTypeTransportDiagnostics: FfiConverterRustBuffer<Trans
             FfiConverterSequenceTypePeerTransportDiagnostic.write(value.`peers`, buf)
     }
 }
+
+
+
+/**
+ * How much mobile data the node may spend reaching friends' phones directly. The stash and the
+ * repeaters are always reachable and always allowed; this decides the rest.
+ */
+
+enum class DataMode {
+    
+    /**
+     * Never dial a friend's phone over the internet. The stash and repeaters carry everything;
+     * a friend reaches us when it dials us, and nearby friends (BLE / same Wi-Fi) still sync.
+     * Background pulls stop; opening the app pulls.
+     */
+    SAVER,
+    /**
+     * Dial a friend only on evidence that it is awake (see the module docs). The default.
+     */
+    BALANCED,
+    /**
+     * Dial every friend as before, with gossip, but coalesced and cooled down after a failure.
+     */
+    REALTIME;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDataMode: FfiConverterRustBuffer<DataMode> {
+    override fun read(buf: ByteBuffer) = try {
+        DataMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: DataMode) = 4UL
+
+    override fun write(value: DataMode, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 

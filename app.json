@@ -88,7 +88,9 @@
         "ACCESS_LOCAL_NETWORK",
         "ACCESS_NETWORK_STATE",
         "NEARBY_WIFI_DEVICES",
-        "CHANGE_WIFI_MULTICAST_STATE"
+        "CHANGE_WIFI_MULTICAST_STATE",
+        "ACTIVITY_RECOGNITION",
+        "com.google.android.gms.permission.ACTIVITY_RECOGNITION"
       ]
     },
     "web": {

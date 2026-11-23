@@ -24,6 +24,8 @@ mod conn_ledger;
 mod contact;
 pub mod crypto;
 pub mod delivery;
+/// Which friends are worth a dial, per data mode: the data budget's choke point (module docs).
+pub mod dial_gate;
 mod docs;
 mod durable;
 /// `friend.pull` spans: a native runtime's receive-side pull, with what it cost against the OS's
@@ -73,6 +75,26 @@ pub mod transport;
 ///
 /// The docs-path key epoch is the per-wrap `i` in the v3 ratchet header (§4.7), not this.
 pub const DOCS_MESH_EPOCH: u32 = 0;
+
+/// Whether this pull may also refresh friends' profiles, and if so, mark it as having done so. A
+/// profile changes when its owner edits a name or a repeater card, not between two pulls. Every
+/// pull used to sync every friend's profile namespace with the stash as well as the trail: 14
+/// more connections at ~19 KB each, and the app on screen pulls every 20 to 90 s (2026-11-21).
+/// How often is the data mode's ([`dial_gate::DataMode::profile_refresh_floor`]).
+fn claim_profile_refresh() -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let floor = dial_gate::mode().profile_refresh_floor();
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    if last.is_some_and(|at| now.saturating_duration_since(at) < floor) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// Where [`LocationNode::set_data_mode`] keeps the mode, in `state_dir`, as its name.
+const DATA_MODE_FILE: &str = "data_mode";
 pub mod host;
 mod relay;
 /// iroh's DNS through the OS resolver on Apple and Android, never a nameserver list.
@@ -1509,6 +1531,15 @@ impl LocationNode {
         publish_repeater_card(&live.profile, &self.roster_key(), &book).await;
     }
 
+    /// The stored [`dial_gate::DataMode`], `Balanced` when none was ever set or the file is
+    /// unreadable.
+    fn stored_data_mode(&self) -> dial_gate::DataMode {
+        std::fs::read_to_string(self.state_dir.join(DATA_MODE_FILE))
+            .ok()
+            .and_then(|raw| dial_gate::DataMode::parse(&raw))
+            .unwrap_or(dial_gate::DataMode::Balanced)
+    }
+
     /// Every friend's endpoint id, recipients and watchers alike. Empty when the store is not
     /// open yet.
     async fn known_friends(&self) -> BTreeSet<[u8; 32]> {
@@ -1942,11 +1973,24 @@ impl LocationNode {
     ) -> Result<(), LocationError> {
         use tracing::Instrument;
         let requested = peer_tickets.len();
-        let peers: Vec<EndpointAddr> = peer_tickets
+        let parsed: Vec<EndpointAddr> = peer_tickets
             .iter()
             .filter_map(|ticket| ticket.parse::<EndpointTicket>().ok())
             .map(|ticket| relay::scrub_addr(ticket.endpoint_addr().clone()))
             .collect();
+        // Friends' phones only on evidence that they are awake (`dial_gate`): the stash and the
+        // repeaters serve every friend whatever happens here, and 88 % of the pushes to friends'
+        // phones went unanswered at ~145 KB a time (2026-11-14..22).
+        let friends = self.known_friends().await;
+        let parsed_len = parsed.len();
+        let peers: Vec<EndpointAddr> = parsed
+            .into_iter()
+            .filter(|addr| {
+                let id = addr.id.as_bytes();
+                !friends.contains(id) || dial_gate::allow_friend(id)
+            })
+            .collect();
+        let gated = parsed_len - peers.len();
         // The repeaters carrying our trail (see [`repeater`]). Handed to the live engine with the
         // rest but never waited for: a laptop asleep in a bag must not cost every push the
         // deadline, and it reconciles whenever it wakes.
@@ -1962,6 +2006,7 @@ impl LocationNode {
             sc.author = %telemetry::short_hex(&self.author),
             sync.peers_requested = requested,
             sync.peers_dialed = peers.len(),
+            sync.peers_gated = gated,
             sync.repeaters_scheduled = carriers.len(),
             push.budget_ms = budget.as_millis() as u64,
             entries_sent = tracing::field::Empty,
@@ -1979,9 +2024,9 @@ impl LocationNode {
             push.friends_finished = tracing::field::Empty,
         );
         async move {
-            if peers.len() < requested {
+            if parsed_len < requested {
                 tracing::warn!(
-                    skipped = requested - peers.len(),
+                    skipped = requested - parsed_len,
                     "trail push: some peer tickets were unparseable and were skipped"
                 );
             }
@@ -2994,6 +3039,11 @@ impl LocationNode {
         let trail_book = open_book(ns_book::TRAIL_BOOK_FILE)?;
         let profile_book = open_book(ns_book::PROFILE_BOOK_FILE)?;
 
+        // The gate must know the mode and who the friends are before the first dial, and the live
+        // engine dials as soon as `TrailDocs::init` puts the namespaces live.
+        dial_gate::set_mode(self.stored_data_mode());
+        let _ = self.peer_roles().await;
+
         let relay_mode = if relay_enabled {
             relay::custom_relay_mode(&relay_urls, &relay_auth_token)
                 .map_err(LocationError::Network)?
@@ -3015,8 +3065,9 @@ impl LocationNode {
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
             .relay_mode(relay_mode)
-            // First, so it counts every dial before another hook can refuse one: which
-            // connections the bytes go to (`net.conns`; `conn_ledger` explains).
+            // First: refuses dials to friends with no evidence of being awake, before a packet is
+            // sent (`dial_gate`). Then the ledger, so it books only dials that went out.
+            .hooks(dial_gate::hook())
             .hooks(conn_ledger::hook());
         // iroh's default resolver sends its own queries to a nameserver list: Google's on Apple,
         // where it cannot read the system config, and on Android whatever list it read at build or
@@ -3381,6 +3432,23 @@ impl LocationNode {
             traceparent,
         )
         .await
+    }
+
+    /// How much mobile data to spend reaching friends' phones directly (see [`dial_gate`]).
+    /// Takes effect at once, and is remembered for every later start, the app's and the
+    /// background runtime's alike.
+    pub async fn set_data_mode(&self, mode: dial_gate::DataMode) -> Result<(), LocationError> {
+        let path = self.state_dir.join(DATA_MODE_FILE);
+        std::fs::write(&path, mode.as_str())
+            .map_err(|e| LocationError::Network(format!("data mode: {e}")))?;
+        dial_gate::set_mode(mode);
+        tracing::info!(data_mode = mode.as_str(), "data mode set");
+        Ok(())
+    }
+
+    /// The data mode in force (see [`Self::set_data_mode`]).
+    pub fn data_mode(&self) -> dial_gate::DataMode {
+        self.stored_data_mode()
     }
 
     /// Remember the transport settings, so a background bootstrap can `start` without JS.
@@ -4741,6 +4809,10 @@ impl LocationNode {
             sc.author = %telemetry::short_hex(&self.author),
             sync.peers_requested = requested,
             sync.peers_dialed = dialed,
+            // Friends left out because nothing says they are awake (`dial_gate`), and why a
+            // background pull did not run at all (`floor`: the data mode's pull floor).
+            sync.peers_gated = tracing::field::Empty,
+            sync.gated = tracing::field::Empty,
             sync.repeater_peers = tracing::field::Empty,
             // Peers that delivered at least one entry this pass — each is a `peer.contact`.
             sync.peers_delivered = tracing::field::Empty,
@@ -4774,6 +4846,12 @@ impl LocationNode {
         }
         telemetry::set_parent(&span, traceparent.as_deref());
         async move {
+            // A budgeted pull is a background one (the native runtimes'); the app on screen pulls
+            // unbudgeted and is never floored.
+            if budget.is_some() && !dial_gate::claim_background_pull() {
+                tracing::Span::current().record("sync.gated", "floor");
+                return Ok(PullReport::default());
+            }
             if dialed < requested {
                 tracing::warn!(
                     skipped = requested - dialed,
@@ -4830,6 +4908,34 @@ impl LocationNode {
                 .collect();
             tracing::Span::current().record("sync.repeater_peers", repeater_count.len());
 
+            // A friend's phone is asked only for its OWN namespace, and only when something says it
+            // is awake (`dial_gate`). It used to be handed every namespace: one dial per namespace
+            // per friend, ~250 a pull with 14 friends, nearly all to phones asleep in a pocket,
+            // at ~145 KB of unanswered handshake each (2026-11-21). The stash and the repeaters
+            // hold every namespace and are asked for all of them.
+            let owners: HashMap<[u8; 32], [u8; 32]> = friend_namespaces.iter().copied().collect();
+            let mut shared = Vec::new();
+            let mut gated = 0usize;
+            for addr in peers {
+                let id = *addr.id.as_bytes();
+                if !friends.contains(&id) {
+                    shared.push(addr);
+                } else if !dial_gate::allow_friend(&id) {
+                    gated += 1;
+                } else if let Some(namespace) = owners.get(&id) {
+                    repeater_peers.entry(*namespace).or_default().push(addr);
+                }
+            }
+            tracing::Span::current().record("sync.peers_gated", gated);
+            let peers = shared;
+            let dialed_endpoints: Vec<EndpointId> = dialed_endpoints
+                .into_iter()
+                .filter(|id| {
+                    let id = id.as_bytes();
+                    !friends.contains(id) || dial_gate::allow_friend(id)
+                })
+                .collect();
+
             // A friend's profile, card included, is held sealed by the stash and by the repeaters
             // that carry them, so it is taken from those as well as from their phone.
             let profile_relays = self.profile_relays(&friends).await;
@@ -4852,7 +4958,10 @@ impl LocationNode {
 
             // Reopened profile replicas are not syncing. Wait for known friends' cards alongside
             // the trail pass, then persist what arrived before a native-only node can shut down.
-            let profile_budget = if friend_namespaces.is_empty() {
+            // Floored only when a stash or repeater is there to carry a missed edit later.
+            let profile_budget = if friend_namespaces.is_empty()
+                || (dial_gate::active() && !claim_profile_refresh())
+            {
                 std::time::Duration::ZERO
             } else {
                 deadline
@@ -5367,6 +5476,11 @@ fn peer_roles_from(
                 .collect()
         })
         .unwrap_or_default();
+    // The gate needs the same answer, and this is where it is computed.
+    dial_gate::set_friends(
+        friends.iter().copied(),
+        stash.is_some() || !repeaters.is_empty(),
+    );
     contact::PeerRoles::new(friends, stash).with_repeaters(repeaters)
 }
 
