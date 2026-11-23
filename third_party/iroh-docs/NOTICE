@@ -43,6 +43,19 @@ Modifications by the streetCryptid project
         exactly these channels, `RpcActor::handle` → `async_channel::bounded::<Event>`, on a
         heap that grew ~20 MB an hour to 1.7 GB.
 
+2026-11-22 — entries handed over outside a sync (the stash's HTTP batch, `/v1/batch`):
+
+  * src/api.rs, src/api/protocol.rs, src/api/actor.rs
+      - `Doc::get_many_signed`: `get_many` without dropping each entry's signatures, so an entry
+        can be handed to another replica intact.
+      - `Doc::insert_remote` / `InsertRemoteRequest`: insert an entry another replica signed
+        through the replica actor's existing `insert_remote` (the path sync uses), recording the
+        delivering peer and whether the content is already local. The replica verifies the
+        signatures and applies its newer-wins rule as it would for a synced entry.
+    The stash serves a phone's whole pull, and takes its publishes, in one HTTPS request instead of
+    one QUIC connection per namespace and per blob (~20-40 KB of handshake and path probing each,
+    measured 2026-11-21).
+
 The crate's Cargo.lock, Cargo.toml.orig, .cargo_vcs_info.json, CI config, examples, tests and
 proptest regressions were not vendored, and the [[example]] / [[test]] entries are removed from
 Cargo.toml. No other file differs from the published 0.101.0 crate.

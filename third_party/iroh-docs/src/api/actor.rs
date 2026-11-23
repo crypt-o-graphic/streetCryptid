@@ -15,11 +15,12 @@ use super::{
         CloseResponse, CreateRequest, CreateResponse, DelRequest, DelResponse, DocsMessage,
         DocsProtocol, DropRequest, DropResponse, GetDownloadPolicyRequest,
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
-        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse, LeaveRequest,
-        LeaveResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
-        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
-        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
+        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse,
+        InsertRemoteRequest, InsertRemoteResponse, LeaveRequest, LeaveResponse, ListRequest,
+        ListResponse, OpenRequest, OpenResponse, SetDownloadPolicyRequest,
+        SetDownloadPolicyResponse, SetHashRequest, SetHashResponse, SetRequest, SetResponse,
+        ShareMode, ShareRequest, ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest,
+        StatusResponse, SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -120,6 +121,13 @@ impl RpcActor {
                 let result = self.doc_get_exact(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send GetExact response: {}", e);
+                }
+            }
+            DocsMessage::InsertRemote(insert) => {
+                let WithChannels { tx, inner, .. } = insert;
+                let result = self.doc_insert_remote(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send InsertRemote response: {}", e);
                 }
             }
             DocsMessage::Del(del) => {
@@ -561,6 +569,28 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(GetExactResponse { entry })
+    }
+
+    pub(super) async fn doc_insert_remote(
+        &self,
+        req: InsertRemoteRequest,
+    ) -> RpcResult<InsertRemoteResponse> {
+        let InsertRemoteRequest {
+            doc_id,
+            entry,
+            from,
+            content_complete,
+        } = req;
+        let status = if content_complete {
+            crate::ContentStatus::Complete
+        } else {
+            crate::ContentStatus::Missing
+        };
+        self.sync
+            .insert_remote(doc_id, entry, from, status)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(InsertRemoteResponse)
     }
 
     pub(super) async fn doc_set_download_policy(
