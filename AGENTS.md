@@ -875,6 +875,19 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   context. It reads the node with `try_lock` and reports `busy` rather than wait. Do not turn
   either into a span per event: a dead relay retries every 16 s for the life of the process. See
   `infra/otel/README.md`.
+- **Bytes and heap are named per connection and per call site, not guessed.** On 2026-11-21 a
+  Pixel 10 (v4.5.0) used 34 GB of mobile upload in a week, about 47 MB per friend pull, and held
+  1.7 GB of Rust heap (3 GB swapped) after 75 h. It lagged as a whole, and nothing could say who
+  received the bytes or what held the memory. `conn_ledger.rs` is an endpoint hook installed
+  FIRST on the node's endpoint. `net.conns` (beside `net.health`, which is at tracing's 32-field
+  limit) reports QUIC bytes per (ALPN, remote, direction), dials, live connections,
+  `runtime.tokio_tasks`, and what the endpoint sent that no connection owns. A connection over
+  1 MiB gets its own `conn.closed`. The hook holds only weak connection handles, because a strong
+  one disables close-on-drop. For the heap, `just heap-profile` (`scripts/profile/android-heap.sh`)
+  runs heapprofd over adb on any developer-telemetry build (`withProfileable`). It symbolizes against the `android-native-symbols` CI artifact: `eas-build-pre-install.sh`
+  links the library with a build id and soname, ships it stripped, and stages the copy with its
+  symbol table. Without a build id a profile cannot be matched to symbols, so keep those link
+  args.
 - Guard newly added native exports anyway (`typeof mod.configureTelemetry === 'function'`). Not
   because of bindgen now, but because a phone can be running an older binary than the JS bundle.
 

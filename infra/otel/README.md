@@ -864,6 +864,31 @@ background. The fields below exist to say whose that growth is:
 OTLP batches right now) and `telemetry.spooled_total` / `replayed_total` / `dropped_total`; see
 below.
 
+### When `rust_live_bytes` climbs: a heap profile (`scripts/profile/android-heap.sh`)
+
+These fields can say THAT Rust holds the memory, but not WHAT holds it. On 2026-11-21 the Pixel 10
+(v4.5.0, 14 friends) had 1.73 GB of Rust live heap, 2.8 GB of native heap and 3.16 GB swapped
+after 75 h. `rust_live_bytes` grew a steady ~20 MB/h (~4.5 MB/h on a Pixel 9 with fewer
+friends). The phone lagged as a whole from zram thrash. Check `net.conns`' `conn.live` and
+`runtime.tokio_tasks` first, because a connection or task leak shows up there. Then profile:
+
+```sh
+scripts/profile/android-heap.sh start 6 10      # attach heapprofd for 6 h, a dump every 10 min
+scripts/profile/android-heap.sh status
+scripts/profile/android-heap.sh pull            # once it ends (or after `stop`)
+scripts/profile/android-heap.sh report --commit <app_commit>   # or --run <id>, --symbols <dir>
+```
+
+It needs the phone on adb and a developer-telemetry build: `withProfileable` makes those
+profileable, which is what lets the adb shell attach to a release build. heapprofd samples the
+allocations made after it attaches, together with their native stacks. `report` sums what is
+still unfreed at the last dump by crate and by call site. Symbols come from the
+`android-native-symbols` artifact of the CI run that built the APK: since 2026-11-21
+`eas-build-pre-install.sh` builds the library with a GNU build id and its symbol table, ships a
+stripped copy, and keeps the symbolized one. The report refuses symbols whose build id does not
+match. A build from before then has no build id, so its frames cannot be named. Run it for hours:
+at 20 MB/h, a short session finds churn, not the leak.
+
 ## Did this phone's telemetry arrive late? (`telemetry.recovered`)
 
 The core's spans used to be exported once and dropped if the POST failed, so a phone with no route
@@ -925,6 +950,39 @@ previous record.
 
 # Anyone still dialling a relay we don't run.
 { name = "net.health" && span.relay.foreign_errors > 0 } | select(resource.service.instance.id, span.relay.error_classes)
+```
+
+### Where the bytes go (`net.conns`, `conn.closed`)
+
+On 2026-11-21 a Pixel 10 on v4.5.0 had used 34 GB of mobile upload in a week (Android netstats
+for the app's uid). `ep.send_ip_bytes` showed about 47 MB going out on every friend pull, every
+15 min parked and every 5 otherwise, with about 1 MB coming back. The stash's pod counters
+(4 KB/s in, for the whole fleet) and every other phone's `ep.recv_*` ruled each of them out, so
+nothing could say who received it. `conn_ledger.rs` is an iroh endpoint hook that counts every
+dial and registers every connection. The same pulse then emits `net.conns` beside `net.health`,
+which is at tracing's 32-field limit. It carries the window's QUIC bytes per (ALPN, remote,
+direction), read from each connection's own `ConnectionStats`:
+
+| Field                                              | Says                                                                                                                                                                                 |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `conn.top_tx`                                      | the ten heaviest rows: `alpn remote side tx= rx= hs= att=` (`side` is `out` when we dialled). The answer to "who got the 47 MB"                                                      |
+| `conn.top_attempts`                                | the ten most-dialled `alpn remote=dials`. Dials that never complete a handshake cost radio and appear only here                                                                      |
+| `conn.by_alpn`                                     | the same window per protocol (`iroh-sync/1` is docs sync, `iroh-bytes/4` blobs, `/iroh-gossip/1` gossip, `streetcryptid/pair/*` pairing)                                             |
+| `conn.tx_bytes` / `rx_bytes` / `lost_bytes`        | totals over every connection                                                                                                                                                         |
+| `conn.attempts` / `handshakes` / `closed` / `live` | dials, completed handshakes (both directions), closes, and connections open now. `live` that only climbs is a connection leak                                                        |
+| `conn.unattributed_tx`                             | `ep.send_ip_bytes + ep.send_relay_bytes` minus `conn.tx_bytes`: what the endpoint sent that no completed connection accounts for (handshakes that failed, relay framing, net_report) |
+| `runtime.tokio_tasks`                              | tasks alive on the node's runtime. Climbing with `memory.rust_live_bytes` is a task leak: every leaked task keeps its future                                                         |
+
+A connection that moved more than 1 MiB in either direction also gets a `conn.closed` span when
+it ends, with `conn.alpn`, `sc.peer`, `conn.side`, its byte totals, `conn.duration_ms` and
+`conn.reason`.
+
+```traceql
+# Where one phone's bytes went, window by window.
+{ name = "net.conns" && resource.service.instance.id = "cd736d206b" } | select(span.conn.tx_bytes, span.conn.unattributed_tx, span.conn.top_tx, span.conn.top_attempts, span.conn.live, span.runtime.tokio_tasks)
+
+# Every big connection, fleet-wide.
+{ name = "conn.closed" } | select(resource.service.instance.id, span.conn.alpn, span.sc.peer, span.conn.side, span.conn.tx_bytes, span.conn.rx_bytes, span.conn.duration_ms)
 ```
 
 ## Who answers a push (`trail.push.peer`)

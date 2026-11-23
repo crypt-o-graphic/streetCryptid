@@ -19,6 +19,8 @@
 /// Rust's share of the native heap, counted by a wrapper around the system allocator.
 mod alloc_stats;
 mod ble;
+/// QUIC bytes per (ALPN, remote) for `net.conns`, from an endpoint hook (see the module docs).
+mod conn_ledger;
 mod contact;
 pub mod crypto;
 pub mod delivery;
@@ -3012,7 +3014,10 @@ impl LocationNode {
         #[allow(unused_mut)]
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret)
-            .relay_mode(relay_mode);
+            .relay_mode(relay_mode)
+            // First, so it counts every dial before another hook can refuse one: which
+            // connections the bytes go to (`net.conns`; `conn_ledger` explains).
+            .hooks(conn_ledger::hook());
         // iroh's default resolver sends its own queries to a nameserver list: Google's on Apple,
         // where it cannot read the system config, and on Android whatever list it read at build or
         // at the last network change, which can be the wrong network's. Some phones can never

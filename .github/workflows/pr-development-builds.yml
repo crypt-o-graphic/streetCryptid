@@ -400,6 +400,19 @@ jobs:
             production-internal-android \
             "$BUILD_ARTIFACT"
 
+      # The Rust library with its symbol table, matched by build id to the stripped copy inside the
+      # APK, so a heapprofd profile of this build can name Rust functions
+      # (scripts/profile/android-heap.sh). eas-build-pre-install.sh builds it from source before any
+      # credential is fetched; it holds nothing but code.
+      - name: Upload the native symbols
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-native-symbols
+          path: ~/.cache/streetcryptid/native/android/*/symbols/
+          if-no-files-found: warn
+          retention-days: 90
+
       # The build above is ~90% of this job and prints nothing, by design. This is the only place
       # its shape is visible. It never fails the job: a profile is a diagnostic, not a gate.
       - name: Report the build profile

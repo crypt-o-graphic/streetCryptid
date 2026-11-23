@@ -96,3 +96,6 @@ store/island-preview/
 .e2e-reports/
 scripts/e2e/reports/
 __pycache__/
+
+# Heap profiles pulled off phones (scripts/profile/android-heap.sh).
+.profiles/

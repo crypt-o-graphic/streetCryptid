@@ -530,6 +530,19 @@ jobs:
             "$BUILD_ARTIFACT" \
             production-release
 
+      # The Rust library with its symbol table, matched by build id to the stripped copy inside the
+      # bundle, so a heapprofd profile of this build can name Rust functions
+      # (scripts/profile/android-heap.sh). eas-build-pre-install.sh builds it from source before any
+      # credential is fetched; it holds nothing but code.
+      - name: Upload the native symbols
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-native-symbols
+          path: ~/.cache/streetcryptid/native/android/*/symbols/
+          if-no-files-found: warn
+          retention-days: 90
+
       # Profiled on the same terms as a pull-request build. This is the run whose numbers matter
       # most for comparison: it is the only one that builds every ABI and a real store bundle.
       - name: Report the build profile
