@@ -159,6 +159,34 @@ describe('MapDrawer grip', () => {
     expect(onDetentChange).not.toHaveBeenCalled();
   });
 
+  // A scroll that runs into the top stops there; only a fresh drag from the top shrinks.
+  it('does not turn a scroll that reaches the top into a resize', () => {
+    const onDetentChange = render('full', 900);
+    const scroll = (y: number) =>
+      renderer.root.findByType(ScrollView).props.onScroll.onScroll({
+        contentOffset: { y },
+        contentSize: { height: 900 },
+        layoutMeasurement: { height: 600 },
+      });
+    act(() => {
+      scroll(100);
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: 100, velocityY: 0 });
+      scroll(-20);
+      body.update?.({ translationY: 300, velocityY: 0 });
+      body.end?.({ translationY: 300, velocityY: 900 });
+    });
+    expect(onDetentChange).not.toHaveBeenCalled();
+    act(() => {
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: 300, velocityY: 0 });
+      body.end?.({ translationY: 300, velocityY: 900 });
+    });
+    expect(onDetentChange).toHaveBeenCalled();
+  });
+
   it('expands one stop when the grip is tapped', () => {
     const onDetentChange = render('collapsed');
     act(() => renderer.root.findByProps({ accessibilityLabel: 'Panel size' }).props.onPress());
@@ -504,7 +532,11 @@ describe('MapDrawer header', () => {
     expect(shift(renderer.root.findByType(ScrollView).props.style)).toBe(-34);
     // Ten pixels in: the header has slid up by ten, and the edge with it.
     act(() => {
-      list.props.onScroll.onScroll({ contentOffset: { y: 10 } });
+      list.props.onScroll.onScroll({
+        contentOffset: { y: 10 },
+        contentSize: { height: 900 },
+        layoutMeasurement: { height: 600 },
+      });
     });
     act(() => {
       measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height: 600 } } });

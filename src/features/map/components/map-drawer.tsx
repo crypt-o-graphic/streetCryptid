@@ -1,7 +1,7 @@
 'use no memo'; // react-compiler: the drawer's height is a Reanimated shared value
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
+import { Platform, Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   interpolate,
@@ -68,6 +68,8 @@ const MIN_EDGE_GAP = Spacing.two;
 
 /** Scroll (px) over which the hairline under a floating header fades in once rows run under it. */
 const HEADER_RULE_SPAN = 12;
+/** Android's stretch is the one overscroll an offset cannot pin, so only it tracks the list's top. */
+const trackTop = Platform.OS === 'android';
 
 interface MapDrawerProps {
   readonly children: ReactNode;
@@ -177,12 +179,20 @@ export function MapDrawer({
   const lastTranslation = useSharedValue(0);
   const rawHeight = useSharedValue(0);
   const resizing = useSharedValue(false);
+  // Whether the drag began with the list at its top: only such a drag may shrink the drawer.
+  const fromTop = useSharedValue(false);
   // The list's offset, on the UI thread where the pan reads it. (It once arrived from JS a frame
   // or two late, which is what made the old offset handoff jump.)
   const scrollRef = useAnimatedRef<Animated.ScrollView>();
   const scrollY = useSharedValue(0);
   const headerSpan = useSharedValue(0);
   const headerHidden = useSharedValue(0);
+  // Whether an Android list came to REST at its top, where its overscroll stretch is switched off:
+  // a pull down from there is the drawer's, and the stretch is drawn by the ScrollView itself, so
+  // pinning the offset (as iOS's bounce is pinned, see the list pan) cannot take it back. Set only
+  // once the list stops there, so a scroll that runs into the top still stretches like any other.
+  const [listAtTop, setListAtTop] = useState(true);
+  const listAtTopUi = useSharedValue(true);
 
   const detents = useMemo(() => allowedDetents(maxDetent, minDetent), [maxDetent, minDetent]);
   const topDetent = detents[detents.length - 1];
@@ -349,11 +359,13 @@ export function MapDrawer({
           gestureActive.value = false;
         });
     // A body that scrolls. The list owns the drag, and the drawer takes only what the list cannot
-    // use: a pull DOWN once the list is at its top, and the way back up to where the drag started.
+    // use: a pull DOWN on a list that was ALREADY at its top when the drag began, and the way back up
+    // to where the drag started. A scroll that runs into the top stops there (iOS bounces it) and
+    // never turns into a resize: it takes a second drag, from the top, to shrink the drawer.
     // Carried as per-frame deltas against the UI-thread offset, so the list scrolling to its top
     // and the drawer starting to shrink are one continuous motion under the finger. The list is
-    // pinned at its top while the drawer moves: it does not bounce (see the ScrollView), and on the
-    // way back up it would otherwise scroll by the same travel the drawer is taking.
+    // pinned at its top while the drawer moves: otherwise iOS would rubber-band it down by the same
+    // pull the drawer is taking, and on the way back up scroll it by the drawer's own travel.
     const makeList = () =>
       Gesture.Pan()
         .enabled(hi > lo)
@@ -364,11 +376,12 @@ export function MapDrawer({
           rawHeight.value = height.value;
           lastTranslation.value = 0;
           resizing.value = false;
+          fromTop.value = scrollY.value <= 0.5;
         })
         .onUpdate((event) => {
           const dy = event.translationY - lastTranslation.value;
           lastTranslation.value = event.translationY;
-          if (dy === 0) return;
+          if (dy === 0 || !fromTop.value) return;
           const below = rawHeight.value < startHeight.value - 0.5;
           if (!below && (dy < 0 || scrollY.value > 0.5)) return;
           resizing.value = true;
@@ -412,9 +425,24 @@ export function MapDrawer({
       });
     }
   };
+  const settleTop = () => {
+    'worklet';
+    if (trackTop && scrollY.value <= 0.5 && !listAtTopUi.value) {
+      listAtTopUi.value = true;
+      runOnJS(setListAtTop)(true);
+    }
+  };
   const scrollHandler = useAnimatedScrollHandler({
     onScroll: (event) => {
-      const y = event.contentOffset.y;
+      // Overscroll is clamped away: a bounce (or a stretch) is the list showing its end, not a
+      // scroll, and reading it as one hid the header at the bottom and brought it back as the
+      // bounce settled.
+      const end = Math.max(0, event.contentSize.height - event.layoutMeasurement.height);
+      const y = Math.min(end, Math.max(0, event.contentOffset.y));
+      if (trackTop && y > 0.5 && listAtTopUi.value) {
+        listAtTopUi.value = false;
+        runOnJS(setListAtTop)(false);
+      }
       const dy = y - scrollY.value;
       scrollY.value = y;
       headerHidden.value =
@@ -426,9 +454,11 @@ export function MapDrawer({
     onEndDrag: () => {
       gestureActive.value = false;
       settleHeader();
+      settleTop();
     },
     onMomentumEnd: () => {
       settleHeader();
+      settleTop();
     },
   });
   const headerStyle = useAnimatedStyle(() => ({
@@ -610,12 +640,11 @@ export function MapDrawer({
                   ref={scrollRef}
                   // iOS bounces a ScrollView vertically even when its content fits, which made the
                   // ME panel — a body that always fits its own detent — feel like a list that had
-                  // somewhere to go and then sprang back. And a list that does scroll does not bounce
-                  // either: pulling down past its top is the drawer's (see the list pan), and a
-                  // bounce there would be the list and the drawer both answering the same pull.
+                  // somewhere to go and then sprang back. A list that does scroll bounces (iOS) and
+                  // stretches (Android) at its ends like any other, except a pull down from its top:
+                  // that is the drawer's (see the list pan, and `listAtTop`).
                   alwaysBounceVertical={false}
-                  bounces={false}
-                  overScrollMode="never"
+                  overScrollMode={listScrolls && !listAtTop ? 'auto' : 'never'}
                   // A body that fits the detent it is in cannot scroll, rather than scrolling by
                   // whatever the pixel grid happens to leave over. The heights are derived from the
                   // body's own measurement, so at rest that slack is a rounding error — but a
