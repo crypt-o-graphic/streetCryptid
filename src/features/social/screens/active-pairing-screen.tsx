@@ -5,7 +5,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppState,
   BackHandler,
+  Keyboard,
   Platform,
+  Pressable,
   Share,
   StyleSheet,
   Text,
@@ -22,6 +24,7 @@ import Animated, {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
+import { KeyboardLiftView } from '@/components/keyboard-lift-view';
 import { ThemedText } from '@/components/themed-text';
 import { resolveSignalColor } from '@/constants/signal-colors';
 import { CryptidThemes, Spacing } from '@/constants/theme';
@@ -91,6 +94,7 @@ export default function ActivePairingScreen() {
   const theme = CryptidThemes[scheme === 'dark' ? 'deepsea' : 'daybreak'];
   const { chrome } = theme;
   const insets = useSafeAreaInsets();
+  const panelMargin = Math.max(insets.bottom, Spacing.two);
   // Sized by its own frame, not the window: the same screen is also pushed inside the Settings
   // sheet, which on a wide window is a ~650 pt card that a window-sized field overflowed.
   const windowSize = useWindowDimensions();
@@ -614,6 +618,7 @@ export default function ActivePairingScreen() {
 
   const createAndShareLink = async (): Promise<void> => {
     if (workingRef.current) return;
+    Keyboard.dismiss();
     workingRef.current = 'link';
     setIntent('link');
     setWorking('link');
@@ -648,6 +653,7 @@ export default function ActivePairingScreen() {
   };
 
   const submitInput = async (): Promise<void> => {
+    Keyboard.dismiss();
     const value = input.trim();
     if (!value || workingRef.current) {
       if (!value) setInputError('Paste a streetCryptid pairing link, token, or code.');
@@ -867,7 +873,9 @@ export default function ActivePairingScreen() {
       </View>
 
       <View style={sideBySide ? styles.bodyRow : styles.bodyColumn}>
-        <View style={styles.stage}>
+        {/* Tapping the stage dismisses the keyboard, as anywhere outside a field does on iOS and
+            Android. The stage itself never moves for the keyboard: only the panel rides up. */}
+        <Pressable accessible={false} onPress={Keyboard.dismiss} style={styles.stage}>
           <Animated.View
             key={stageKey}
             entering={reducedMotion ? undefined : FadeIn.duration(SWAP_IN_MS)}
@@ -917,290 +925,317 @@ export default function ActivePairingScreen() {
               </View>
             )}
           </Animated.View>
-        </View>
+        </Pressable>
 
-        <Animated.View
-          layout={reducedMotion ? undefined : LinearTransition.duration(SWAP_IN_MS)}
-          style={[
-            styles.panel,
-            sideBySide ? [styles.panelSide, { width: sidePanelWidth }] : null,
-            {
-              backgroundColor: chrome.island,
-              borderColor: chrome.islandBorder,
-              marginBottom: Math.max(insets.bottom, Spacing.two),
-            },
-          ]}
+        {/* The keyboard covers the home indicator, so its inset is not owed while it is up. */}
+        <KeyboardLiftView
+          coverableBottom={panelMargin - Spacing.two}
+          style={sideBySide ? styles.panelSideLift : null}
         >
-          {!shownFriend ? (
-            <View style={styles.statusRow}>
-              <Animated.View
-                key={presentation.status}
-                entering={reducedMotion ? undefined : FadeIn.duration(SWAP_IN_MS)}
-                style={styles.statusCopy}
-              >
-                <Text
-                  style={[
-                    verification ? styles.statusSentence : styles.statusLabel,
-                    { color: verification ? chrome.ink : toneColor },
-                  ]}
+          <Animated.View
+            layout={reducedMotion ? undefined : LinearTransition.duration(SWAP_IN_MS)}
+            style={[
+              styles.panel,
+              sideBySide ? [styles.panelSide, { width: sidePanelWidth }] : null,
+              {
+                backgroundColor: chrome.island,
+                borderColor: chrome.islandBorder,
+                marginBottom: panelMargin,
+              },
+            ]}
+          >
+            {!shownFriend ? (
+              <View style={styles.statusRow}>
+                <Animated.View
+                  key={presentation.status}
+                  entering={reducedMotion ? undefined : FadeIn.duration(SWAP_IN_MS)}
+                  style={styles.statusCopy}
                 >
-                  {presentation.status}
-                </Text>
-                {presentation.detail ? (
-                  <Text style={[styles.detail, { color: chrome.steel }]}>
-                    {presentation.detail}
+                  <Text
+                    style={[
+                      verification ? styles.statusSentence : styles.statusLabel,
+                      { color: verification ? chrome.ink : toneColor },
+                    ]}
+                  >
+                    {presentation.status}
+                  </Text>
+                  {presentation.detail ? (
+                    <Text style={[styles.detail, { color: chrome.steel }]}>
+                      {presentation.detail}
+                    </Text>
+                  ) : null}
+                  {linkNotice ? (
+                    <Text style={[styles.detail, { color: chrome.amber }]}>{linkNotice}</Text>
+                  ) : null}
+                </Animated.View>
+                {verification ? (
+                  <Text
+                    accessibilityLabel={
+                      verify.expired
+                        ? 'This verification has expired'
+                        : `Verification time remaining ${verify.clock}`
+                    }
+                    style={[
+                      styles.smallClock,
+                      { color: verify.expired ? chrome.amber : chrome.steel },
+                    ]}
+                  >
+                    {verify.clock}
                   </Text>
                 ) : null}
-                {linkNotice ? (
-                  <Text style={[styles.detail, { color: chrome.amber }]}>{linkNotice}</Text>
-                ) : null}
-              </Animated.View>
-              {verification ? (
-                <Text
-                  accessibilityLabel={
-                    verify.expired
-                      ? 'This verification has expired'
-                      : `Verification time remaining ${verify.clock}`
-                  }
-                  style={[
-                    styles.smallClock,
-                    { color: verify.expired ? chrome.amber : chrome.steel },
-                  ]}
-                >
-                  {verify.clock}
-                </Text>
-              ) : null}
-            </View>
-          ) : null}
-
-          {stage === 'link-live' && pairing?.inviteLink ? (
-            <Animated.View
-              entering={reducedMotion ? undefined : FadeIn.duration(SWAP_IN_MS)}
-              style={styles.linkTools}
-            >
-              <PressableAction
-                accessibilityHint="Opens the code large enough for another phone to scan"
-                accessibilityLabel="Show the pairing QR code large enough to scan"
-                accessibilityRole="button"
-                onPress={() => setScanning(true)}
-              >
-                <PairingQr
-                  background={qrField}
-                  color={qrModule}
-                  size={QR_SIZE}
-                  value={pairing.inviteLink}
-                />
-              </PressableAction>
-              <View style={styles.linkCopy}>
-                <Text
-                  numberOfLines={2}
-                  selectable
-                  testID="debug-invite-link"
-                  style={[styles.linkText, { color: chrome.ink }]}
-                >
-                  {pairing.inviteLink}
-                </Text>
-                <View style={styles.linkActions}>
-                  <SmallAction
-                    color={signal}
-                    label={copied ? 'COPIED' : 'COPY'}
-                    onPress={() => {
-                      void Clipboard.setStringAsync(pairing.inviteLink!);
-                      void tapHaptic();
-                      setCopied(true);
-                    }}
-                  />
-                  <SmallAction
-                    color={signal}
-                    label="SHARE"
-                    onPress={() => void shareLink(pairing.inviteLink!)}
-                  />
-                  <SmallAction color={signal} label="QR" onPress={() => setScanning(true)} />
-                </View>
               </View>
-            </Animated.View>
-          ) : null}
+            ) : null}
 
-          {showPasteRow ? (
-            <View style={styles.inputRow}>
-              <TextInput
-                accessibilityLabel="Pairing link or code"
-                autoCapitalize="none"
-                autoCorrect={false}
-                editable={!working}
-                onChangeText={(value) => {
-                  setInput(value);
-                  setInputError(null);
-                }}
-                onSubmitEditing={() => void submitInput()}
-                placeholder="Pairing link or code"
-                placeholderTextColor={chrome.steel}
-                selectionColor={signal}
-                style={[
-                  styles.input,
-                  { borderColor: inputError ? chrome.amber : chrome.hairline, color: chrome.ink },
-                ]}
-                value={input}
-              />
-              <PressableAction
-                accessibilityLabel="Pair using this link or code"
-                accessibilityRole="button"
-                disabled={Boolean(working)}
-                onPress={() => void submitInput()}
-                style={[styles.pairButton, { borderColor: signal }]}
+            {stage === 'link-live' && pairing?.inviteLink ? (
+              <Animated.View
+                entering={reducedMotion ? undefined : FadeIn.duration(SWAP_IN_MS)}
+                style={styles.linkTools}
               >
-                <Text style={[styles.buttonLabel, { color: signal }]}>PAIR</Text>
-              </PressableAction>
-            </View>
-          ) : null}
+                <PressableAction
+                  accessibilityHint="Opens the code large enough for another phone to scan"
+                  accessibilityLabel="Show the pairing QR code large enough to scan"
+                  accessibilityRole="button"
+                  onPress={() => setScanning(true)}
+                >
+                  <PairingQr
+                    background={qrField}
+                    color={qrModule}
+                    size={QR_SIZE}
+                    value={pairing.inviteLink}
+                  />
+                </PressableAction>
+                <View style={styles.linkCopy}>
+                  <Text
+                    numberOfLines={2}
+                    selectable
+                    testID="debug-invite-link"
+                    style={[styles.linkText, { color: chrome.ink }]}
+                  >
+                    {pairing.inviteLink}
+                  </Text>
+                  <View style={styles.linkActions}>
+                    <SmallAction
+                      color={signal}
+                      label={copied ? 'COPIED' : 'COPY'}
+                      onPress={() => {
+                        void Clipboard.setStringAsync(pairing.inviteLink!);
+                        void tapHaptic();
+                        setCopied(true);
+                      }}
+                    />
+                    <SmallAction
+                      color={signal}
+                      label="SHARE"
+                      onPress={() => void shareLink(pairing.inviteLink!)}
+                    />
+                    <SmallAction color={signal} label="QR" onPress={() => setScanning(true)} />
+                  </View>
+                </View>
+              </Animated.View>
+            ) : null}
 
-          {friend || !verification ? (
-            <PairingRepeaterCards
-              offer={repeaterOffer}
-              chrome={chrome}
-              friendLabel={friend?.handle ?? null}
-              disabled={Boolean(working)}
-            />
-          ) : null}
-
-          {discoveryError ? (
-            <Text accessibilityRole="alert" style={[styles.detail, { color: chrome.amber }]}>
-              {discoveryError}
-            </Text>
-          ) : null}
-
-          <View style={styles.actions}>
-            {friend ? (
-              <>
-                <Action
-                  color={chrome.steel}
-                  label="REJECT"
+            {showPasteRow ? (
+              <View style={styles.inputRow}>
+                <TextInput
+                  accessibilityLabel="Pairing link or code"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  editable={!working}
+                  onChangeText={(value) => {
+                    setInput(value);
+                    setInputError(null);
+                  }}
+                  onSubmitEditing={() => void submitInput()}
+                  placeholder="Pairing link or code"
+                  placeholderTextColor={chrome.steel}
+                  returnKeyType="go"
+                  selectionColor={signal}
+                  style={[
+                    styles.input,
+                    { borderColor: inputError ? chrome.amber : chrome.hairline, color: chrome.ink },
+                  ]}
+                  value={input}
+                />
+                <PressableAction
+                  accessibilityLabel="Pair using this link or code"
+                  accessibilityRole="button"
                   disabled={Boolean(working)}
-                  onPress={() => void decideFriend(false)}
-                  outline
-                />
-                <Action
-                  color={signal}
-                  label="ACKNOWLEDGE"
-                  testID="pairing-acknowledge-friend"
-                  disabled={
-                    Boolean(working) ||
-                    rejectedDiscovery === `${friend.endpointId}:${friend.pairedAt ?? 0}`
-                  }
-                  onPress={() => void decideFriend(true)}
-                />
-              </>
-            ) : verify.mode === 'show' ? (
-              <>
-                <Action
-                  accessibilityLabel="The other person picked a different figure"
-                  color={chrome.steel}
-                  disabled={verify.disabled}
-                  hapticOnPress={false}
-                  label="DIFFERENT"
-                  onPress={() => verify.confirm(false)}
-                  outline
-                  testID="pairing-confirm-different"
-                />
-                <Action
-                  accessibilityLabel="The other person picked this figure"
-                  color={signal}
-                  disabled={verify.disabled}
-                  hapticOnPress={false}
-                  label="THEY MATCHED"
-                  onPress={() => verify.confirm(true)}
-                  testID="pairing-confirm-matched"
-                />
-              </>
-            ) : verify.mode ? (
-              <Action
-                accessibilityLabel={
-                  verify.mode === 'invalid' ? 'Stop invalid pairing attempt' : 'stop pairing'
-                }
-                color={chrome.steel}
-                hapticOnPress={false}
-                label="STOP PAIRING"
-                onPress={verify.cancel}
-                outline
-              />
-            ) : stage === 'radio-off' && Platform.OS === 'android' ? (
-              <Action
-                color={signal}
-                label="TURN ON BLUETOOTH"
-                onPress={() => void openBluetoothSettings()}
-              />
-            ) : stage === 'link-live' ? (
-              <Action
-                color={chrome.steel}
+                  onPress={() => void submitInput()}
+                  style={[styles.pairButton, { borderColor: signal }]}
+                >
+                  <Text style={[styles.buttonLabel, { color: signal }]}>PAIR</Text>
+                </PressableAction>
+              </View>
+            ) : null}
+
+            {friend || !verification ? (
+              <PairingRepeaterCards
+                offer={repeaterOffer}
+                chrome={chrome}
+                friendLabel={friend?.handle ?? null}
                 disabled={Boolean(working)}
-                label="CANCEL LINK"
-                onPress={() => void cancelLinkAndReturn()}
-                outline
               />
-            ) : stage === 'pair-failed' ? (
-              <>
-                <Action color={chrome.steel} label="NOT NOW" onPress={returnToBump} outline />
-                {failure?.nearby ? (
-                  <Action color={signal} label="TRY AGAIN" onPress={() => void retryBump()} />
-                ) : (
+            ) : null}
+
+            {discoveryError ? (
+              <Text accessibilityRole="alert" style={[styles.detail, { color: chrome.amber }]}>
+                {discoveryError}
+              </Text>
+            ) : null}
+
+            <View style={styles.actions}>
+              {friend ? (
+                <>
+                  <Action
+                    color={chrome.steel}
+                    label="REJECT"
+                    disabled={Boolean(working)}
+                    onPress={() => void decideFriend(false)}
+                    outline
+                  />
+                  <Action
+                    color={signal}
+                    label="ACKNOWLEDGE"
+                    testID="pairing-acknowledge-friend"
+                    disabled={
+                      Boolean(working) ||
+                      rejectedDiscovery === `${friend.endpointId}:${friend.pairedAt ?? 0}`
+                    }
+                    onPress={() => void decideFriend(true)}
+                  />
+                </>
+              ) : verify.mode === 'show' ? (
+                <>
+                  <Action
+                    accessibilityLabel="The other person picked a different figure"
+                    color={chrome.steel}
+                    disabled={verify.disabled}
+                    hapticOnPress={false}
+                    label="DIFFERENT"
+                    onPress={() => verify.confirm(false)}
+                    outline
+                    testID="pairing-confirm-different"
+                  />
+                  <Action
+                    accessibilityLabel="The other person picked this figure"
+                    color={signal}
+                    disabled={verify.disabled}
+                    hapticOnPress={false}
+                    label="THEY MATCHED"
+                    onPress={() => verify.confirm(true)}
+                    testID="pairing-confirm-matched"
+                  />
+                </>
+              ) : verify.mode ? (
+                <Action
+                  accessibilityLabel={
+                    verify.mode === 'invalid' ? 'Stop invalid pairing attempt' : 'stop pairing'
+                  }
+                  color={chrome.steel}
+                  hapticOnPress={false}
+                  label="STOP PAIRING"
+                  onPress={verify.cancel}
+                  outline
+                />
+              ) : stage === 'radio-off' && Platform.OS === 'android' ? (
+                <Action
+                  color={signal}
+                  label="TURN ON BLUETOOTH"
+                  onPress={() => void openBluetoothSettings()}
+                />
+              ) : stage === 'link-live' ? (
+                <Action
+                  color={chrome.steel}
+                  disabled={Boolean(working)}
+                  label="CANCEL LINK"
+                  onPress={() => void cancelLinkAndReturn()}
+                  outline
+                />
+              ) : stage === 'pair-failed' ? (
+                <>
+                  <Action color={chrome.steel} label="NOT NOW" onPress={returnToBump} outline />
+                  {failure?.nearby ? (
+                    <Action color={signal} label="TRY AGAIN" onPress={() => void retryBump()} />
+                  ) : (
+                    <Action
+                      color={signal}
+                      label="NEW LINK"
+                      onPress={() => void createAndShareLink()}
+                    />
+                  )}
+                </>
+              ) : stage === 'link-spent' ? (
+                <>
+                  <Action
+                    color={chrome.steel}
+                    label="BACK TO BUMP"
+                    onPress={returnToBump}
+                    outline
+                  />
                   <Action
                     color={signal}
                     label="NEW LINK"
                     onPress={() => void createAndShareLink()}
                   />
-                )}
-              </>
-            ) : stage === 'link-spent' ? (
-              <>
-                <Action color={chrome.steel} label="BACK TO BUMP" onPress={returnToBump} outline />
-                <Action color={signal} label="NEW LINK" onPress={() => void createAndShareLink()} />
-              </>
-            ) : stage === 'service-failed' ? (
-              <Action color={signal} label="TRY AGAIN" onPress={retryService} />
-            ) : stage === 'bump-failed' || stage === 'bump-waiting' ? (
-              <>
+                </>
+              ) : stage === 'service-failed' ? (
+                <Action color={signal} label="TRY AGAIN" onPress={retryService} />
+              ) : stage === 'bump-failed' || stage === 'bump-waiting' ? (
+                <>
+                  <Action
+                    color={chrome.steel}
+                    label="MAKE A LINK"
+                    onPress={() => void createAndShareLink()}
+                    outline
+                  />
+                  <Action color={signal} label="TRY AGAIN" onPress={() => void retryBump()} />
+                </>
+              ) : stage === 'bump-armed' && bump.sensor.status !== 'ready' ? (
+                <>
+                  <Action
+                    color={chrome.steel}
+                    label="MAKE A LINK"
+                    onPress={() => void createAndShareLink()}
+                    outline
+                  />
+                  <Action color={signal} label="BUMP NOW" onPress={() => void bump.commit()} />
+                </>
+              ) : stage === 'link-expired' ||
+                stage === 'link-failed' ||
+                stage === 'redeem-failed' ? (
+                <>
+                  <Action
+                    color={chrome.steel}
+                    label="BACK TO BUMP"
+                    onPress={returnToBump}
+                    outline
+                  />
+                  <Action
+                    color={signal}
+                    label="NEW LINK"
+                    onPress={() => void createAndShareLink()}
+                  />
+                </>
+              ) : stage === 'bump-armed' ||
+                stage === 'bump-starting' ||
+                stage === 'unavailable' ||
+                stage === 'radio-unsupported' ? (
                 <Action
                   color={chrome.steel}
                   label="MAKE A LINK"
                   onPress={() => void createAndShareLink()}
                   outline
                 />
-                <Action color={signal} label="TRY AGAIN" onPress={() => void retryBump()} />
-              </>
-            ) : stage === 'bump-armed' && bump.sensor.status !== 'ready' ? (
-              <>
-                <Action
-                  color={chrome.steel}
-                  label="MAKE A LINK"
-                  onPress={() => void createAndShareLink()}
-                  outline
-                />
-                <Action color={signal} label="BUMP NOW" onPress={() => void bump.commit()} />
-              </>
-            ) : stage === 'link-expired' || stage === 'link-failed' || stage === 'redeem-failed' ? (
-              <>
-                <Action color={chrome.steel} label="BACK TO BUMP" onPress={returnToBump} outline />
-                <Action color={signal} label="NEW LINK" onPress={() => void createAndShareLink()} />
-              </>
-            ) : stage === 'bump-armed' ||
-              stage === 'bump-starting' ||
-              stage === 'unavailable' ||
-              stage === 'radio-unsupported' ? (
-              <Action
-                color={chrome.steel}
-                label="MAKE A LINK"
-                onPress={() => void createAndShareLink()}
-                outline
-              />
-            ) : null}
-          </View>
+              ) : null}
+            </View>
 
-          {verify.queued > 0 ? (
-            <ThemedText type="code" themeColor="textSecondary" style={styles.queue}>
-              {verify.queued} MORE SIGNAL{verify.queued === 1 ? '' : 'S'} WAITING
-            </ThemedText>
-          ) : null}
-        </Animated.View>
+            {verify.queued > 0 ? (
+              <ThemedText type="code" themeColor="textSecondary" style={styles.queue}>
+                {verify.queued} MORE SIGNAL{verify.queued === 1 ? '' : 'S'} WAITING
+              </ThemedText>
+            ) : null}
+          </Animated.View>
+        </KeyboardLiftView>
       </View>
 
       {scanLink ? (
@@ -1383,9 +1418,11 @@ const styles = StyleSheet.create({
   },
   // Beside the field, centred on it, rather than a full-width bar along the bottom edge.
   panelSide: {
-    alignSelf: 'center',
     marginLeft: 0,
     marginRight: 18,
+  },
+  panelSideLift: {
+    alignSelf: 'center',
   },
   statusRow: {
     alignItems: 'flex-start',
