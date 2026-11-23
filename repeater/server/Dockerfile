@@ -38,7 +38,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 LABEL org.opencontainers.image.title="trail-stash" \
       org.opencontainers.image.description="Ciphertext-blind, stateless iroh-docs replica + push waker (offline trail delivery)" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later" \
-      org.opencontainers.image.source="https://github.com/unrealJune/streetCryptid"
+      org.opencontainers.image.source="https://github.com/crypt-o-graphic/streetCryptid"
 
 COPY --from=build /trail-stash /trail-stash
 
