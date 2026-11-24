@@ -429,7 +429,7 @@ function stashScene(t: number, size: StageSize): DeliveryScene {
       { key: 'stash-b', from: dropOut, to: cb, strength: t >= 0.68 ? seg(t, 0.68, 0.86) : 0.03 },
     ],
     payloads,
-    slab: { rect: slabRect, label: 'STASH SERVER', holding: stashed },
+    slab: { rect: slabRect, label: 'HOSTED REPEATER', holding: stashed },
     circle: null,
     // The clock runs only while something is actually being held, and reaches zero exactly as
     // the held copy finishes fading — the expiry and the disappearance are the same event.
