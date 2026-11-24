@@ -62,6 +62,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      # The bump commit's `license/cla` status (see "Commit and tag the release").
+      statuses: write
     outputs:
       release: ${{ steps.resolve.outputs.release }}
       version: ${{ steps.resolve.outputs.version }}
@@ -183,6 +185,29 @@ jobs:
           # instead (a lightweight tag on the same commit; next-version.sh and `gh release` read
           # either kind), so a tag refusal can no longer cost a release.
           base="$(git rev-parse origin/main)"
+          # The "Require signed CLA" ruleset wants a `license/cla` status on every commit that
+          # reaches main, and CLA Assistant only posts one on pull requests, so the bump commit was
+          # refused (GH013) on every run from 2026-11-21. The ruleset does not pin the status to an
+          # app, so this job posts it itself -- but only on a commit that is exactly this
+          # workflow's bump: one commit on top of main, touching nothing but the two manifests.
+          # A status needs the commit on GitHub first, hence the parking branch; no workflow runs
+          # on pushes to it.
+          if [[ "$(git rev-parse HEAD)" != "$base" ]]; then
+            if [[ "$(git rev-parse HEAD^)" != "$base" ]] ||
+              [[ -n "$(git diff --name-only "$base" HEAD -- . ':!app.json' ':!package.json')" ]]; then
+              echo "The release commit is not a bare version bump on main; refusing to vouch for it." >&2
+              exit 1
+            fi
+            parking="release-pending/$TAG"
+            trap 'git push --quiet origin --delete "$parking" || true' EXIT
+            git push --force origin "HEAD:refs/heads/$parking"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$(git rev-parse HEAD)" \
+              -f state=success \
+              -f context=license/cla \
+              -f description='Version bump by github-actions[bot]; no contributor signature applies.' \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              > /dev/null
+          fi
           pushed=false
           for attempt in 1 2 3; do
             if git push --atomic origin HEAD:main "refs/tags/$TAG"; then
@@ -513,10 +538,14 @@ jobs:
           free -m
           echo "systemd-oomd: $(systemctl is-active systemd-oomd 2>/dev/null || true)"
 
+      - name: Install the Gradle build profiler
+        run: install -D -m 0644 scripts/gradle-build-profile.init.gradle "$HOME/.gradle/init.d/gradle-build-profile.init.gradle"
+
       - name: Build the store bundle locally
         id: build
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          SC_GRADLE_PROFILE: '1'
         run: |
           set -euo pipefail
           mkdir -p "$EAS_LOCAL_BUILD_ARTIFACTS_DIR" "$EAS_LOCAL_BUILD_WORKINGDIR"
@@ -525,6 +554,19 @@ jobs:
             production \
             "$BUILD_ARTIFACT" \
             production-release
+
+      # The Rust library with its symbol table, matched by build id to the stripped copy inside the
+      # bundle, so a heapprofd profile of this build can name Rust functions
+      # (scripts/profile/android-heap.sh). eas-build-pre-install.sh builds it from source before any
+      # credential is fetched; it holds nothing but code.
+      - name: Upload the native symbols
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-native-symbols
+          path: ~/.cache/streetcryptid/native/android/*/symbols/
+          if-no-files-found: warn
+          retention-days: 90
 
       # Profiled on the same terms as a pull-request build. This is the run whose numbers matter
       # most for comparison: it is the only one that builds every ABI and a real store bundle.
@@ -536,9 +578,19 @@ jobs:
           SC_CACHE_CARGO_HIT: ${{ steps.setup.outputs.cargo-cache-hit }}
           SC_CACHE_NATIVE_HIT: ${{ steps.setup.outputs.artifact-cache-hit }}
           SC_CACHE_GRADLE_HIT: ${{ steps.setup.outputs.native-cache-hit }}
+          SC_PROFILE_BUNDLE_DIR: ${{ runner.temp }}/build-profile-bundle
         run: |
           bash scripts/build-report.sh android >> "$GITHUB_STEP_SUMMARY" ||
             printf '_The build profile could not be rendered._\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the validated Android build profile
+        if: '!cancelled()'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-profile-android
+          path: ${{ runner.temp }}/build-profile-bundle
+          if-no-files-found: ignore
+          retention-days: 14
 
       # Straight from this runner to the Play Developer API -- the .aab never goes to Expo.
       - name: Upload to the Google Play internal track

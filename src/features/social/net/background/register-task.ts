@@ -1,5 +1,3 @@
-import { Platform } from 'react-native';
-
 import type { SpanContext } from '@/features/dev/telemetry';
 import { defineBackgroundRefreshTask, isBackgroundRefreshAvailable } from './refresh-task';
 import { defineReviveTask, isReviveFenceAvailable } from './revive-task';
@@ -59,7 +57,13 @@ export function getActiveRefreshHandler(): ((parent?: SpanContext) => Promise<vo
  * `ensureSharingArmedHeadless` has — and the periodic refresh is still how a phone whose
  * `LocationTaskService` was killed gets itself back.
  */
-const NEEDS_JS_BACKGROUND_TASKS = Platform.OS === 'android';
+//
+// 2026-11-22: and Android no longer either. `BackgroundLocationService` heartbeats and pulls natively,
+// and `ServiceRecovery` (watchdog alarm, boot receiver, resume notification) brings the service back.
+// These handlers only woke a JS context to repeat that: the revive fence alone fired ~1,750 times a
+// day on a Pixel sitting still. `retireJsBackgroundTasks` (location-sharing.ts) unregisters what
+// earlier builds left behind.
+const NEEDS_JS_BACKGROUND_TASKS = false;
 
 if (NEEDS_JS_BACKGROUND_TASKS && isBackgroundRefreshAvailable()) {
   // The periodic refresh task. Defined at module scope (like the location task) so a

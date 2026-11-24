@@ -115,7 +115,7 @@ internal object NativeBackgroundRuntime {
     battery: BatteryState,
     intervalMs: ULong,
   ): Capture {
-    if (IrohLocationModule.appIsWired()) return Capture.HandToApp
+    if (routeToApp()) return Capture.HandToApp
     val node = acquireNode(context) ?: return Capture.Unavailable
     return try {
       val outcome =
@@ -155,7 +155,7 @@ internal object NativeBackgroundRuntime {
     battery: BatteryState,
     intervalMs: ULong,
   ): Capture {
-    if (IrohLocationModule.appIsWired()) return Capture.HandToApp
+    if (routeToApp()) return Capture.HandToApp
     val node = acquireNode(context) ?: return Capture.Unavailable
     return try {
       val outcome =
@@ -229,10 +229,22 @@ internal object NativeBackgroundRuntime {
   }
 
   /**
+   * Whether a capture goes up to the app rather than straight into the pipeline here: only while
+   * the app is wired AND on screen, where it draws the user's own marker live.
+   *
+   * It used to be whenever the app was wired, and the foreground service keeps the app mounted for
+   * as long as sharing runs, so a phone in a pocket woke the JS thread for every capture and every
+   * parked tick, all day, to do what this does without it (June, 2026-11-22: "we shouldn't be
+   * waking up the JS"). The app reads what was published while it was away from the own-trail log
+   * (`takeOwnPublished`) when it comes back.
+   */
+  private fun routeToApp(): Boolean = IrohLocationModule.appIsWired() && appInForeground()
+
+  /**
    * Whether an activity of ours is in the foreground. The foreground service alone reports
    * `IMPORTANCE_FOREGROUND_SERVICE`, which is ranked below this, so a pocketed app reads `false`.
    */
-  private fun appInForeground(): Boolean {
+  internal fun appInForeground(): Boolean {
     val info = ActivityManager.RunningAppProcessInfo()
     ActivityManager.getMyMemoryState(info)
     return info.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND

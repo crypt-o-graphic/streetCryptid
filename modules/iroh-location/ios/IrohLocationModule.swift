@@ -602,6 +602,29 @@ public final class IrohLocationModule: Module {
     }
 
     /// Remember the transport settings, so the background runtime can `start` without JS.
+    /// How much mobile data the node may spend reaching friends' phones directly: `saver`,
+    /// `balanced` or `realtime` (`dial_gate`). The node remembers it for every later start, the
+    /// background runtime's included.
+    AsyncFunction("setDataMode") { (mode: String) async throws in
+      guard let node = self.node else { throw Exception(name: "NoNode", description: "call createNode first") }
+      let parsed: DataMode
+      switch mode {
+      case "saver": parsed = .saver
+      case "realtime": parsed = .realtime
+      default: parsed = .balanced
+      }
+      try await node.setDataMode(mode: parsed)
+    }
+
+    Function("dataMode") { () throws -> String in
+      guard let node = self.node else { throw Exception(name: "NoNode", description: "call createNode first") }
+      switch node.dataMode() {
+      case .saver: return "saver"
+      case .balanced: return "balanced"
+      case .realtime: return "realtime"
+      }
+    }
+
     AsyncFunction("setTransportConfig") {
       (relayUrls: [String], relayAuthToken: String, relayEnabled: Bool, ipEnabled: Bool,
         bleEnabled: Bool) async throws in
@@ -625,6 +648,30 @@ public final class IrohLocationModule: Module {
           battery: batteryState(from: battery),
           intervalMs: UInt64(max(1, intervalMs)),
           nowMs: UInt64(Date().timeIntervalSince1970 * 1000)))
+    }
+
+    /// `ingestFix` and the motion claim it settles, in one drain (`parked`: `true` a stop, `false`
+    /// a departure, `nil` none), with the push bounded by `budgetMs` when the runtime handed one
+    /// over. What a mounted app does with a capture the runtime hands it — see `HandOffAcks` and
+    /// `DrainEngine::ingest_claiming`.
+    AsyncFunction("ingestFixClaiming") {
+      (fix: [String: Double], battery: [String: Any], intervalMs: Double, parked: Bool?,
+        budgetMs: Double?) async throws -> [String: Any?] in
+      guard let node = self.node else { throw Exception(name: "NoNode", description: "call createNode first") }
+      return ingestOutcomeToDict(
+        try await node.ingestFixClaiming(
+          fix: locationFix(from: fix),
+          battery: batteryState(from: battery),
+          intervalMs: UInt64(max(1, intervalMs)),
+          nowMs: UInt64(Date().timeIntervalSince1970 * 1000),
+          parked: parked,
+          budgetMs: budgetMs.map { UInt64(max(0, $0)) }))
+    }
+
+    /// The app has finished publishing a capture the runtime handed it, so the background
+    /// assertion held for it can end. See `HandOffAcks`.
+    Function("ackNativeCapture") { (token: String) in
+      BackgroundLocationRuntime.shared.ackHandOff(token)
     }
 
     /// Publish the slots that have come due without a new fix, reusing the last known position.

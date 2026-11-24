@@ -123,6 +123,14 @@ jobs:
           bash scripts/test-eas-ci-log-isolation.sh
           bash scripts/test-build-profile-isolation.sh
 
+      # The Rust core's host build, which the EAS step below would run first anyway (UniFFI reads
+      # the bindings from it). Here, with no credential in the environment, its compiler errors are
+      # printed; inside EAS they are withheld with the rest of its output, and a macOS-only compile
+      # error read as nothing but "EAS local ios build failed" (PR #227, 2026-11-22). The EAS step
+      # then finds the target directory built.
+      - name: Compile the Rust core for macOS
+        run: bash scripts/generate-uniffi-bindings.sh ios
+
       - name: Build the standalone Release locally
         id: build
         env:
@@ -400,6 +408,19 @@ jobs:
             production-internal-android \
             "$BUILD_ARTIFACT"
 
+      # The Rust library with its symbol table, matched by build id to the stripped copy inside the
+      # APK, so a heapprofd profile of this build can name Rust functions
+      # (scripts/profile/android-heap.sh). eas-build-pre-install.sh builds it from source before any
+      # credential is fetched; it holds nothing but code.
+      - name: Upload the native symbols
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-native-symbols
+          path: ~/.cache/streetcryptid/native/android/*/symbols/
+          if-no-files-found: warn
+          retention-days: 90
+
       # The build above is ~90% of this job and prints nothing, by design. This is the only place
       # its shape is visible. It never fails the job: a profile is a diagnostic, not a gate.
       - name: Report the build profile
@@ -565,6 +586,38 @@ jobs:
           if [[ -n "${BUILD_ARTIFACT:-}" ]]; then
             rm -f -- "$BUILD_ARTIFACT"
           fi
+
+  prune-preview-caches:
+    name: Prune superseded compiler caches
+    needs: [build_ios, build_android]
+    if: >-
+      !cancelled() &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (needs.build_ios.result == 'success' || needs.build_android.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      # No checkout, and no credentials other than the cache API token. Never touch main's caches.
+      - name: Keep two cache generations per platform and family
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          ref="refs/pull/$PR_NUMBER/merge"
+          for prefix in eas-local-ccache-ios- eas-local-ccache-android- eas-local-gradle-build-cache-; do
+            ids="$(gh api --paginate --slurp --method GET "repos/$GITHUB_REPOSITORY/actions/caches" \
+              -f ref="$ref" -f key="$prefix" -f sort=created_at -f direction=desc -F per_page=100 \
+              | jq -r '[.[].actions_caches[]][2:][].id')"
+            for id in $ids; do
+              [[ "$id" =~ ^[0-9]+$ ]]
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" >/dev/null ||
+                echo "::warning::Could not prune preview cache $id"
+            done
+          done
 
   notify:
     name: Notify build thread

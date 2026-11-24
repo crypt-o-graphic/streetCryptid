@@ -49,9 +49,20 @@ fi
 # would ship an old roster rule whose UniFFI checksums still match, with no error anywhere. The
 # server is deliberately absent: the phone does not link it.
 compute_digest() {
+  local compiler sdk ndk
+  compiler="$(rustc -vV)" || return
+  if [[ "$platform" == android ]]; then
+    ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
+    if [[ -n "$ndk" ]]; then
+      sdk="$(grep '^Pkg.Revision *=' "$ndk/source.properties")" || return
+    else
+      sdk='ndk-unspecified'
+    fi
+  else
+    sdk="$(xcodebuild -version)" || return
+  fi
   {
-    rustc -V 2> /dev/null || echo 'rustc-unknown'
-    printf 'profile-v2\n'
+    printf 'profile-v3\n%s\n%s\n' "$compiler" "$sdk"
     (
       cd "$crate_dir"
       find src third_party Cargo.toml -type f |
@@ -61,7 +72,7 @@ compute_digest() {
     )
     (
       cd "$repo_root"
-      find Cargo.toml Cargo.lock third_party repeater/protocol -type f |
+      find Cargo.toml Cargo.lock rust-toolchain.toml third_party repeater/protocol -type f |
         LC_ALL=C sort |
         tr '\n' '\0' |
         xargs -0 "${SHA_CMD[@]}"
@@ -73,23 +84,53 @@ compute_digest() {
   } | "${SHA_CMD[@]}" | cut -c1-40
 }
 
+toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$repo_root/rust-toolchain.toml")"
+[[ -n "$toolchain" ]]
+export RUSTUP_TOOLCHAIN="$toolchain"
+
+if [[ "${1:-}" == '--cache-key' ]]; then
+  compute_digest
+  exit
+fi
+
 # Only phase marks here, no sampler: scripts/eas-local-build-ci.sh runs one around the WHOLE
 # `eas build --local` invocation, and a second one would double-count this hook's own processes.
 
-toolchain_start="$(date +%s)"
-if ! command -v rustup > /dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-    https://sh.rustup.rs | sh -s -- -y --profile minimal
+if [[ "${1:-}" != '--cache-ready' ]]; then
+  toolchain_start="$(date +%s)"
+  if ! command -v rustup > /dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+      https://sh.rustup.rs | sh -s -- -y --profile minimal
+  fi
+  export PATH="$HOME/.cargo/bin:$PATH"
+  rustup toolchain install "$toolchain" --profile minimal --no-self-update
+  sc_profile_mark 'rust-toolchain' "$(($(date +%s) - toolchain_start))"
 fi
-
-# A rustup installed by this hook is not on the inherited PATH yet.
-export PATH="$HOME/.cargo/bin:$PATH"
-rustup toolchain install stable --profile minimal --no-self-update
-export RUSTUP_TOOLCHAIN=stable
-sc_profile_mark 'rust-toolchain' "$(($(date +%s) - toolchain_start))"
 
 digest="$(compute_digest)"
 stage="$native_cache_root/$platform/$digest"
+
+cache_ready() {
+  local abi
+  if [[ "$platform" == android ]]; then
+    [[ -s "$stage/bindings/iroh_location/iroh_location.kt" ]] || return 1
+    for abi in $SC_ANDROID_ABIS; do
+      [[ -s "$stage/$abi/libiroh_location.so" ]] || return 1
+      [[ -s "$stage/symbols/$abi/libiroh_location.so" ]] || return 1
+    done
+  else
+    [[ -s "$stage/IrohLocationFFI.xcframework/Info.plist" &&
+       -s "$stage/IrohLocationFFI.xcframework/ios-arm64/libiroh_location.a" &&
+       -s "$stage/headers/iroh_locationFFI.h" &&
+       -s "$stage/headers/module.modulemap" &&
+       -s "$stage/bindings/iroh_location.swift" ]]
+  fi
+}
+
+if [[ "${1:-}" == '--cache-ready' ]]; then
+  cache_ready
+  exit
+fi
 
 if [[ "$platform" == "android" ]]; then
   jni_libs="$repo_root/modules/iroh-location/android/src/main/jniLibs"
@@ -111,13 +152,7 @@ if [[ "$platform" == "android" ]]; then
   # A hit needs every ABI this build was asked for AND the bindings that were generated with them.
   # The warm job on main stages all three, so a pull request asking for arm64-v8a alone hits the
   # same entry; the reverse (a release after a PR staged one ABI) correctly misses.
-  cache_hit=1
-  [[ -d "$stage/bindings" ]] || cache_hit=0
-  for abi in $SC_ANDROID_ABIS; do
-    [[ -f "$stage/$abi/libiroh_location.so" ]] || cache_hit=0
-  done
-
-  if ((cache_hit)); then
+  if cache_ready; then
     sc_profile_note 'native_artifacts' "reused-$digest"
     mkdir -p "$jni_libs" "$(dirname "$bindings_dir")"
     for abi in $SC_ANDROID_ABIS; do
@@ -138,27 +173,61 @@ if [[ "$platform" == "android" ]]; then
     targets+=("$(abi_target "$abi")")
     ndk_args+=(-t "$abi")
   done
-  sc_profile_run 'rust-target-add' rustup target add --toolchain stable "${targets[@]}"
+  sc_profile_run 'rust-target-add' rustup target add --toolchain "$toolchain" "${targets[@]}"
 
   if ! command -v cargo-ndk > /dev/null 2>&1; then
     sc_profile_run 'cargo-ndk-install' \
-      cargo +stable install cargo-ndk --version 4.1.2 --locked
+      cargo install cargo-ndk --version 4.1.2 --locked
   fi
 
+  # Built with its symbol table and a GNU build id, then stripped for the APK below, with the
+  # symbol copy kept in the stage. A heapprofd profile records only a library's build id and
+  # offsets into it, and on 2026-11-21 a Pixel's 1.7 GB Rust heap could not be named because the
+  # shipped library had neither: no build id to match a copy by, and no copy with symbols. The
+  # APK's library is as small as before. `scripts/profile/android-heap.sh` symbolizes against
+  # the copy, which the workflows publish as the `android-native-symbols` artifact.
   (
     cd "$crate_dir"
+    export CARGO_PROFILE_RELEASE_STRIP=debuginfo
+    # The soname is what an unwinder names a library mapped straight out of the APK by
+    # (`base.apk!libiroh_location.so`); without one a profile shows a bare `base.apk`.
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,--build-id=sha1 -C link-arg=-Wl,-soname,libiroh_location.so"
     sc_profile_run 'cargo-build' \
-      cargo +stable ndk "${ndk_args[@]}" -o "$jni_libs" build --locked --release --timings
+      cargo ndk "${ndk_args[@]}" -o "$jni_libs" build --locked --release --timings
   )
   sc_profile_collect_cargo_timings
+
+  symbols_dir="$target_dir/android-symbols"
+  rm -rf "$symbols_dir"
+  ndk_home="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
+  llvm_strip=''
+  for candidate in "$ndk_home"/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+    "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}"/ndk/*/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
+    if [[ -x "$candidate" ]]; then
+      llvm_strip="$candidate"
+      break
+    fi
+  done
+  for abi in $SC_ANDROID_ABIS; do
+    mkdir -p "$symbols_dir/$abi"
+    cp "$jni_libs/$abi/libiroh_location.so" "$symbols_dir/$abi/"
+    if [[ -n "$llvm_strip" ]]; then
+      "$llvm_strip" --strip-all "$jni_libs/$abi/libiroh_location.so"
+    else
+      # Gradle strips native libraries itself when it finds the NDK, so the worst this ships is a
+      # symbol table, never a broken library.
+      echo "eas-build-pre-install: no llvm-strip found; $abi keeps its symbol table" >&2
+    fi
+  done
 
   # Stage what was just built so the next run -- and, from the main-branch warm job, every open
   # pull request -- can skip all of the above.
   rm -rf "$stage"
   mkdir -p "$stage"
   for abi in $SC_ANDROID_ABIS; do
-    mkdir -p "$stage/$abi"
+    mkdir -p "$stage/$abi" "$stage/symbols/$abi"
     cp "$jni_libs/$abi/libiroh_location.so" "$stage/$abi/"
+    cp "$symbols_dir/$abi/libiroh_location.so" "$stage/symbols/$abi/"
   done
   cp -R "$bindings_dir" "$stage/bindings"
   exit 0
@@ -173,7 +242,7 @@ library_path="$target_dir/aarch64-apple-ios/release/libiroh_location.a"
 # Keep C/assembly dependencies built by Rust aligned with Expo SDK 57's iOS minimum.
 export IPHONEOS_DEPLOYMENT_TARGET=16.4
 
-if [[ -d "$stage/IrohLocationFFI.xcframework" && -d "$stage/headers" && -d "$stage/bindings" ]]; then
+if cache_ready; then
   sc_profile_note 'native_artifacts' "reused-$digest"
   rm -rf "$framework_path" "$headers_dir" "$bindings_dir"
   cp -R "$stage/IrohLocationFFI.xcframework" "$framework_path"
@@ -188,9 +257,9 @@ sc_profile_note 'native_artifacts' "built-$digest"
 # UniFFI validates every API checksum on first use and aborts when generated bindings are stale.
 sc_profile_run 'uniffi-bindgen' "$repo_root/scripts/generate-uniffi-bindings.sh" ios
 
-sc_profile_run 'rust-target-add' rustup target add --toolchain stable aarch64-apple-ios
+sc_profile_run 'rust-target-add' rustup target add --toolchain "$toolchain" aarch64-apple-ios
 sc_profile_run 'cargo-build' \
-  cargo +stable build \
+  cargo build \
   --locked \
   --manifest-path "$crate_dir/Cargo.toml" \
   --release \

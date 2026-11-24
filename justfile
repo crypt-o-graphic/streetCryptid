@@ -12,6 +12,7 @@ default:
 mod server 'repeater/server'
 mod windows 'repeater/windows'
 mod linux 'repeater/linux'
+mod macos 'repeater/macos'
 mod website 'website'
 
 # --- Setup -------------------------------------------------------------------
@@ -363,6 +364,16 @@ test-ble-transport:
 # Benchmark Rust protobuf parsing + SCG1 encoding with committed fixtures.
 profile-mvt:
     cd modules/iroh-location/rust && cargo run --release --example profile_mvt -- 200 20
+
+# A native heap profile of the app on an adb-connected Android phone (heapprofd), symbolized
+# against a CI run's `android-native-symbols` artifact. See infra/otel/README.md.
+# Examples:
+#   just heap-profile start 6 10        # six hours, a dump every ten minutes
+#   just heap-profile status
+#   just heap-profile pull
+#   just heap-profile report --commit <app_commit>
+heap-profile *args:
+    bash scripts/profile/android-heap.sh {{args}}
 
 # Compile the Rust crate against the pinned iroh/gossip/docs deps (no bindings generated).
 build-rust:

@@ -23,6 +23,7 @@ import {
  */
 
 const POST_NOTIFICATIONS = 'android.permission.POST_NOTIFICATIONS' as Permission;
+const ACTIVITY_RECOGNITION = 'android.permission.ACTIVITY_RECOGNITION' as Permission;
 /** How long the battery step waits for the system dialog to hand the screen back. */
 const BATTERY_DIALOG_WAIT_MS = 60_000;
 
@@ -43,11 +44,12 @@ export async function readPermissionFacts(): Promise<
     battery:
       typeof mod?.batteryOptimizationExempt === 'function' &&
       typeof mod.requestBatteryOptimizationExemption === 'function',
+    motion: platform === 'android' && safe(() => mod?.motionActivityAvailable?.()) === true,
   };
   // Web has nothing to read: its only step is the disclosure, which it always shows.
   if (platform === 'web') return { platform, androidApi, native, granted: {} };
 
-  const [location, background, bluetooth, localNetwork, notifications] = await Promise.all([
+  const [location, background, bluetooth, localNetwork, notifications, motion] = await Promise.all([
     readForegroundGranted(),
     readBackgroundAccessGranted(),
     platform === 'ios'
@@ -57,6 +59,9 @@ export async function readPermissionFacts(): Promise<
       ? hasLocalNetworkPermission()
       : Promise.resolve(undefined),
     platform === 'android' ? checkAndroid(POST_NOTIFICATIONS) : Promise.resolve(undefined),
+    platform === 'android' && androidApi >= 29
+      ? checkAndroid(ACTIVITY_RECOGNITION)
+      : Promise.resolve(undefined),
   ]);
   return {
     platform,
@@ -68,6 +73,7 @@ export async function readPermissionFacts(): Promise<
       bluetooth,
       'local-network': localNetwork,
       notifications,
+      motion,
       battery: safe(() => mod?.batteryOptimizationExempt?.()),
     },
   };
@@ -113,6 +119,14 @@ export async function requestPermissionStep(step: PermissionStepId): Promise<boo
           (await PermissionsAndroid.request(POST_NOTIFICATIONS)) ===
           PermissionsAndroid.RESULTS.GRANTED
         );
+      case 'motion': {
+        const granted =
+          (await PermissionsAndroid.request(ACTIVITY_RECOGNITION)) ===
+          PermissionsAndroid.RESULTS.GRANTED;
+        // The running service subscribes when it starts; tell it now rather than at the next start.
+        safe(() => tryGetIrohLocation()?.refreshMotionActivity?.());
+        return granted;
+      }
       case 'battery':
         return await requestBatteryExemption();
     }

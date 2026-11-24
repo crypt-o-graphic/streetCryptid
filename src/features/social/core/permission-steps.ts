@@ -17,6 +17,7 @@ export const PERMISSION_STEPS = [
   'bluetooth',
   'local-network',
   'notifications',
+  'motion',
   'battery',
 ] as const;
 
@@ -36,6 +37,11 @@ export interface PermissionContext {
     readonly bluetooth: boolean;
     readonly localNetwork: boolean;
     readonly battery: boolean;
+    /**
+     * Android with Google Play services: activity recognition is a Play services API, so without
+     * them the permission would buy nothing and the step is not shown.
+     */
+    readonly motion: boolean;
   };
   /** The location disclosure's stored choice; `null` until it has been answered. */
   readonly disclosure: 'accepted' | 'declined' | null;
@@ -56,6 +62,8 @@ export interface PermissionContext {
 
 /** Android 12 split Bluetooth into its own runtime permissions; before it, BLE rode on location. */
 const ANDROID_BLUETOOTH_RUNTIME_API = 31;
+/** ACTIVITY_RECOGNITION is a runtime permission from Android 10; before it, install-time. */
+const ANDROID_ACTIVITY_RECOGNITION_API = 29;
 /** POST_NOTIFICATIONS exists from Android 13. */
 const ANDROID_NOTIFICATIONS_API = 33;
 /**
@@ -85,6 +93,10 @@ export function permissionStepExists(step: PermissionStepId, ctx: PermissionCont
       return platform === 'android' && androidApi >= ANDROID_LOCAL_NETWORK_API;
     case 'notifications':
       return platform === 'android' && androidApi >= ANDROID_NOTIFICATIONS_API;
+    case 'motion':
+      return (
+        platform === 'android' && androidApi >= ANDROID_ACTIVITY_RECOGNITION_API && native.motion
+      );
     case 'battery':
       return platform === 'android' && native.battery;
   }
@@ -94,6 +106,7 @@ export function permissionStepExists(step: PermissionStepId, ctx: PermissionCont
 const NEEDS_LOCATION: ReadonlySet<PermissionStepId> = new Set([
   'background-location',
   'notifications',
+  'motion',
   'battery',
 ]);
 
@@ -120,7 +133,8 @@ export function pendingPermissionSteps(ctx: PermissionContext): PermissionStepId
     if (NEEDS_LOCATION.has(step) && ctx.disclosure !== 'accepted') return false;
     if (step === 'background-location' && ctx.granted.location !== true) return false;
     if (legacy) {
-      if (step === 'battery') return true;
+      // Battery and motion arrived after the old init path, which never asked either.
+      if (step === 'battery' || step === 'motion') return true;
       return step === 'local-network' && ctx.granted[step] === false;
     }
     return true;

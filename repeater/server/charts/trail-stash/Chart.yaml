@@ -15,8 +15,8 @@ keywords:
   - push
   - e2e-encryption
   - streetcryptid
-home: https://github.com/unrealJune/trail-stash
+home: https://github.com/crypt-o-graphic/streetCryptid/tree/main/repeater/server
 sources:
-  - https://github.com/unrealJune/trail-stash
+  - https://github.com/crypt-o-graphic/streetCryptid/tree/main/repeater/server
 maintainers:
   - name: June Philip

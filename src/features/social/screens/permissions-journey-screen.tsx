@@ -53,6 +53,7 @@ const STEP_ICON: Record<PermissionStepId, SymbolViewProps['name']> = {
   bluetooth: { ios: 'antenna.radiowaves.left.and.right', android: 'bluetooth', web: 'bluetooth' },
   'local-network': { ios: 'wifi', android: 'wifi', web: 'wifi' },
   notifications: { ios: 'bell', android: 'notifications', web: 'notifications' },
+  motion: { ios: 'figure.walk', android: 'directions_walk', web: 'directions_walk' },
   battery: { ios: 'battery.100', android: 'battery_full', web: 'battery_full' },
 };
 

@@ -95,3 +95,7 @@ store/island-preview/
 # summaries under scripts/e2e/reports/. Both are per-run output, never source.
 .e2e-reports/
 scripts/e2e/reports/
+__pycache__/
+
+# Heap profiles pulled off phones (scripts/profile/android-heap.sh).
+.profiles/

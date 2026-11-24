@@ -530,7 +530,13 @@ impl BleTransport {
         .await?;
         info!(key_uuid = %key_uuid, "advertising started");
 
-        let scan_filter = blew::central::ScanFilter::default();
+        // streetCryptid: the scan that runs for the transport's whole life, which is the app's whole
+        // life, background included, uses the low duty cycle. Bump's own scan windows ask for low
+        // latency while they run. See NOTICE (2026-11-22).
+        let scan_filter = blew::central::ScanFilter {
+            mode: blew::central::ScanMode::LowPower,
+            ..blew::central::ScanFilter::default()
+        };
         rollback.scanning = true;
         let scanning = construct_step("start_scan", async {
             match central.start_scan(scan_filter.clone()).await {

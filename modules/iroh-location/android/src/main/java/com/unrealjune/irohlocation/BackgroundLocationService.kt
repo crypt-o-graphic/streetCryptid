@@ -7,24 +7,25 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.Sensor
+import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
-import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
+import com.google.android.gms.location.DetectedActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import uniffi.iroh_location.BatteryState
+import uniffi.iroh_location.DataMode
 import uniffi.iroh_location.LocationFix
 import uniffi.iroh_location.LocationRuntimeKind
 
@@ -37,12 +38,12 @@ import uniffi.iroh_location.LocationRuntimeKind
  * foreground service, the GPS and the outbox all look perfectly healthy. Here the same callback
  * that receives the location also seals and sends it.
  *
- * ## Why `LocationManager` rather than the fused provider
+ * ## Play services where there are any, the platform everywhere else
  *
- * `FusedLocationProviderClient` would mean a Play Services dependency this module does not have,
- * and a hard one — a device without Play Services would lose background sharing entirely. At an
- * ambient five-minute cadence the platform provider is more than good enough, and the fix quality
- * gate (`gate.rs`) already discards what it should.
+ * Positions come from the fused provider, stops and departures from activity recognition and a
+ * geofence, all Google Play services, when the phone has them ([LocationSource], [MotionSignals]).
+ * A phone without them must still share, so each has a platform fallback: `LocationManager`, the
+ * significant-motion sensor and a dwell rule. Play services is never a hard dependency.
  *
  * ## Relationship to the JS pipeline
  *
@@ -52,7 +53,13 @@ import uniffi.iroh_location.LocationRuntimeKind
  */
 class BackgroundLocationService : Service() {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-  private var locationManager: LocationManager? = null
+  private var source: LocationSource? = null
+  private var activity: ActivityTransitions? = null
+  private var fence: StopFence? = null
+  private var tickAlarm: TickAlarm? = null
+
+  /** The distance the moving request was made with, so a cadence change re-requests only on change. */
+  private var movingDistanceM: Float = -1f
 
   /**
    * The publish cadence.
@@ -68,26 +75,64 @@ class BackgroundLocationService : Service() {
   private val slotIntervalMs: ULong
     get() = cadenceSlotIntervalMs
 
-  private val listener =
-    LocationListener { location ->
-      // Stamped before the launch, not inside it: the ticker asks "did the provider deliver in this
-      // slot", and a coroutine that has been dispatched but not yet run still answers yes.
-      lastDeliveryAtMs = System.currentTimeMillis()
-      reporter.noteDelivery(location)
-      // Straight into the native path. No JS, no headless bridge, no spool.
-      scope.launch { publish(location) }
+  private fun onLocation(location: Location) {
+    reporter.noteDelivery(location)
+    if (stopped) {
+      // A passive or network position while stopped. Near the stop it confirms the stop, which the
+      // parked heartbeat already says; only a position clearly elsewhere is news.
+      if (nearStop(location)) return
+      enterMoving("departure")
+    }
+    lastLocation = location
+    // Stamped before the launch, not inside it: the tick asks "did the provider deliver in this
+    // slot", and a coroutine that has been dispatched but not yet run still answers yes.
+    lastDeliveryAtMs = System.currentTimeMillis()
+    // Straight into the native path. No JS, no headless bridge, no spool.
+    launchAwake("publish") { publish(location) }
+  }
+
+  private fun nearStop(location: Location): Boolean {
+    val anchor = stopAnchor ?: return false
+    val slack = if (location.hasAccuracy()) location.accuracy else 0f
+    return location.distanceTo(anchor) < DEPART_RADIUS_M + slack
+  }
+
+  /**
+   * `moving` or `stopped`, the Android counterpart of the iOS runtime's states (June, 2026-11-22:
+   * make Android like iOS, reporting while moving and only doing maintenance otherwise).
+   *
+   * It was a single state with GPS and network requested every minute for as long as sharing ran,
+   * because a foreground service stays alive regardless. Staying alive was never the problem; the
+   * GPS was. Stopped means no GPS: passive positions only, a stop fence, and a wake on the data
+   * mode's maintenance interval ([maintenanceIntervalMs]), whose parked heartbeats the core floors
+   * to the same cadence (`publish.rs`).
+   *
+   * What decides it, best first:
+   * - activity recognition (`STILL` entered → stopped; walking, running, cycling, driving →
+   *   moving), with Play services and the physical-activity permission;
+   * - the stop fence's exit, with Play services;
+   * - otherwise the significant-motion sensor for leaving, and no delivery past the 50 m filter for
+   *   [STOP_AFTER_MS] for stopping (also the backstop when activity recognition never says `STILL`);
+   * - and always a passive or maintenance position [DEPART_RADIUS_M] from the stop.
+   */
+  @Volatile private var stopped = false
+  @Volatile private var stopAnchor: Location? = null
+  @Volatile private var lastLocation: Location? = null
+  private var sensorManager: SensorManager? = null
+  private var significantMotion: Sensor? = null
+
+  private val motionTrigger =
+    object : TriggerEventListener() {
+      override fun onTrigger(event: TriggerEvent?) {
+        enterMoving("significant_motion")
+      }
     }
 
   /**
-   * When the provider last handed us a location, or 0 before the first one.
-   *
-   * The only state the stationary ticker needs. Deliberately not a "moving/stopped" state machine
-   * like the iOS runtime's: that exists there because Core Location has to be re-tiered to a
-   * cheaper stream to keep the process ALIVE, and a foreground service has no such problem.
+   * When the provider last handed us a location, or 0 before the first one. The ticker reads it to
+   * fill slots nothing delivered into, and to decide the phone has stopped (see [stopped]).
    */
   @Volatile private var lastDeliveryAtMs: Long = 0L
-
-  private var stationaryTicker: Job? = null
 
   /** `location.runtime`, so this service is visible when no JS is alive to say it is running. */
   private val reporter =
@@ -123,8 +168,18 @@ class BackgroundLocationService : Service() {
     } else {
       ServiceRecovery.noteStarted(applicationContext)
     }
-    startLocationUpdates()
-    startStationaryTicker()
+    instance = this
+    val play = PlayServices.available(this)
+    source =
+      if (play) FusedSource(this, ::onLocation, ::onFusedFailure)
+      else PlatformSource(this, ::onLocation, ::onSourceFailure)
+    if (play) fence = StopFence(this)
+    sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+    significantMotion = sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+    refreshMotion()
+    tickAlarm = TickAlarm(this)
+    startMoving()
+    scheduleTick()
     // Off the main thread: configuring telemetry loads the native library. A process restarted
     // with no JS (the app was killed and `START_REDELIVER_INTENT` brought this back) is exactly
     // the one with nobody else to configure it, so the `started` span goes out after it.
@@ -134,17 +189,27 @@ class BackgroundLocationService : Service() {
       // may never have exported anything. `detail` carries the count, the gap and the last cause.
       // Only a start that actually reached the foreground ends the outage being reported.
       val blocked = if (promoted) ServiceRecovery.takeBlocked(applicationContext) else null
+      // What brought the service back, and how long after the phone booted: a `trigger=boot` with
+      // a small `boot_age_s` is the boot receiver working; a first start long after a boot, from
+      // the app, is one that did not.
+      val trigger = ServiceRecovery.takeStartTrigger(applicationContext) ?: "app-or-redeliver"
+      val bootAgeS = SystemClock.elapsedRealtime() / 1000
+      val origin =
+        "trigger=$trigger boot_age_s=$bootAgeS source=${source?.name} " +
+          "motion=${motionName()} fence=${fence != null}"
+      Log.i(TAG, "service started: $origin promoted=$promoted")
       if (blocked != null) {
         val gapS = (System.currentTimeMillis() - blocked.firstAtMs) / 1000
         reporter.event(
           LocationRuntimeKind.STARTED,
           reason = "recovered",
-          detail = "fgs_start_blocked count=${blocked.count} gap_s=$gapS last=${blocked.reason}",
+          detail = "$origin fgs_start_blocked count=${blocked.count} gap_s=$gapS last=${blocked.reason}",
         )
       } else {
         reporter.event(
           LocationRuntimeKind.STARTED,
           reason = if (promoted) "service" else "service-not-foreground",
+          detail = origin,
         )
       }
       ProcessMemorySampler.sample("started")
@@ -157,7 +222,12 @@ class BackgroundLocationService : Service() {
    * should bring the service back with its intent rather than silently drop sharing until the user
    * next opens the app.
    */
-  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_REDELIVER_INTENT
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    // [setCadence] restarts the service to apply a new distance filter; `onCreate` does not run
+    // again for a service already running, so the moving request is re-made here.
+    if (running && !stopped && movingDistanceM != cadenceDistanceM) startMoving()
+    return START_REDELIVER_INTENT
+  }
 
   override fun onDestroy() {
     // False when `onCreate` was refused the foreground and stopped early: nothing was started, and
@@ -169,11 +239,14 @@ class BackgroundLocationService : Service() {
       super.onDestroy()
       return
     }
+    instance = null
     reporter.stopPulse()
-    stationaryTicker?.cancel()
-    stationaryTicker = null
-    locationManager?.removeUpdates(listener)
-    locationManager = null
+    tickAlarm?.cancel()
+    activity?.stop()
+    fence?.disarm()
+    significantMotion?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
+    source?.stop()
+    source = null
     // Release the directory claims so a mounted app can take them back immediately, rather than
     // failing its first `createNode` until this process happens to be reaped.
     //
@@ -184,88 +257,260 @@ class BackgroundLocationService : Service() {
     super.onDestroy()
   }
 
-  private fun startLocationUpdates() {
-    val manager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-    if (manager == null) {
-      Log.w(TAG, "no LocationManager; background sharing cannot start")
-      stopSelf()
-      return
+  private fun startMoving() {
+    val source = source ?: return
+    source.stop()
+    movingDistanceM = cadenceDistanceM
+    source.startMoving(MIN_UPDATE_INTERVAL_MS, cadenceDistanceM)
+  }
+
+  /** Whether anything other than a passive position can notice a departure. */
+  private fun hasDepartureSignal(): Boolean =
+    activity != null || fence != null || significantMotion != null
+
+  /**
+   * Activity recognition when Play services and the permission allow it, the significant-motion
+   * sensor otherwise. Called at start and again from [refreshMotionActivity] once the permission
+   * step has been answered, so a grant takes effect without restarting sharing.
+   */
+  @Synchronized
+  internal fun refreshMotion() {
+    if (activity != null) return
+    if (!PlayServices.available(this) || !MotionSignals.activityPermitted(this)) return
+    val transitions = ActivityTransitions(this)
+    activity = transitions
+    transitions.start { error ->
+      Log.w(TAG, "activity transitions refused", error)
+      synchronized(this) { if (activity === transitions) activity = null }
+      reporter.event(
+        LocationRuntimeKind.AUTHORIZATION,
+        reason = "activity_refused",
+        detail = error.message ?: error.javaClass.simpleName,
+      )
     }
-    locationManager = manager
-    // Both providers, deliberately. GPS alone goes quiet indoors, which is where a phone spends
-    // most of its day, and the network provider is what keeps a trail alive in a building.
-    for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+    // The sensor is the fallback; with activity recognition it would only duplicate it.
+    if (stopped) significantMotion?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
+  }
+
+  private fun motionName(): String =
+    when {
+      activity != null -> "activity"
+      significantMotion != null -> "significant_motion"
+      else -> "none"
+    }
+
+  @Synchronized
+  private fun enterStopped(reason: String) {
+    if (stopped || !running) return
+    stopped = true
+    stopAnchor = lastLocation
+    val source = source
+    source?.stop()
+    source?.startStopped(STOPPED_UPDATE_INTERVAL_MS, DEPART_RADIUS_M, withNetwork = !hasDepartureSignal())
+    val sensorArmed =
+      if (activity == null) {
+        significantMotion?.let { sensorManager?.requestTriggerSensor(motionTrigger, it) } ?: false
+      } else {
+        false
+      }
+    val anchor = stopAnchor
+    if (anchor != null) {
+      armFence(anchor)
+    } else {
+      // No position yet this run: take one cheaply and centre the stop on it.
+      source?.currentPosition { position ->
+        if (position != null && stopped && stopAnchor == null) {
+          stopAnchor = position
+          armFence(position)
+        }
+      }
+    }
+    scheduleTick()
+    reporter.event(
+      LocationRuntimeKind.TRANSITION,
+      reason = reason,
+      detail =
+        "moving->stopped gps=off motion=${motionName()} sensor=$sensorArmed " +
+          "fence=${fence != null && anchor != null}",
+    )
+  }
+
+  private fun armFence(anchor: Location) {
+    fence?.arm(anchor, DEPART_RADIUS_M) { error ->
+      Log.w(TAG, "stop fence refused", error)
+      reporter.event(
+        LocationRuntimeKind.FENCE_FAILED,
+        reason = "stop_fence",
+        detail = error.message ?: error.javaClass.simpleName,
+      )
+    }
+  }
+
+  @Synchronized
+  private fun enterMoving(reason: String) {
+    if (!stopped || !running) return
+    stopped = false
+    significantMotion?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
+    fence?.disarm()
+    // A full window to find the first fix before the dwell rule may decide the phone stopped again.
+    lastDeliveryAtMs = System.currentTimeMillis()
+    startMoving()
+    // The next tick may be a whole maintenance interval away; back to slot cadence now.
+    scheduleTick()
+    reporter.event(LocationRuntimeKind.TRANSITION, reason = reason, detail = "stopped->moving")
+  }
+
+  /** From [MotionReceiver]: an activity transition was entered. */
+  internal fun onActivity(type: Int) {
+    val name = ActivityTransitions.name(type)
+    when {
+      type == DetectedActivity.STILL -> enterStopped("activity_$name")
+      type in ActivityTransitions.MOVING -> enterMoving("activity_$name")
+    }
+  }
+
+  /** From [MotionReceiver]: the stop fence reported an exit. */
+  internal fun onFenceExit() {
+    reporter.event(LocationRuntimeKind.FENCE_EXIT, reason = "stop_fence")
+    enterMoving("fence_exit")
+  }
+
+  /** The fused provider refused: report it, and fall back to the platform provider for this run. */
+  private fun onFusedFailure(what: String, error: Exception) {
+    onSourceFailure(what, error)
+    if (error is SecurityException) return
+    synchronized(this) {
+      if (source !is FusedSource || !running) return
+      source?.stop()
+      source = PlatformSource(this, ::onLocation, ::onSourceFailure)
+      if (stopped) {
+        source?.startStopped(
+          STOPPED_UPDATE_INTERVAL_MS,
+          DEPART_RADIUS_M,
+          withNetwork = !hasDepartureSignal(),
+        )
+      } else {
+        startMoving()
+      }
+    }
+  }
+
+  private fun onSourceFailure(what: String, error: Exception) {
+    Log.w(TAG, "location request refused: $what", error)
+    reporter.event(
+      if (error is SecurityException) LocationRuntimeKind.AUTHORIZATION
+      else LocationRuntimeKind.LOCATION_ERROR,
+      reason = if (error is SecurityException) "denied" else "request_failed",
+      detail = "$what: ${error.message ?: error.javaClass.simpleName}",
+    )
+  }
+
+  private fun slotMs(): Long = slotIntervalMs.toLong().coerceAtLeast(MIN_TICK_INTERVAL_MS)
+
+  private fun scheduleTick() {
+    tickAlarm?.schedule(if (stopped) maintenanceIntervalMs(slotMs()) else slotMs())
+  }
+
+  /**
+   * Run [block] with the CPU held awake. An alarm, a sensor trigger or a location callback wakes
+   * the CPU only for as long as its own callback runs; a push and a pull take tens of seconds
+   * after that, and a CPU that suspends mid-push resumes it whenever something next wakes the phone.
+   */
+  private fun launchAwake(tag: String, block: suspend () -> Unit) {
+    val power = getSystemService(Context.POWER_SERVICE) as? PowerManager
+    val lock =
+      power?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "streetcryptid:$tag")?.apply {
+        setReferenceCounted(false)
+        acquire(WORK_WAKE_LOCK_MS)
+      }
+    scope.launch {
       try {
-        manager.requestLocationUpdates(
-          provider,
-          MIN_UPDATE_INTERVAL_MS,
-          cadenceDistanceM,
-          listener,
-          Looper.getMainLooper(),
-        )
-      } catch (e: SecurityException) {
-        // Permission revoked while running. Not fatal — the other provider may still be permitted,
-        // and the app surfaces the permission state itself.
-        Log.w(TAG, "location permission refused for $provider", e)
-        reporter.event(
-          LocationRuntimeKind.AUTHORIZATION,
-          reason = "denied",
-          detail = "$provider: ${e.message ?: "SecurityException"}",
-        )
-      } catch (e: IllegalArgumentException) {
-        Log.i(TAG, "provider $provider is unavailable on this device")
+        block()
+      } finally {
+        if (lock?.isHeld == true) lock.release()
       }
     }
   }
 
   /**
-   * Publish a parked heartbeat for every slot the provider does not deliver into.
+   * The service's clock, fired by [TickAlarm]: every slot while moving, every maintenance interval
+   * while stopped.
    *
    * ## Why this has to exist
    *
-   * `LocationManager.requestLocationUpdates` delivers only when BOTH `MIN_UPDATE_INTERVAL_MS` has
-   * elapsed AND the device has moved `cadenceDistanceM`. With a 50 m filter a phone on a desk
-   * produces **no callbacks at all, indefinitely** — so the send path simply never ran, and the
-   * only thing publishing a stationary Pixel's position was the deferrable `expo-background-task`
-   * refresh. On 2026-09-18 App Standby decayed that from a run every ~16 minutes to one in fourteen
-   * hours, and the phone went silent for 7.8 of them with `task.location_running = true`,
-   * `perm.background = granted` and every other flag green. That is the same shape the iOS runtime
-   * was rewritten to fix (see `BackgroundLocationRuntime.swift`, 2026-08-30); Android never got the
-   * other half.
+   * `requestLocationUpdates` delivers only when BOTH the interval has elapsed AND the device has
+   * moved `cadenceDistanceM`. With a 50 m filter a phone on a desk produces **no callbacks at all,
+   * indefinitely** — so the send path simply never ran, and the only thing publishing a stationary
+   * Pixel's position was the deferrable `expo-background-task` refresh. On 2026-09-18 App Standby
+   * decayed that from a run every ~16 minutes to one in fourteen hours, and the phone went silent
+   * for 7.8 of them with `task.location_running = true`, `perm.background = granted` and every
+   * other flag green.
    *
-   * ## Why a plain timer is the right answer HERE
+   * ## Why an alarm and not a timer
    *
-   * iOS cannot do this — it has no clock that survives suspension, which is why that side has to be
-   * parasitic on Core Location and re-tier to a coarse stream to stay alive at all. A foreground
-   * service is exempt from Doze and App Standby, so on Android the clock is simply available. Using
-   * it means the parked heartbeat stops depending on WorkManager, which is the component that
-   * actually failed.
+   * It was a coroutine `delay` until 2026-11-22. That clock does not advance while the CPU is
+   * suspended, and nothing holds the CPU awake for a parked phone: while GPS was requested every
+   * minute its wakeups carried the timer along, but with GPS off for a stop a 30-minute delay could
+   * last for hours. `ELAPSED_REALTIME_WAKEUP` counts sleep and wakes the CPU to fire.
    *
-   * Lowering `cadenceDistanceM` to zero would also produce deliveries, and is the wrong fix twice
-   * over: it spins GPS for positions the gate will discard, and it routes them through `ingest`,
-   * where failing the movement test stamps `FIX_STATE_NO_FIX` — "moving, no signal fix" on a
-   * friend's screen, for a phone that is parked. The heartbeat path stamps `FIX_STATE_PARKED`,
-   * which is true.
+   * Lowering `cadenceDistanceM` to zero would also produce deliveries, and is the wrong fix: it
+   * spins GPS for positions the gate will discard, and routes them through `ingest`, where failing
+   * the movement test stamps `FIX_STATE_NO_FIX` for a phone that is parked. The heartbeat path
+   * stamps `FIX_STATE_PARKED`, which is true.
    *
-   * The tick is skipped whenever the provider has delivered inside the current slot, so a moving
-   * phone costs nothing and never publishes twice for one slot. `heartbeatFix` is idempotent
-   * against the slot grid anyway (`gate::due_slots` returns 0 when none are due), so a race between
-   * a late delivery and a tick is absorbed rather than duplicated.
+   * A moving tick is skipped whenever the provider delivered inside the current slot, so a moving
+   * phone never publishes twice for one slot; `heartbeatFix` is idempotent against the slot grid
+   * anyway.
    */
-  private fun startStationaryTicker() {
-    stationaryTicker?.cancel()
-    stationaryTicker =
-      scope.launch {
-        while (isActive && running) {
-          val slotMs = slotIntervalMs.toLong().coerceAtLeast(MIN_TICK_INTERVAL_MS)
-          delay(slotMs)
-          if (!running) break
-          val since = System.currentTimeMillis() - lastDeliveryAtMs
-          // A delivery inside this slot means `publish` has already run the gate for it.
-          if (lastDeliveryAtMs != 0L && since < slotMs) continue
-          heartbeat()
-        }
+  internal fun onTick() {
+    if (!running) return
+    // The next one first, so nothing below can end the chain.
+    scheduleTick()
+    launchAwake("tick") {
+      if (stopped) {
+        maintenance()
+        return@launchAwake
       }
+      val slotMs = slotMs()
+      val since = System.currentTimeMillis() - lastDeliveryAtMs
+      // A delivery inside this slot means `publish` has already run the gate for it.
+      if (lastDeliveryAtMs != 0L && since < slotMs) return@launchAwake
+      // Nothing delivered for long enough with a 50 m filter: the phone is not moving.
+      if (lastDeliveryAtMs == 0L || since >= STOP_AFTER_MS) enterStopped("dwell")
+      heartbeat()
+    }
+  }
+
+  /**
+   * How long a stopped phone sleeps between maintenance wakes: the data mode's parked cadence
+   * (Balanced 30 min, Saver 60 min, Real time every slot), the same floor the core applies to a
+   * parked heartbeat (`dial_gate::parked_heartbeat_floor`). June, 2026-11-22: "we should still
+   * wake the phone up every so often because we can, but certainly not every 5".
+   */
+  private fun maintenanceIntervalMs(slotMs: Long): Long {
+    val mode =
+      try {
+        NodeStorage.host.current()?.dataMode()
+      } catch (e: Exception) {
+        null
+      }
+    return when (mode) {
+      DataMode.REALTIME -> slotMs
+      DataMode.SAVER -> 60 * 60_000L
+      else -> 30 * 60_000L
+    }.coerceAtLeast(slotMs)
+  }
+
+  /**
+   * A stopped phone's periodic wake: the parked heartbeat (which also pulls friends, floored), and
+   * one cheap Wi-Fi or cell position to catch a departure every other signal missed.
+   */
+  private suspend fun maintenance() {
+    reporter.event(LocationRuntimeKind.PULSE, reason = "maintenance")
+    heartbeat()
+    source?.currentPosition { position ->
+      if (position != null && stopped && !nearStop(position)) enterMoving("maintenance_check")
+    }
   }
 
   private suspend fun heartbeat() {
@@ -399,6 +644,15 @@ class BackgroundLocationService : Service() {
     @Volatile private var cadenceSlotIntervalMs: ULong = 5UL * 60UL * 1000UL
     @Volatile private var cadenceDistanceM: Float = 50f
     @Volatile private var running = false
+    @Volatile private var instance: BackgroundLocationService? = null
+
+    /** The running service, for [MotionReceiver]; null when sharing is off. */
+    internal fun current(): BackgroundLocationService? = instance
+
+    /** The physical-activity permission was just answered: start activity recognition if allowed. */
+    fun refreshMotionActivity() {
+      instance?.refreshMotion()
+    }
 
     /** Whether the service is the one currently receiving locations. Reported by `device.health`. */
     fun isRunning(): Boolean = running
@@ -439,6 +693,18 @@ class BackgroundLocationService : Service() {
      * from turning the ticker into a spin loop.
      */
     private const val MIN_TICK_INTERVAL_MS = 60_000L
+
+    /** No delivery for this long, with the 50 m filter, and the phone is taken to have stopped. */
+    private const val STOP_AFTER_MS = 10 * 60_000L
+
+    /** While stopped, how far a passive or network position must be from the stop to mean "left". */
+    private const val DEPART_RADIUS_M = 150f
+
+    /** While stopped, the least interval asked of the passive (and fallback network) provider. */
+    private const val STOPPED_UPDATE_INTERVAL_MS = 5 * 60_000L
+
+    /** How long one tick's or one capture's work may hold the CPU awake: a push, then a pull. */
+    private const val WORK_WAKE_LOCK_MS = 90_000L
 
     /** The user turned sharing on (or the cadence changed while it was on). */
     fun start(context: Context) {

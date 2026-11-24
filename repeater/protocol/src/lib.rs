@@ -20,4 +20,6 @@
 //! iroh-docs namespace id both are; converting to and from iroh types is the caller's business.
 
 pub mod roster;
+/// The stash's `POST /v1/batch`: publishes and a whole pull in one HTTPS request.
+pub mod stash_batch;
 pub mod wire;

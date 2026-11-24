@@ -194,6 +194,14 @@ export interface TransportConfig {
 }
 
 /**
+ * How much mobile data the node may spend reaching friends' phones directly (`dial_gate.rs`).
+ * `saver`: never over the internet (the stash and repeaters carry everything, nearby friends still
+ * sync, background pulls stop). `balanced`: only friends with evidence of being awake, background
+ * pulls hourly. `realtime`: every friend, with gossip.
+ */
+export type DataMode = 'saver' | 'balanced' | 'realtime';
+
+/**
  * Where the native drain path sends a published envelope so it leaves the phone.
  *
  * Mirrors `delivery.rs`. Crosses the bridge flattened into positional arguments (see
@@ -517,9 +525,18 @@ export interface OnNativeFixEvent {
   /**
    * On a `heartbeat`: what the runtime can prove about motion — `true` a confirmed stop, `false`
    * a stop just left. Absent when it has no evidence either way, or from a binary that predates
-   * the field. Forwarded to {@link IrohLocationModule.heartbeatFix} unchanged.
+   * the field. Forwarded to {@link IrohLocationModule.heartbeatFix} unchanged on a `heartbeat`,
+   * and with the fix in one drain ({@link IrohLocationModule.ingestFixClaiming}) on a `fix`.
    */
   parked?: boolean;
+  /**
+   * iOS: the runtime is holding a background assertion for this capture until the app answers
+   * with {@link IrohLocationModule.ackNativeCapture}. Absent from older binaries and when nothing
+   * is held.
+   */
+  token?: string;
+  /** iOS: what is left of the background allowance for this capture's push, in ms. */
+  budgetMs?: number;
 }
 
 /**
@@ -588,6 +605,10 @@ export interface IrohLocationApi {
    * OPTIONAL: absent on binaries built before the native drain path.
    */
   setTransportConfig?(config?: TransportConfig): Promise<void>;
+  /** See {@link DataMode}. Remembered natively. OPTIONAL: absent on binaries before 2026-11-22. */
+  setDataMode?(mode: DataMode): Promise<void>;
+  /** The data mode in force. Throws without a node. OPTIONAL, like {@link setDataMode}. */
+  dataMode?(): DataMode;
   /**
    * Run one captured fix through the native gate → outbox → seal → own docs namespace → push.
    *
@@ -599,6 +620,26 @@ export interface IrohLocationApi {
     battery: { level: number; charging: boolean; lowPower: boolean },
     intervalMs: number
   ): Promise<NativeIngestOutcome>;
+  /**
+   * {@link ingestFix} and the motion claim it settles, in ONE native drain: `parked` `true` a stop,
+   * `false` a departure, `null` none. As two calls (a fix, then a claim heartbeat) the claim queued
+   * behind the fix's push, and an iPhone suspended inside that push never sealed it — friends read
+   * "out of contact" about a phone at home (2026-11-18). `budgetMs` bounds the push, as the native
+   * runtime's own drains are; `null` is the ordinary deadline. OPTIONAL: absent on older binaries.
+   */
+  ingestFixClaiming?(
+    fix: NativeLocationFix,
+    battery: { level: number; charging: boolean; lowPower: boolean },
+    intervalMs: number,
+    parked: boolean | null,
+    budgetMs: number | null
+  ): Promise<NativeIngestOutcome>;
+  /**
+   * Tell the iOS runtime the app has finished publishing the capture it handed over under `token`
+   * (`OnNativeFixEvent.token`), so the background assertion it holds for it can end. iOS only;
+   * OPTIONAL.
+   */
+  ackNativeCapture?(token: string): void;
   /**
    * Start the native background publish path — a foreground service on Android, Core Location on
    * iOS. Only the sharing toggle should call these: a service the user did not ask for is a
@@ -665,6 +706,16 @@ export interface IrohLocationApi {
    * ANDROID ONLY, OPTIONAL.
    */
   requestBatteryOptimizationExemption?(): boolean;
+  /**
+   * Android: whether Google Play services' activity recognition is available, which is what the
+   * physical-activity permission step is for. ANDROID ONLY, OPTIONAL.
+   */
+  motionActivityAvailable?(): boolean;
+  /**
+   * Android: re-subscribe the running service to activity transitions, after the permission was
+   * granted. ANDROID ONLY, OPTIONAL.
+   */
+  refreshMotionActivity?(): void;
   /**
    * iOS: Bluetooth authorization, read from `CBManager.authorization` WITHOUT creating a manager â€”
    * creating one is what shows the alert. IOS ONLY, OPTIONAL (Android reads its runtime permissions

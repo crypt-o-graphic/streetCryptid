@@ -93,6 +93,24 @@ export const PERMISSION_STEP_COPY: Record<PermissionStepId, StepCopyText> = {
     note: {},
     action: 'Allow notifications',
   },
+  motion: {
+    name: 'Physical activity',
+    title: 'Turn GPS off when you stop',
+    lede: 'Your phone can tell when you are walking, driving or sitting still. streetCryptid uses that to switch GPS off while you stay put and back on when you move, which saves battery and data.',
+    summary: 'Use GPS only while you are moving.',
+    cards: [
+      {
+        label: 'STAYS ON YOUR PHONE',
+        tone: 'green',
+        body: 'Only "moving" or "still" is used, to decide when to run GPS. It is never shared or sent anywhere.',
+      },
+    ],
+    note: {
+      default:
+        'If you skip it, streetCryptid notices a stop more slowly and keeps GPS on a little longer.',
+    },
+    action: 'Allow physical activity',
+  },
   battery: {
     name: 'Battery',
     title: 'Keep sharing when the app is closed',

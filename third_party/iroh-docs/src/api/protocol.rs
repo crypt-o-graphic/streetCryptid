@@ -148,6 +148,20 @@ pub struct GetExactResponse {
     pub entry: Option<SignedEntry>,
 }
 
+/// Insert an entry someone else signed, exactly as a sync would (streetCryptid). The signatures
+/// are verified by the replica; `from` is recorded as the peer that delivered it.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InsertRemoteRequest {
+    pub doc_id: NamespaceId,
+    pub entry: SignedEntry,
+    pub from: [u8; 32],
+    /// Whether the entry's content is already in the local blob store.
+    pub content_complete: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InsertRemoteResponse;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ImportFileRequest {
     pub doc_id: NamespaceId,
@@ -329,6 +343,8 @@ pub enum DocsProtocol {
     Get(GetManyRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<GetExactResponse>>)]
     GetExact(GetExactRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<InsertRemoteResponse>>)]
+    InsertRemote(InsertRemoteRequest),
     // #[rpc(tx = mpsc::Sender<ImportProgress>)]
     // ImportFile(ImportFileRequest),
     // #[rpc(tx = mpsc::Sender<ExportProgress>)]

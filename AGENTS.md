@@ -65,7 +65,9 @@ map, the `sc.*` join-key correlation model (entry-hash based; there is deliberat
 end-to-end trace because payloads are E2E-encrypted), and the TraceQL cookbook for debugging
 dropped location pings across devices and the trail-stash server.
 
-**Query it with `scripts/telemetry/{tq,tr,lq}.sh`** (TraceQL search, full trace, LogQL). Grafana
+**Query it with `scripts/telemetry/{tq,tr,lq,pq}.sh`** (TraceQL search, full trace, LogQL, PromQL
+over span metrics). **`fleet.py` lists every phone and `who.py <id>` explains one**; the id is the
+TELEMETRY ID a friend card shows with connection details on (`infra/otel/README.md`). Grafana
 resolves publicly but routes only over the tailnet. In a Claude Code web session,
 `scripts/claude-web/session-start.sh` (a SessionStart hook) joins the tailnet as an ephemeral
 userspace node and the helpers route through its SOCKS5 listener; it needs `TS_AUTHKEY`,
@@ -137,6 +139,11 @@ Conventions when changing that code:
   forwarded (binary+offset, attributed thread first, 48 frames) — a full call-stack tree is
   hundreds of kilobytes and would make telemetry the reason a phone stops shipping telemetry.
   `diag.*` attributes describe the build that DIED, which is routinely not the build reporting it.
+  The daily metric payloads ride the same spool as `kind = "metrics"` rows and come out as
+  `ios.metrics` (`metric.cpu_ms`, `metric.location_10m_ms` … `_3km_ms`, `metric.cell_up_bytes`,
+  `metric.background_ms`, `metric.bg_exit_*`): the OS's own battery accounting, GPS time included,
+  which no counter in the app can see. They were dropped until 2026-11-19, when the app was
+  reported heavy on battery and nothing could say whether the GPS, the radio or the CPU was why.
 - **A backgrounded iOS app is not a suspended one, and that is where the CPU went.**
   `UIBackgroundModes: ["location"]` plus `allowsBackgroundLocationUpdates` means iOS does not
   suspend this process while sharing is on, so a swiped-away app keeps every JS timer it had
@@ -156,8 +163,12 @@ Conventions when changing that code:
 - **The background budget is measured now, not inferred.** Every earlier claim about it —
   `SHIP_MAX_BATCHES = 3`, `HEADLESS_TEARDOWN_TIMEOUT_MS`, "throttled into silence" — came from
   reading silence after the fact. `BackgroundWakeLedger.swift` samples `CLOCK_PROCESS_CPUTIME_ID`
-  and `CLOCK_MONOTONIC` around each wake into durable UserDefaults counters, surfaced as `wake.*`
-  on the next `device.health`. Counters and not spans, for the reason `init-watermark.ts` exists: a
+  and `CLOCK_UPTIME_RAW` around each wake into durable UserDefaults counters, surfaced as `wake.*`
+  on the next `device.health`. Records before v4.8 are unreliable: the wall clock was
+  `CLOCK_MONOTONIC`, which on Darwin counts sleep (one week read as 62 days), and a window opened by
+  a process that was then killed was closed by the next one against its own per-process clocks,
+  so the groups summed to many times the total. A window now belongs to its process, and one left
+  open by another is discarded and counted (`wake.windows_orphaned`). Counters and not spans, for the reason `init-watermark.ts` exists: a
   wake that ends before it can ship cannot describe itself, and on a JS-free wake there is no
   journal to write to. `recordDeviceHealth` is the ONLY caller allowed to reset them — a
   take-and-reset inside the read lets two records in one minute take half the counts each.
@@ -192,9 +203,13 @@ Conventions when changing that code:
   parked declaration was even sealed: friends read "out of contact" about a phone sitting still.
   The seal is never bounded; the push is (`ingest_fix_within` / `heartbeat_fix_within`, the
   remaining allowance minus 5 s, not started under 2 s → `push_deferred`, which asks for a
-  `NativeRefreshTask` wake if none is pending). An ingest that owes a claim leaves 8 s for the
-  claim's push and pulls only after it. Outcomes are durable `wake.publish_*` counters plus
-  `location.runtime{event=publish_assertion}` (`expired` / `stranded`).
+  `NativeRefreshTask` wake if none is pending). Off screen, a "no limit" `backgroundTimeRemaining`
+  counts as 25 s (`residentAllowanceMs`): the location stream keeps a process resident only until
+  it winds down, which is what an arrival does, and on 2026-11-18 every drain took the unbounded
+  30 s push and was suspended inside it (210 s, 451 s). A capture handed to a mounted app keeps
+  its assertion until JS answers `ackNativeCapture` (`HandOffAcks`, at most 28 s) and carries its
+  `budgetMs`. Outcomes are durable `wake.publish_*` counters plus
+  `location.runtime{event=publish_assertion}` (`expired` / `stranded` / `handoff_unanswered`).
   `native-publish-assertion.test.ts` scans the Swift for a bare `Task`. The `serviceRefresh` path is
   the one exception: its `BGProcessingTask` is its assertion. Android was checked and left alone:
   its foreground service keeps the process running, and the newest `trail.push.wait` spans there
@@ -336,9 +351,25 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   otherwise after `speculativeHoldSeconds` (60 s) inside its radius; a re-centre — a fix that left
   the last candidate — retracts and never re-declares. Until 2026-10-20 every re-centre declared,
   and the field-soak iPhone (simulated GPS, speed always -1) flipped `live`/`parked` every 30-60 s
-  for whole walks, each flip an off-grid envelope (`moving.declared_parked`). A claim is settled in the
-  same task as the fix that caused it (`settleClaims`), fix first, so the drain anchors a
-  declaration on that fix and judges it against the right stop.
+  for whole walks, each flip an off-grid envelope (`moving.declared_parked`). **A claim is settled
+  in the same DRAIN as the fix that caused it** (`settleClaims` → `ingest_fix_claiming`, and from a
+  mounted app `ingestFixClaiming`): a `parked` claim with an accepted fix anchors the stop ON that
+  fix, and the envelope sealed already carries it. It was a fix and then a claim heartbeat, and on
+  2026-11-18 `cc1d2f7ebd`'s arrival sealed two `live` envelopes, was suspended inside their push,
+  and never sealed the claim; friends read "out of contact" two hours later. A visit arrival that
+  parks on a fix, a confirming dwell and a seed into `stopped` (restored ones included) send their
+  fix with the claim too; only a stop with no fix yet sends a bare `heartbeat(parked: true)`.
+- **A push stops waiting for friends once the stash has the entries** (`docs::push` `settle_on`,
+  `PUSH_GRACE_AFTER_SETTLE` = 3 s, `trail.push.wait{ended=settled, settled_ms}`). Over 24 h to
+  2026-11-19, 592 of 867 friend dials never answered and each cost its push the full 30 s, while
+  the stash answered at p50 0.3 s. The stash serves every friend, and the namespace stays live, so
+  an awake friend still reconciles after the wait ends. A repeater carrying our trail settles a push
+  the same way (it serves the namespace to every friend that pulls it), while staying unwaited: it
+  can end a wait, never extend it. With neither, the push waits as before. When the grace runs out,
+  a friend that looks awake — an open iroh path (`TransportAddrUsage::Active`) or a `NeighborUp`
+  on the namespace — is HELD until the original deadline rather than let go, so a direct send that
+  is still connecting is not abandoned to an iOS suspension (`trail.push.peer{peer.held_at_cut}`). Which carrier a fix left
+  through is `trail.push{push.durable_via}`, a spanmetrics dimension beside `fix.provenance`.
 - **A position Core Location hands back is not a capture.** `didUpdateLocations` drops a location
   whose timestamp is not newer than the last one delivered: on 2026-10-02 one fix came back every
   30 s for 73 minutes, the first two went out `live` 5-9 minutes stale, and the rest read as a
@@ -376,7 +407,12 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   sealed `s/profile`, `s/repeaters` and `keyring` too; sources are the owner's `profile_relays`,
   then the owner named by the read ticket), which hands a profile that became readable to the app
   because no `ContentReady` will, and re-reads repeater cards when anything landed; it reports
-  `sync.profile_stranded` / `_fetched`. Do not move
+  `sync.profile_stranded` / `_fetched`. **A stranded fetch that fails twice backs off**
+  (`docs::stranded_retry_delay`: next pull, then 15 min doubling to 6 h; `sync.stranded_deferred` /
+  `sync.profile_stranded_deferred` count what a pass skipped). A fetch nobody can serve ends only
+  on its timeout, and on 2026-11-19 a Pixel 10 holding two unservable slots (one 39 days old) and
+  two profile entries ran 213 of 214 pulls to the 20 s deadline: 6 s of CPU and 20 s of radio
+  every 5-15 minutes, for nothing. Do not shorten the backoff back to "every pull". Do not move
   either into the replica read (a read never dials), and do not drop the `rsy` lane: a control
   record without bytes is a restart request the leader cannot see. The web build does not run it
   yet.
@@ -457,6 +493,21 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   it until the process was reclaimed. `location.delegate_on_main` in `device.health` must read
   `true`; `location.wake_reason` stuck on `seed` with `last_wake_age_ms` climbing on a moving phone
   is what `false` looks like.
+- **A launch before the first unlock waits for it** (`ProtectedDataGate.swift`). After a reboot
+  iOS can relaunch the app for a fence, visit or significant change while the phone is still
+  locked, when every `untilFirstUserAuthentication` file reads back empty or fails: `UserDefaults`
+  (so `wasArmed` said off and nothing armed), the Rust stores, the telemetry spool, the keychain.
+  A fence exit then still ran `enterMoving`, whose `persistState` wrote `sc.bg.armed = false` over
+  a domain it could not read. On 2026-11-17 two friends' phones ran flat 25 minutes apart and
+  neither came back by itself. So `restorePersistedState` and `finishLaunch` go through
+  `whenAvailable`; every wake (`didUpdateLocations` / `didVisit` / `didExitRegion`, the refresh
+  task, the unlock notification) calls `poll`; `persistState` writes nothing while deferred; and
+  `ArmedMarker`, a one-byte file with no data protection, lets a locked launch know it was sharing,
+  so it can ask for a refresh wake (a phone that reboots and then sits still has no other way
+  back). The generated `SceneDelegate` holds a scene back while locked too. The locked part cannot
+  report itself; the first `started` after it does (`bg=`, `reboot=`, `wait_ms=`, `locked=` in
+  `location.detail`, see `infra/otel/README.md`). Anything new that reads or writes app data at
+  launch goes behind the gate.
 - **`start()` claims every durable store before it touches the network, and must keep doing so.**
   Until 2026-09-28 the native runtime's node had never started on either platform: `start_stored`
   read its config from a store only `start` opens, so it was `NotStarted` on every fresh node and
@@ -824,6 +875,40 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
   context. It reads the node with `try_lock` and reports `busy` rather than wait. Do not turn
   either into a span per event: a dead relay retries every 16 s for the life of the process. See
   `infra/otel/README.md`.
+- **Bytes and heap are named per connection and per call site, not guessed.** On 2026-11-21 a
+  Pixel 10 (v4.5.0) used 34 GB of mobile upload in a week, about 47 MB per friend pull, and held
+  1.7 GB of Rust heap (3 GB swapped) after 75 h. It lagged as a whole, and nothing could say who
+  received the bytes or what held the memory. `conn_ledger.rs` is an endpoint hook installed
+  FIRST on the node's endpoint. `net.conns` (beside `net.health`, which is at tracing's 32-field
+  limit) reports QUIC bytes per (ALPN, remote, direction), dials, live connections,
+  `runtime.tokio_tasks`, and what the endpoint sent that no connection owns. A connection over
+  1 MiB gets its own `conn.closed`. The hook holds only weak connection handles, because a strong
+  one disables close-on-drop. For the heap, `just heap-profile` (`scripts/profile/android-heap.sh`)
+  runs heapprofd over adb on any developer-telemetry build (`withProfileable`). It symbolizes against the `android-native-symbols` CI artifact: `eas-build-pre-install.sh`
+  links the library with a build id and soname, ships it stripped, and stages the copy with its
+  symbol table. Without a build id a profile cannot be matched to symbols, so keep those link
+  args.
+- **Android does not wake JavaScript in the background, and stops GPS when stopped** (2026-11-22).
+  `BackgroundLocationService` hands a capture or parked tick to the app only while the app is on
+  screen (`NativeBackgroundRuntime.routeToApp`). Off screen it ingests natively, does not forward
+  replica notifications or pull results to JS, and the JS heartbeat timer is paused
+  (`onEnterBackground`). The JS revive fence and periodic refresh are no longer scheduled on any
+  platform: `ServiceRecovery` restarts the service, and `retireJsBackgroundTasks` unregisters
+  what older builds left. The service has `moving` and `stopped` states, and uses the platform's
+  own signals for both wherever Google Play services exists, with a fallback that needs none of
+  it (a phone without Google must still share). Positions: the fused provider, else
+  `LocationManager` (`LocationSource.kt`). Stopping: activity recognition's `STILL` (the `motion`
+  permission step), else 10 min with nothing past the 50 m filter. Leaving: activity recognition,
+  a Play services exit geofence on the stop, and a passive or maintenance position 150 m away,
+  else the significant-motion sensor (`MotionSignals.kt`; `location.runtime{event=started}`
+  says which a phone got). Stopped means GPS off. **The service's clock is an `AlarmManager`
+  alarm, never a coroutine `delay`**: that clock stops while the CPU sleeps, and with GPS off
+  nothing wakes it, so a 30-minute wait could last for hours. Work after a wake holds a partial
+  wake lock (`launchAwake`). While a phone stays parked the core publishes on the
+  data mode's maintenance cadence (Balanced 30 min, Saver 60 min, one envelope for all the
+  slots missed; `publish.rs`, `dial_gate::parked_heartbeat_floor`). That deliberately trades
+  away the uniform-cadence rule above while parked: the stash can now tell a parked phone from a
+  moving one by how often it publishes.
 - Guard newly added native exports anyway (`typeof mod.configureTelemetry === 'function'`). Not
   because of bindgen now, but because a phone can be running an older binary than the JS bundle.
 

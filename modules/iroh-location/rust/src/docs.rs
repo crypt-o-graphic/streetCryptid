@@ -85,6 +85,34 @@ const SYNC_FIRST_EVENT_TIMEOUT_SECS: u64 = 25;
 /// but a peer that connects and then stalls would otherwise hold a headless context open.
 pub const PUSH_TIMEOUT_SECS: u64 = 30;
 
+/// How much longer a push waits for friends once a durable carrier — the stash, or one of our
+/// repeaters — has its copy (`settle_on` in [`TrailDocs::push`]).
+///
+/// Measured 2026-11-19 over 24 h of `trail.push.peer`: the stash finished at p50 0.3 s, a friend
+/// that answered at p50 0.7 s, and 592 of 867 friend dials never answered at all — each one costing
+/// its push the full 30 s. On iOS those 30 s are spent from a ~30 s background allowance, and the
+/// phones were suspended inside them (pushes of 210 and 451 s on 2026-11-18), with whatever the
+/// wake owed next — a `parked` claim — never sent. Once the stash holds the entries every friend can
+/// read them from it, and the namespace stays live, so an awake friend still reconciles after we
+/// stop watching. Three seconds keeps the friends who answer quickly as direct contacts: replayed
+/// over 48 h of `trail.push.peer` it kept 711 of the 867 friend finishes inside the window and cut
+/// the fleet's push wait from 10.5 to 1.9 phone-hours.
+///
+/// A repeater settles a push exactly as the stash does: it carries the namespace for every friend
+/// who can read it (`repeater::pull_plan`), so a phone that carries its trail on a repeater and has
+/// not opted into the stash no longer spends every push's whole budget on friends' phones.
+pub const PUSH_GRACE_AFTER_SETTLE: Duration = Duration::from_secs(3);
+
+// When the grace runs out, a friend who is demonstrably awake is not cut with the rest: one we hold
+// an open path to (iroh's `TransportAddrUsage::Active`, a validated QUIC path, direct or relayed)
+// or who joined the namespace's swarm (`LiveEvent::NeighborUp`) is HELD — waited for up to the
+// push's original deadline — while everyone else is let go. Over 48 h to 2026-11-19, 629 of 825
+// friend finishes landed inside 3 s and the rest were a tail at p50 15 s, while 2,083 of 2,182
+// friend failures sat at 25 s+, the dial timeout of a phone nobody could reach. A fix is one small
+// record, so that tail is getting connected rather than transferring, and an open path is the cheap
+// liveness check that tells the two apart. On iOS the deadline is already the background allowance
+// less a margin (`push_trail_within`), so a hold never outlives the assertion.
+
 /// Key separator between the hex author and the zero-padded sequence number.
 pub const KEY_SEP: u8 = b'/';
 
@@ -335,6 +363,77 @@ pub struct SettleReport {
     pub fetched: usize,
     /// Authors that became readable, each once — what the replica observer was told.
     pub readable: Vec<[u8; 32]>,
+    /// Of `stranded`, the ones this pass did not ask for because they are backing off
+    /// ([`StrandedBackoff`]).
+    pub deferred: usize,
+}
+
+/// The first retry delay after a stranded fetch has failed twice in a row
+/// ([`stranded_retry_delay`]). A pull runs every 5-15 min, so this is "skip the next pull or so".
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+const STRANDED_RETRY_BASE_SECS: u64 = 15 * 60;
+/// The longest a stranded slot waits between attempts. Long enough that bytes nobody holds cost a
+/// handful of dials a day, short enough that a friend back from a week away is read the same day.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+const STRANDED_RETRY_CAP_SECS: u64 = 6 * 60 * 60;
+
+/// How long to leave a stranded entry alone after its `failures`-th failed fetch in a row.
+///
+/// The first failure is retried by the very next pull: the common case
+/// ([`TrailDocs::settle_stranded`]'s 2026-11-10 incident) is bytes that land on the stash moments
+/// after the record did. After that, the bytes are not coming soon, and every attempt costs a pull
+/// its whole remaining deadline — a fetch that nobody can serve ends only on its timeout. On
+/// 2026-11-19 a Pixel 10 held two friend slots and two profile entries that no peer had (one slot
+/// 39 days old), and every one of its pulls over two days ran to the 20 s deadline on them: 213
+/// of 214 pulls, 6 s of CPU and 20 s of radio each, every 5-15 minutes, to bring nothing.
+/// Doubling from [`STRANDED_RETRY_BASE_SECS`] to [`STRANDED_RETRY_CAP_SECS`].
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn stranded_retry_delay(failures: u32) -> Duration {
+    if failures <= 1 {
+        return Duration::ZERO;
+    }
+    let doublings = (failures - 2).min(16);
+    Duration::from_secs(
+        STRANDED_RETRY_BASE_SECS
+            .saturating_mul(1u64 << doublings)
+            .min(STRANDED_RETRY_CAP_SECS),
+    )
+}
+
+/// Per content hash, how many stranded fetches in a row have failed and when to try again.
+///
+/// In memory on purpose: it only has to outlive one process's pull cadence, and a new process
+/// trying everything once more is exactly the retry a cold start should make. Bounded by what is
+/// stranded right now — [`Self::retain`] drops every hash that is no longer stranded, fetched or
+/// superseded alike. A std lock, never held across an await.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[derive(Debug, Default)]
+pub(crate) struct StrandedBackoff {
+    inner: std::sync::Mutex<HashMap<Hash, (u32, Instant)>>,
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+impl StrandedBackoff {
+    /// Whether `hash` may be asked for at `now`. Unknown hashes always may.
+    pub(crate) fn due(&self, hash: &Hash, now: Instant) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.get(hash).is_none_or(|(_, next)| *next <= now)
+    }
+
+    /// A fetch of `hash` failed at `now`; returns the delay before the next attempt.
+    pub(crate) fn failed(&self, hash: Hash, now: Instant) -> Duration {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let failures = inner.get(&hash).map_or(0, |(n, _)| *n).saturating_add(1);
+        let delay = stranded_retry_delay(failures);
+        inner.insert(hash, (failures, now + delay));
+        delay
+    }
+
+    /// Forget every hash `keep` does not name: fetched, superseded, or no longer replicated.
+    pub(crate) fn retain(&self, keep: impl Fn(&Hash) -> bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.retain(|hash, _| keep(hash));
+    }
 }
 
 /// Who to ask for one stranded slot's bytes, most likely first, each once, never ourselves.
@@ -483,6 +582,8 @@ pub struct PushReport {
     pub peers_failed: usize,
     /// What each dialled peer did, individually. See [`PeerPushOutcome`].
     pub per_peer: Vec<PeerPushOutcome>,
+    /// The durable carrier (one of `settle_on`) whose finish cut the wait short, when one did.
+    pub settled_by: Option<[u8; 32]>,
 }
 
 /// Which of the three things a dialled peer did.
@@ -500,6 +601,11 @@ pub enum PeerOutcome {
     Failed,
     /// Never reported at all before the deadline. An asleep phone looks like this.
     Silent,
+    /// A carrier handed to the live engine but never waited for (a repeater; see
+    /// [`TrailDocs::push`]) that had not reported when the push stopped watching. Not
+    /// [`Silent`](Self::Silent): nothing waited on it, and it may well finish a second later. Kept
+    /// as a row anyway, because without it a repeater's answer rate had no denominator.
+    Unwaited,
 }
 
 impl PeerOutcome {
@@ -509,26 +615,84 @@ impl PeerOutcome {
             Self::Finished => "finished",
             Self::Failed => "failed",
             Self::Silent => "silent",
+            Self::Unwaited => "unwaited",
         }
     }
 }
 
 /// Complete a push's per-peer record: every dialled peer that never reported is folded in as
-/// [`PeerOutcome::Silent`] alongside the peers that did.
+/// [`PeerOutcome::Silent`] alongside the peers that did, and every unwaited carrier that never
+/// reported as [`PeerOutcome::Unwaited`].
 ///
 /// Pure, and separated out for that reason, so it is tested without standing up an iroh node. It
 /// must never drop the record when nobody answered: a push where every peer stayed quiet is the
 /// most informative row there is.
+/// The push deadline once the settling peer has its copy: [`PUSH_GRACE_AFTER_SETTLE`] from now, and
+/// never later than the deadline already standing.
+fn settled_deadline(deadline: Instant, now: Instant) -> Instant {
+    deadline.min(now + PUSH_GRACE_AFTER_SETTLE)
+}
+
+/// What the settle grace's end decided, per peer outstanding then: `true` held, `false` let go.
+type Cut = Option<HashMap<[u8; 32], bool>>;
+
+fn cut_mark(cut: &Cut, peer: &[u8; 32]) -> Option<bool> {
+    cut.as_ref().and_then(|marks| marks.get(peer).copied())
+}
+
+/// The outstanding peers worth holding when the settle grace runs out: those that look awake.
+fn hold_at_cut(
+    pending: &std::collections::HashSet<[u8; 32]>,
+    neighbours: &std::collections::HashSet<[u8; 32]>,
+    connected: &std::collections::HashSet<[u8; 32]>,
+) -> std::collections::HashSet<[u8; 32]> {
+    pending
+        .iter()
+        .filter(|peer| neighbours.contains(*peer) || connected.contains(*peer))
+        .copied()
+        .collect()
+}
+
+/// Whether `endpoint` holds an open path to `peer` right now: a validated QUIC path, direct or
+/// relayed. A phone asleep in a pocket has none; one whose sync is still connecting may.
+async fn has_open_path(endpoint: &iroh::Endpoint, peer: [u8; 32]) -> bool {
+    let Ok(id) = iroh::EndpointId::from_bytes(&peer) else {
+        return false;
+    };
+    endpoint.remote_info(id).await.is_some_and(|info| {
+        info.addrs()
+            .any(|addr| matches!(addr.usage(), iroh::endpoint::TransportAddrUsage::Active))
+    })
+}
+
 fn finish_outcomes(
     mut reported: Vec<PeerPushOutcome>,
     outstanding: &[[u8; 32]],
+    carriers: &[[u8; 32]],
+    cut: &Cut,
 ) -> Vec<PeerPushOutcome> {
+    for row in reported.iter_mut() {
+        row.held_at_cut = cut_mark(cut, &row.peer);
+    }
     for peer in outstanding {
         reported.push(PeerPushOutcome {
             peer: *peer,
             outcome: PeerOutcome::Silent,
             latency_ms: None,
             entries_sent: 0,
+            held_at_cut: cut_mark(cut, peer),
+        });
+    }
+    for peer in carriers {
+        if reported.iter().any(|row| &row.peer == peer) {
+            continue;
+        }
+        reported.push(PeerPushOutcome {
+            peer: *peer,
+            outcome: PeerOutcome::Unwaited,
+            latency_ms: None,
+            entries_sent: 0,
+            held_at_cut: None,
         });
     }
     reported.sort_by_key(|outcome| outcome.peer);
@@ -549,6 +713,10 @@ pub struct PeerPushOutcome {
     pub latency_ms: Option<u64>,
     /// Entries handed to THIS peer. Zero unless [`PeerOutcome::Finished`].
     pub entries_sent: u64,
+    /// Whether this peer was still outstanding when the settle grace ran out, and if so whether
+    /// it looked awake then (an open path or a swarm neighbour) and was held: `Some(true)` held,
+    /// `Some(false)` let go. `None` when no cut happened or the peer had answered before it.
+    pub held_at_cut: Option<bool>,
 }
 
 /// Who served an author's slot in the most recent reconciliation that carried it.
@@ -701,6 +869,9 @@ async fn watch_namespace(
                     record_serving_peer(&mut peers, entry.key(), from, entry.timestamp())
                 };
                 if let Some(author) = author {
+                    // Its author was awake when it wrote this; a recent one makes it worth a dial
+                    // (`dial_gate`), whoever handed it over.
+                    crate::dial_gate::note_fresh(author, entry.timestamp());
                     batch.insert(from, author, entry.content_hash(), content_status);
                 }
             }
@@ -753,6 +924,12 @@ pub struct TrailDocs {
     /// One watch task per namespace, aborted when its entry is dropped. A std lock: it is only
     /// ever held to insert or remove, never across an await.
     watchers: std::sync::Mutex<HashMap<[u8; 32], AbortOnDropHandle<()>>>,
+    /// Which stranded slots [`Self::settle_stranded`] is leaving alone for now, and until when.
+    stranded_backoff: StrandedBackoff,
+    /// Content hashes the stash has accepted over HTTP in this process, so a push re-sends only
+    /// what is new. Every push used to PUT the newest bytes of EVERY key in our namespace again,
+    /// a TLS handshake and a dozen envelopes every five minutes for slots that had not changed.
+    uploaded: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 
 impl TrailDocs {
@@ -819,6 +996,8 @@ impl TrailDocs {
             serving_peers: Arc::new(Mutex::new(HashMap::new())),
             observer,
             watchers: std::sync::Mutex::new(HashMap::new()),
+            stranded_backoff: StrandedBackoff::default(),
+            uploaded: Default::default(),
         };
         let live: Vec<Doc> = docs.handles.lock().await.values().cloned().collect();
         for doc in live {
@@ -954,6 +1133,14 @@ impl TrailDocs {
                 continue;
             }
             let hash = entry.content_hash();
+            if self
+                .uploaded
+                .lock()
+                .expect("uploaded lock")
+                .contains(hash.as_bytes())
+            {
+                continue;
+            }
             // A slot whose bytes we no longer hold cannot be offered, and cannot be fixed by
             // retrying it: skip it rather than failing the slots that follow.
             let bytes = match self.blobs.blobs().get_bytes(hash).await {
@@ -1021,10 +1208,20 @@ impl TrailDocs {
                     "trail content upload: stash is not tracking this slot yet; skipping"
                 );
                 report.untracked += 1;
+                // A stash that does not know a slot may have lost what it held: offer everything
+                // again next time.
+                self.uploaded.lock().expect("uploaded lock").clear();
                 continue;
             }
             match response.error_for_status() {
-                Ok(_) => report.uploaded += 1,
+                Ok(_) => {
+                    report.uploaded += 1;
+                    let mut uploaded = self.uploaded.lock().expect("uploaded lock");
+                    if uploaded.len() >= 4096 {
+                        uploaded.clear();
+                    }
+                    uploaded.insert(*hash.as_bytes());
+                }
                 Err(error) => {
                     report.transport_failed += 1;
                     last_transport_error = Some(error.into());
@@ -1039,6 +1236,116 @@ impl TrailDocs {
             }
         }
         Ok(report)
+    }
+
+    /// Our own entries written after `since_us`, signed and with their bytes: what the stash batch
+    /// publishes (`streetcryptid_repeater::stash_batch`). Returns them with the newest timestamp
+    /// among them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn own_signed_since(
+        &self,
+        since_us: u64,
+    ) -> Result<(Vec<streetcryptid_repeater::stash_batch::BatchEntry>, u64)> {
+        let doc = self.doc_for(self.own_ns).await?;
+        let stream = doc
+            .get_many_signed(Query::single_latest_per_key().build())
+            .await?;
+        tokio::pin!(stream);
+        let mut out = Vec::new();
+        let mut newest = since_us;
+        while let Some(signed) = stream.next().await {
+            let signed = signed?;
+            let entry = signed.entry();
+            if entry.timestamp() <= since_us || entry.content_len() == 0 {
+                continue;
+            }
+            let Ok(content) = self.blobs.blobs().get_bytes(entry.content_hash()).await else {
+                continue;
+            };
+            newest = newest.max(entry.timestamp());
+            out.push(streetcryptid_repeater::stash_batch::BatchEntry {
+                namespace: self.own_ns.to_bytes(),
+                entry: postcard::to_allocvec(&signed)?,
+                content: content.to_vec(),
+            });
+        }
+        Ok((out, newest))
+    }
+
+    /// Every friend namespace with the newest entry timestamp this replica holds in it: the
+    /// stash batch's read cursors.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn pull_cursors(&self) -> Vec<streetcryptid_repeater::stash_batch::PullCursor> {
+        let mut cursors = Vec::new();
+        for ns in self.namespaces().await {
+            if ns == self.own_ns {
+                continue;
+            }
+            let mut since_us = 0;
+            if let Ok(doc) = self.doc_for(ns).await {
+                if let Ok(stream) = doc.get_many(Query::single_latest_per_key().build()).await {
+                    tokio::pin!(stream);
+                    while let Some(Ok(entry)) = stream.next().await {
+                        since_us = since_us.max(entry.timestamp());
+                    }
+                }
+            }
+            cursors.push(streetcryptid_repeater::stash_batch::PullCursor {
+                namespace: ns.to_bytes(),
+                since_us,
+            });
+        }
+        cursors
+    }
+
+    /// Put entries the stash handed over into the replica, bytes first, as a sync would: the
+    /// replica verifies both signatures and keeps the newer of two entries for a key, and the
+    /// namespace's watch reports each as delivered by `from`. Returns (inserted, refused).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn import_batch(
+        &self,
+        entries: Vec<streetcryptid_repeater::stash_batch::BatchEntry>,
+        from: [u8; 32],
+    ) -> (usize, usize) {
+        let held: std::collections::HashSet<[u8; 32]> = self
+            .namespaces()
+            .await
+            .into_iter()
+            .map(|ns| ns.to_bytes())
+            .collect();
+        let (mut inserted, mut refused) = (0, 0);
+        for item in entries {
+            let ok = async {
+                if !held.contains(&item.namespace) || item.namespace == self.own_ns.to_bytes() {
+                    return false;
+                }
+                let Ok(signed) = postcard::from_bytes::<iroh_docs::SignedEntry>(&item.entry) else {
+                    return false;
+                };
+                let entry = signed.entry();
+                if entry.namespace().to_bytes() != item.namespace
+                    || entry.content_len() != item.content.len() as u64
+                    || Hash::new(&item.content) != entry.content_hash()
+                {
+                    return false;
+                }
+                match self.blobs.blobs().add_bytes(item.content).await {
+                    Ok(tag) if tag.hash == entry.content_hash() => {}
+                    _ => return false,
+                }
+                let Ok(doc) = self.doc_for(NamespaceId::from(item.namespace)).await else {
+                    return false;
+                };
+                doc.insert_remote(signed, from, true).await.is_ok()
+            }
+            .await;
+            if ok {
+                inserted += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        (inserted, refused)
     }
 
     /// Fetch a cached [`Doc`] handle for `ns`, or open it from the local replica store.
@@ -1237,9 +1544,11 @@ impl TrailDocs {
     /// pass dialled — the stash among them), `namespace_sources` for the slot's namespace (the
     /// repeaters carrying that friend), the slot's author (its `EndpointId` is the key), and
     /// whoever last served that author to us. Each fetch is bounded by `deadline` when there is
-    /// one and by [`STRANDED_FETCH_TIMEOUT_SECS`] regardless; a slot still stranded is simply
-    /// tried again on the next pull. Failures are expected (a sleeping author, a stash that has
-    /// not received the bytes either) and are reported, not raised.
+    /// one and by [`STRANDED_FETCH_TIMEOUT_SECS`] regardless. A slot still stranded is tried again
+    /// by the next pull, and after that backs off ([`stranded_retry_delay`]): a fetch nobody can
+    /// serve ends only on its timeout, so retrying it every pull held every pull to its deadline.
+    /// Failures are expected (a sleeping author, a stash that has not received the bytes either)
+    /// and are reported, not raised; `deferred` counts the slots left alone this pass.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn settle_stranded(
         &self,
@@ -1248,11 +1557,19 @@ impl TrailDocs {
         namespace_sources: &HashMap<[u8; 32], Vec<iroh::EndpointId>>,
         deadline: Option<Instant>,
     ) -> Result<SettleReport> {
-        let stranded = self.stranded_slots().await?;
+        let all = self.stranded_slots().await?;
         let mut report = SettleReport {
-            stranded: stranded.len(),
+            stranded: all.len(),
             ..SettleReport::default()
         };
+        self.stranded_backoff
+            .retain(|hash| all.iter().any(|slot| slot.hash == *hash));
+        let now = Instant::now();
+        let stranded: Vec<StrandedSlot> = all
+            .into_iter()
+            .filter(|slot| self.stranded_backoff.due(&slot.hash, now))
+            .collect();
+        report.deferred = report.stranded - stranded.len();
         if stranded.is_empty() {
             return Ok(report);
         }
@@ -1315,12 +1632,14 @@ impl TrailDocs {
                     );
                 }
                 Err(error) => {
+                    let retry_in = self.stranded_backoff.failed(slot.hash, Instant::now());
                     tracing::debug!(
                         sc.author = %crate::telemetry::short_hex(&slot.author),
                         sc.entry_hash = %crate::telemetry::short_hex(slot.hash.as_bytes()),
                         age_ms = now_us.saturating_sub(slot.written_us) / 1000,
+                        retry_in_s = retry_in.as_secs(),
                         %error,
-                        "stranded friend slot still without bytes; will retry next pull"
+                        "stranded friend slot still without bytes; will retry"
                     );
                 }
             }
@@ -1558,12 +1877,25 @@ impl TrailDocs {
     /// never waited for: a laptop repeater asleep in a bag would otherwise cost every push the
     /// whole deadline. They reconcile whenever they next wake, and a carrier that answers while
     /// the others are awaited is still reported.
+    ///
+    /// `settle_on` are the peers whose copy makes the push durable — the stash and our repeaters.
+    /// Once the first of them reports finished, the rest get [`PUSH_GRACE_AFTER_SETTLE`] more and
+    /// no longer the whole budget (`ended = "settled"`, [`PushReport::settled_by`]). A carrier
+    /// among them stays unwaited: it can end the wait, never extend it. Their silence changes
+    /// nothing: the push then waits as before.
+    ///
+    /// When that grace runs out, outstanding peers that look awake — an open path on `liveness`,
+    /// or a `NeighborUp` on this namespace — are held until the original deadline instead of being
+    /// let go with the rest (see [`PUSH_GRACE_AFTER_SETTLE`]). Without an endpoint only the swarm
+    /// signal counts.
     pub async fn push(
         &self,
         ns: NamespaceId,
         peers: Vec<EndpointAddr>,
         unwaited: Vec<EndpointAddr>,
         budget: Duration,
+        settle_on: &[[u8; 32]],
+        liveness: Option<&iroh::Endpoint>,
     ) -> Result<Option<PushReport>> {
         use tracing::Instrument;
         // The phases of a push are spans of their own (`trail.push.open`, `.start_sync`, `.wait`)
@@ -1585,8 +1917,10 @@ impl TrailDocs {
         let dialled = peers.len();
         let scheduled = unwaited.len();
         let mut targets = peers;
+        let mut carriers: Vec<[u8; 32]> = Vec::new();
         for peer in unwaited {
             if !pending.contains(peer.id.as_bytes()) && !targets.iter().any(|t| t.id == peer.id) {
+                carriers.push(*peer.id.as_bytes());
                 targets.push(peer);
             }
         }
@@ -1598,33 +1932,67 @@ impl TrailDocs {
             ))
             .await?;
         if dialled == 0 {
+            report.per_peer = finish_outcomes(report.per_peer, &[], &carriers, &None);
             return Ok(Some(report));
         }
 
         // The budget starts once the exchange is under way, as it always has; `latency_ms` is
         // measured from here too.
         let started_at = Instant::now();
-        let deadline = started_at + budget;
+        let full_deadline = started_at + budget;
+        let mut deadline = full_deadline;
+        let mut settled_ms: Option<u64> = None;
+        // Peers that joined this namespace's swarm during the push: awake, whatever the sync says.
+        let mut neighbours: std::collections::HashSet<[u8; 32]> = Default::default();
+        // Decided once, when the settle grace runs out: who is held and who is let go. From then on
+        // the wait is for the held peers alone.
+        let mut cut: Cut = None;
         let wait = tracing::info_span!(
             "trail.push.wait",
             budget_ms = budget.as_millis() as u64,
             ended = tracing::field::Empty,
             events = tracing::field::Empty,
             pending = tracing::field::Empty,
+            settled_ms = tracing::field::Empty,
+            held = tracing::field::Empty,
+            held_finished = tracing::field::Empty,
         );
         let mut events_seen: u64 = 0;
         let mut ended = "all-reported";
         let waited = async {
-            while !pending.is_empty() {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    ended = "deadline";
+            loop {
+                let waiting_for = match &cut {
+                    None => pending.len(),
+                    Some(marks) => pending
+                        .iter()
+                        .filter(|peer| marks.get(*peer) == Some(&true))
+                        .count(),
+                };
+                if waiting_for == 0 {
+                    if cut.is_some() {
+                        // Every held peer answered; the ones let go still had not.
+                        ended = if pending.is_empty() {
+                            "all-reported"
+                        } else {
+                            "held"
+                        };
+                    }
                     break;
                 }
-                let next = timeout(remaining, events.next()).await;
-                events_seen += 1;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let next = if remaining.is_zero() {
+                    None
+                } else {
+                    let next = timeout(remaining, events.next()).await;
+                    events_seen += 1;
+                    next.ok()
+                };
                 match next {
-                    Ok(Some(Ok(LiveEvent::SyncFinished(ev)))) => {
+                    Some(Some(Ok(LiveEvent::NeighborUp(peer)))) => {
+                        neighbours.insert(*peer.as_bytes());
+                        continue;
+                    }
+                    Some(Some(Ok(LiveEvent::SyncFinished(ev)))) => {
                         let peer = *ev.peer.as_bytes();
                         let latency_ms = started_at.elapsed().as_millis() as u64;
                         // A peer this push did not dial can still report — the live engine may be
@@ -1640,7 +2008,13 @@ impl TrailDocs {
                                     outcome: PeerOutcome::Finished,
                                     latency_ms: Some(latency_ms),
                                     entries_sent: sent,
+                                    held_at_cut: None,
                                 });
+                                if settled_ms.is_none() && settle_on.contains(&peer) {
+                                    settled_ms = Some(latency_ms);
+                                    report.settled_by = Some(peer);
+                                    deadline = settled_deadline(deadline, Instant::now());
+                                }
                             }
                             Err(err) => {
                                 // One unreachable peer isn't the end of the exchange — keep waiting
@@ -1657,39 +2031,90 @@ impl TrailDocs {
                                     outcome: PeerOutcome::Failed,
                                     latency_ms: Some(latency_ms),
                                     entries_sent: 0,
+                                    held_at_cut: None,
                                 });
                             }
                         }
+                        continue;
                     }
-                    Ok(Some(Ok(_))) => continue,
-                    Ok(Some(Err(err))) => {
+                    Some(Some(Ok(_))) => continue,
+                    Some(Some(Err(err))) => {
                         ended = "stream-error";
                         return Err(err);
                     }
-                    // Stream ended, or the deadline passed. Either way the peers still
-                    // in `pending` never spoke. The namespace stays marked syncing, so later writes in
-                    // this process broadcast — we just cannot confirm them here.
-                    Ok(None) => {
+                    // Stream ended. The peers still in `pending` never spoke. The namespace stays
+                    // marked syncing, so later writes in this process broadcast — we just cannot
+                    // confirm them here.
+                    Some(None) => {
                         ended = "stream-ended";
                         break;
                     }
-                    Err(_) => {
-                        ended = "deadline";
-                        break;
+                    // The deadline passed.
+                    None => {}
+                }
+                // Without a settle, or once a hold has run to the original deadline, that is the
+                // end. When it is the settle grace that ran out, hold whoever looks awake.
+                if settled_ms.is_none() {
+                    ended = "deadline";
+                    break;
+                }
+                if cut.is_some() || deadline >= full_deadline {
+                    ended = "settled";
+                    break;
+                }
+                let mut connected = std::collections::HashSet::new();
+                if let Some(endpoint) = liveness {
+                    for peer in &pending {
+                        if has_open_path(endpoint, *peer).await {
+                            connected.insert(*peer);
+                        }
                     }
                 }
+                let held = hold_at_cut(&pending, &neighbours, &connected);
+                cut = Some(
+                    pending
+                        .iter()
+                        .map(|peer| (*peer, held.contains(peer)))
+                        .collect(),
+                );
+                if held.is_empty() {
+                    ended = "settled";
+                    break;
+                }
+                deadline = full_deadline;
             }
             anyhow::Ok(())
         }
         .instrument(wait.clone())
         .await;
         wait.record("ended", ended);
+        if let Some(ms) = settled_ms {
+            wait.record("settled_ms", ms);
+        }
         wait.record("events", events_seen);
         wait.record("pending", pending.len() as u64);
+        if let Some(marks) = &cut {
+            let held: Vec<&[u8; 32]> = marks
+                .iter()
+                .filter(|(_, held)| **held)
+                .map(|(peer, _)| peer)
+                .collect();
+            let held_finished = held
+                .iter()
+                .filter(|peer| {
+                    report
+                        .per_peer
+                        .iter()
+                        .any(|row| &row.peer == **peer && row.outcome == PeerOutcome::Finished)
+                })
+                .count();
+            wait.record("held", held.len() as u64);
+            wait.record("held_finished", held_finished as u64);
+        }
         waited?;
 
         let outstanding: Vec<[u8; 32]> = pending.into_iter().collect();
-        report.per_peer = finish_outcomes(report.per_peer, &outstanding);
+        report.per_peer = finish_outcomes(report.per_peer, &outstanding, &carriers, &cut);
         Ok(Some(report))
     }
 
@@ -2088,6 +2513,7 @@ pub(crate) mod tests {
             outcome: PeerOutcome::Finished,
             latency_ms: Some(latency_ms),
             entries_sent: entries,
+            held_at_cut: None,
         }
     }
 
@@ -2097,7 +2523,7 @@ pub(crate) mod tests {
         // `None` here and threw the whole push away.
         let a = [0xaau8; 32];
         let b = [0xbbu8; 32];
-        let out = finish_outcomes(Vec::new(), &[a, b]);
+        let out = finish_outcomes(Vec::new(), &[a, b], &[], &None);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|p| p.outcome == PeerOutcome::Silent));
         assert!(out.iter().all(|p| p.latency_ms.is_none()));
@@ -2106,7 +2532,7 @@ pub(crate) mod tests {
     #[test]
     fn answered_peers_keep_their_latency_and_entries() {
         let peer = [0x07u8; 32];
-        let out = finish_outcomes(vec![finished(peer, 913, 3)], &[]);
+        let out = finish_outcomes(vec![finished(peer, 913, 3)], &[], &[], &None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].latency_ms, Some(913));
         assert_eq!(out[0].entries_sent, 3);
@@ -2122,6 +2548,8 @@ pub(crate) mod tests {
         let out = finish_outcomes(
             vec![finished(stash, 800, 1), finished(awake, 1_100, 1)],
             &[asleep],
+            &[],
+            &None,
         );
         assert_eq!(out.len(), 3);
         let mut peers: Vec<[u8; 32]> = out.iter().map(|p| p.peer).collect();
@@ -2147,6 +2575,86 @@ pub(crate) mod tests {
         assert_eq!(PeerOutcome::Finished.as_str(), "finished");
         assert_eq!(PeerOutcome::Failed.as_str(), "failed");
         assert_eq!(PeerOutcome::Silent.as_str(), "silent");
+        assert_eq!(PeerOutcome::Unwaited.as_str(), "unwaited");
+    }
+
+    #[test]
+    fn the_cut_holds_only_friends_that_look_awake() {
+        let connected = [0x01u8; 32];
+        let neighbour = [0x02u8; 32];
+        let asleep = [0x03u8; 32];
+        let pending: std::collections::HashSet<[u8; 32]> =
+            [connected, neighbour, asleep].into_iter().collect();
+        let held = hold_at_cut(
+            &pending,
+            &[neighbour].into_iter().collect(),
+            &[connected].into_iter().collect(),
+        );
+        let expected: std::collections::HashSet<[u8; 32]> =
+            [connected, neighbour].into_iter().collect();
+        assert_eq!(held, expected);
+        // Signals about peers that already answered change nothing.
+        let none = hold_at_cut(
+            &[asleep].into_iter().collect(),
+            &[neighbour].into_iter().collect(),
+            &[connected].into_iter().collect(),
+        );
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn rows_say_who_was_held_and_who_was_let_go() {
+        // The grace ran out with `held` connected and `gone` not; `held` then finished inside
+        // the hold, `gone` never answered. A peer that answered before the cut has no mark.
+        let early = [0x10u8; 32];
+        let held = [0x20u8; 32];
+        let gone = [0x30u8; 32];
+        let cut: Cut = Some([(held, true), (gone, false)].into_iter().collect());
+        let out = finish_outcomes(
+            vec![finished(early, 300, 1), finished(held, 9_000, 1)],
+            &[gone],
+            &[],
+            &cut,
+        );
+        let mark = |peer| out.iter().find(|p| p.peer == peer).unwrap().held_at_cut;
+        assert_eq!(mark(early), None);
+        assert_eq!(mark(held), Some(true));
+        assert_eq!(mark(gone), Some(false));
+    }
+
+    #[test]
+    fn an_unwaited_carrier_is_a_row_whether_or_not_it_answered() {
+        // A repeater that answered inside the wait keeps its answer; one that did not is
+        // `unwaited`, never `silent` — nothing waited on it — and never dropped, or a repeater's
+        // answer rate has no denominator.
+        let stash = [0x10u8; 32];
+        let quick = [0x40u8; 32];
+        let asleep = [0x50u8; 32];
+        let out = finish_outcomes(
+            vec![finished(stash, 300, 1), finished(quick, 900, 1)],
+            &[],
+            &[quick, asleep],
+            &None,
+        );
+        assert_eq!(out.len(), 3, "the answering carrier is not counted twice");
+        let row = |peer| out.iter().find(|p| p.peer == peer).unwrap().outcome;
+        assert_eq!(row(quick), PeerOutcome::Finished);
+        assert_eq!(row(asleep), PeerOutcome::Unwaited);
+        assert!(out.iter().all(|p| p.outcome != PeerOutcome::Silent));
+    }
+
+    #[test]
+    fn the_stash_settling_cuts_the_wait_for_friends_to_the_grace() {
+        let now = Instant::now();
+        let far = now + Duration::from_secs(30);
+        assert_eq!(settled_deadline(far, now), now + PUSH_GRACE_AFTER_SETTLE);
+    }
+
+    #[test]
+    fn the_stash_settling_never_extends_a_deadline() {
+        let now = Instant::now();
+        let near = now + Duration::from_millis(500);
+        assert_eq!(settled_deadline(near, now), near);
     }
 
     #[test]
@@ -2739,6 +3247,77 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_repeater_that_answers_settles_a_push_held_by_an_asleep_friend() -> Result<()> {
+        // The repeater-only phone (no stash): before carriers could settle a push, every push
+        // waited its whole budget on friends' phones in pockets.
+        let dir = scratch_dir("carrier-settles");
+        let (writer_endpoint, writer_docs, writer_blobs, writer_router) =
+            replication_peer().await?;
+        let (carrier_endpoint, carrier_docs, _carrier_blobs, carrier_router) =
+            replication_peer().await?;
+        // An endpoint that is up and never accepts anything: the friend asleep in a pocket.
+        let asleep = Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await?;
+        let writer = TrailDocs::init(writer_docs, writer_blobs, dir.clone(), None, None).await?;
+        let ns = writer.own_namespace();
+        writer
+            .doc_for(ns)
+            .await?
+            .set_bytes(
+                writer.author,
+                encode_key(writer_endpoint.id().as_bytes()),
+                b"sealed fix".to_vec(),
+            )
+            .await?;
+        let ticket: iroh_docs::DocTicket = writer.read_ticket(ns).await?.parse()?;
+        carrier_docs
+            .import_namespace(ticket.capability)
+            .await?
+            .start_sync(Vec::new())
+            .await?;
+
+        let carrier = *carrier_endpoint.id().as_bytes();
+        let started = Instant::now();
+        let report = tokio::time::timeout(
+            Duration::from_secs(20),
+            writer.push(
+                ns,
+                vec![asleep.addr()],
+                vec![carrier_endpoint.addr()],
+                Duration::from_secs(30),
+                &[carrier],
+                // No liveness probe: whether a path to an endpoint that never accepts counts as
+                // open is iroh's business, and this test is about the carrier settling.
+                None,
+            ),
+        )
+        .await??
+        .expect("the push reports");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a carrier's finish must cut the wait to the grace"
+        );
+        assert_eq!(report.settled_by, Some(carrier));
+        let row = |peer: [u8; 32]| {
+            report
+                .per_peer
+                .iter()
+                .find(|p| p.peer == peer)
+                .map(|p| p.outcome)
+        };
+        assert_eq!(row(carrier), Some(PeerOutcome::Finished));
+        assert_eq!(row(*asleep.id().as_bytes()), Some(PeerOutcome::Silent));
+
+        asleep.close().await;
+        writer_router.shutdown().await?;
+        carrier_router.shutdown().await?;
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_unwaited_carrier_is_scheduled_without_holding_the_push() -> Result<()> {
         let dir = scratch_dir("unwaited-carrier");
         let (writer_endpoint, writer_docs, writer_blobs, writer_router) =
@@ -2756,7 +3335,7 @@ pub(crate) mod tests {
         let reader_doc = reader_docs.import_namespace(ticket.capability).await?;
         reader_doc.start_sync(Vec::new()).await?;
 
-        // Nothing is waited for, so the push returns at once with nothing reported...
+        // Nothing is waited for, so the push returns at once, with the carrier as an unwaited row...
         let report = tokio::time::timeout(
             Duration::from_secs(3),
             writer.push(
@@ -2764,11 +3343,15 @@ pub(crate) mod tests {
                 Vec::new(),
                 vec![reader_endpoint.addr()],
                 Duration::from_secs(30),
+                &[],
+                None,
             ),
         )
         .await??
         .expect("a push with only unwaited carriers still reports");
-        assert!(report.per_peer.is_empty());
+        assert_eq!(report.per_peer.len(), 1);
+        assert_eq!(report.per_peer[0].outcome, PeerOutcome::Unwaited);
+        assert_eq!(report.settled_by, None);
 
         // ...and the carrier still receives the entry and its bytes.
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -2828,6 +3411,8 @@ pub(crate) mod tests {
                 Vec::new(),
                 vec![carrier_endpoint.addr()],
                 Duration::from_secs(30),
+                &[],
+                None,
             )
             .await?;
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -3551,6 +4136,44 @@ pub(crate) mod tests {
         for dir in [a_dir, r_dir] {
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn a_stranded_fetch_is_retried_by_the_next_pull_then_backs_off_to_a_cap() {
+        let mins = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(stranded_retry_delay(0), Duration::ZERO);
+        assert_eq!(
+            stranded_retry_delay(1),
+            Duration::ZERO,
+            "bytes may land any moment"
+        );
+        assert_eq!(stranded_retry_delay(2), mins(15));
+        assert_eq!(stranded_retry_delay(3), mins(30));
+        assert_eq!(stranded_retry_delay(4), mins(60));
+        assert_eq!(stranded_retry_delay(6), mins(240));
+        assert_eq!(stranded_retry_delay(7), mins(360), "capped at six hours");
+        assert_eq!(stranded_retry_delay(u32::MAX), mins(360));
+    }
+
+    #[test]
+    fn stranded_backoff_defers_a_failing_hash_and_forgets_one_no_longer_stranded() {
+        let backoff = StrandedBackoff::default();
+        let (a, b) = (Hash::new(b"a"), Hash::new(b"b"));
+        let t0 = Instant::now();
+        assert!(backoff.due(&a, t0), "an unknown hash is always due");
+
+        assert_eq!(backoff.failed(a, t0), Duration::ZERO);
+        assert!(backoff.due(&a, t0), "one failure: the next pull asks again");
+        let delay = backoff.failed(a, t0);
+        assert_eq!(delay, Duration::from_secs(15 * 60));
+        assert!(!backoff.due(&a, t0 + Duration::from_secs(60)));
+        assert!(backoff.due(&a, t0 + delay));
+        assert!(backoff.due(&b, t0), "other hashes are unaffected");
+
+        // Fetched or superseded: dropped, so the same bytes stranded again start from scratch.
+        backoff.retain(|h| *h == b);
+        assert!(backoff.due(&a, t0));
+        assert_eq!(backoff.failed(a, t0), Duration::ZERO);
     }
 
     #[test]

@@ -206,6 +206,28 @@ export const REVIVE_FENCE_REGION_ID = 'streetcryptid.revive';
  */
 export const REVIVE_FENCE_RADIUS_M = 200;
 
+/**
+ * Android's radius. There the fence only has to catch a phone whose location service died and that
+ * then went somewhere: it grants the exemption to start a foreground service from the background
+ * and is no resurrection mechanism. Android also fixes a parked phone from Wi-Fi and cell towers at
+ * night, hundreds of metres off, so at 200 m a phone sitting on a nightstand left its own fence
+ * every minute or two. On 2026-11-21 the Pixel 10 had 590 exits a day, each running a headless JS
+ * self-heal and a re-centre, and 1,160 enter events a day on top. Every one was a JS context start
+ * and a telemetry flush.
+ */
+export const REVIVE_FENCE_RADIUS_ANDROID_M = 1000;
+
+/** The radius this platform arms. */
+export function reviveFenceRadiusM(): number {
+  return Platform.OS === 'android' ? REVIVE_FENCE_RADIUS_ANDROID_M : REVIVE_FENCE_RADIUS_M;
+}
+
+/**
+ * The worst accuracy a re-centre may use. A coarse fix puts the centre where the phone is not, and
+ * being "outside" a fence the phone never left is what makes it fire again at once.
+ */
+export const REVIVE_FENCE_MAX_CENTRE_ACCURACY_M = 100;
+
 let armKv: PersistentKV | null | undefined;
 
 /**
@@ -311,6 +333,8 @@ export type ReviveArmOutcome =
   | 'armed'
   /** Refused by the re-arm floor; the previous fence still stands, which is a working tripwire. */
   | 'throttled'
+  /** A re-centre on a fix too coarse to place a fence; the previous fence still stands. */
+  | 'imprecise'
   /**
    * The OS has no handler registered for the fence task, so arming would succeed and deliver
    * nothing. The one outcome that looks identical to success from the call site.
@@ -345,7 +369,7 @@ function recordArm(
         outcome,
         armed,
         forced: options.force === true,
-        radius_m: REVIVE_FENCE_RADIUS_M,
+        radius_m: reviveFenceRadiusM(),
         platform: Platform.OS,
         // Absent when armed, so the drop queries show only the attempts that left no tripwire.
         ...(armed ? {} : { 'sc.drop_reason': `revive-${outcome}` }),
@@ -385,6 +409,9 @@ export async function armReviveFence(
   // Persisted, not in-memory: every arm can wake a fresh process, so an in-process timestamp would
   // reset exactly when the throttle is needed most.
   const kv = tryKv();
+  if (!options.force && fix.accuracyM > REVIVE_FENCE_MAX_CENTRE_ACCURACY_M) {
+    return recordArm('imprecise', options, { accuracy_m: Math.round(fix.accuracyM) });
+  }
   if (!options.force && kv) {
     const last = parseLastArm(await kv.get(LAST_ARM_KEY).catch(() => null));
     if (last !== null && armedAt - last.at < REVIVE_FENCE_MIN_REARM_MS) {
@@ -392,7 +419,7 @@ export async function armReviveFence(
       // moved clear of the standing fence is a real crossing, and refusing it would leave the
       // tripwire behind the user — the exact failure the fence exists to prevent.
       const moved = metresBetween(last.lat, last.lon, fix.lat, fix.lon);
-      if (moved < REVIVE_FENCE_RADIUS_M) {
+      if (moved < reviveFenceRadiusM()) {
         return recordArm('throttled', options, {
           since_last_ms: armedAt - last.at,
           moved_m: Math.round(moved),
@@ -406,7 +433,7 @@ export async function armReviveFence(
         identifier: REVIVE_FENCE_REGION_ID,
         latitude: fix.lat,
         longitude: fix.lon,
-        radius: REVIVE_FENCE_RADIUS_M,
+        radius: reviveFenceRadiusM(),
         // Exit only. Entry would fire every time the user came home, waking the app to do nothing.
         //
         // On iOS this is necessary but NOT sufficient: the flags are ignored by the state-

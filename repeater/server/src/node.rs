@@ -74,6 +74,10 @@ use crate::repeater::{Repeater, RepeaterProtocol};
 use crate::retention::{release_decisions, RetentionEntry, RetentionPolicy};
 use crate::subscriptions::{NamespaceId as NsBytes, NamespaceRegistry, PushSubscription};
 use crate::waker::{NoopWaker, Waker};
+use streetcryptid_repeater::stash_batch::{
+    decode_request, encode_response, entry_cost, BatchEntry, BatchRequest, BatchResponse,
+    PublishStatus, BATCH_CONTENT_TYPE, BATCH_PATH, MAX_RESPONSE_BYTES,
+};
 
 /// How often the settle loop re-checks whether pushed/downloaded bytes have landed.
 const SETTLE_INTERVAL_MS: u64 = 250;
@@ -279,18 +283,35 @@ impl StashNode {
         delivery: Arc<dyn DeliveryService>,
         waker: Arc<dyn Waker>,
     ) -> Result<Arc<Self>> {
-        // The repeater signs its certs with the key it answers dials with.
-        let seed = secret.to_bytes();
-        let mut endpoint_builder =
-            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret);
-        if !relay_urls.is_empty() {
+        let relays = if !relay_urls.is_empty() {
             let relay_map = RelayMap::try_from_iter(relay_urls.iter().map(String::as_str))
                 .map_err(|e| anyhow!("invalid custom relay URL: {e}"))?;
             let relay_map = match relay_token {
                 Some(token) => relay_map.with_auth_token(token),
                 None => relay_map,
             };
-            endpoint_builder = endpoint_builder.relay_mode(RelayMode::Custom(relay_map));
+            Some(relay_map)
+        } else {
+            None
+        };
+        Self::spawn_with_relays(storage, secret, retention, relays, delivery, waker).await
+    }
+
+    /// [`Self::spawn_with`] with independently authenticated relay entries. `None` preserves
+    /// the N0 preset; desktop settings supply a map without changing the server's env contract.
+    pub async fn spawn_with_relays(
+        storage: Storage,
+        secret: SecretKey,
+        retention: RetentionPolicy,
+        relays: Option<RelayMap>,
+        delivery: Arc<dyn DeliveryService>,
+        waker: Arc<dyn Waker>,
+    ) -> Result<Arc<Self>> {
+        let seed = secret.to_bytes();
+        let mut endpoint_builder =
+            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret);
+        if let Some(relays) = relays {
+            endpoint_builder = endpoint_builder.relay_mode(RelayMode::Custom(relays));
         }
         let endpoint = endpoint_builder
             .bind()
@@ -1125,6 +1146,129 @@ impl StashNode {
         self.handles.lock().await.get(&ns).cloned()
     }
 
+    /// `POST /v1/batch`: take a phone's publishes and answer its whole pull in one request (see
+    /// `streetcryptid_repeater::stash_batch`). Entries go into the replica through the same insert
+    /// a sync uses, so the namespace watcher tracks and wakes for them as for any other arrival;
+    /// their bytes go into the blob store first, so nothing is fetched back.
+    #[tracing::instrument(
+        name = "stash.batch",
+        skip_all,
+        fields(
+            batch.publish = request.publish.len(),
+            batch.pull = request.pull.len(),
+            batch.stored = tracing::field::Empty,
+            batch.entries_out = tracing::field::Empty,
+            batch.bytes_out = tracing::field::Empty,
+            batch.truncated = tracing::field::Empty,
+        )
+    )]
+    pub async fn batch(&self, request: BatchRequest) -> BatchResponse {
+        let mut response = BatchResponse::default();
+        for item in request.publish {
+            let status = self.batch_publish(item).await;
+            response.published.push(status);
+        }
+        let mut budget = MAX_RESPONSE_BYTES;
+        'namespaces: for cursor in request.pull {
+            if !self.registry.is_known(&cursor.namespace) {
+                continue;
+            }
+            let Some(doc) = self.handle(cursor.namespace).await else {
+                continue;
+            };
+            let Ok(stream) = doc
+                .get_many_signed(Query::single_latest_per_key().build())
+                .await
+            else {
+                continue;
+            };
+            tokio::pin!(stream);
+            while let Some(Ok(signed)) = stream.next().await {
+                let entry = signed.entry();
+                if entry.timestamp() <= cursor.since_us || entry.content_len() == 0 {
+                    continue;
+                }
+                let Some(content) = self
+                    .content_bytes(&cursor.namespace, entry.content_hash())
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(encoded) = postcard::to_allocvec(&signed) else {
+                    continue;
+                };
+                let item = BatchEntry {
+                    namespace: cursor.namespace,
+                    entry: encoded,
+                    content,
+                };
+                let cost = entry_cost(&item);
+                if cost > budget {
+                    response.truncated = true;
+                    break 'namespaces;
+                }
+                budget -= cost;
+                response.entries.push(item);
+            }
+        }
+        let current = tracing::Span::current();
+        current.record(
+            "batch.stored",
+            response
+                .published
+                .iter()
+                .filter(|s| **s == PublishStatus::Stored)
+                .count(),
+        );
+        current.record("batch.entries_out", response.entries.len());
+        current.record("batch.bytes_out", MAX_RESPONSE_BYTES - budget);
+        current.record("batch.truncated", response.truncated);
+        response
+    }
+
+    async fn batch_publish(&self, item: BatchEntry) -> PublishStatus {
+        if !self.registry.is_known(&item.namespace) {
+            return PublishStatus::UnknownNamespace;
+        }
+        let Ok(signed) = postcard::from_bytes::<iroh_docs::SignedEntry>(&item.entry) else {
+            return PublishStatus::Invalid;
+        };
+        let entry = signed.entry();
+        if entry.namespace().to_bytes() != item.namespace
+            || entry.content_len() != item.content.len() as u64
+            || Hash::new(&item.content) != entry.content_hash()
+        {
+            return PublishStatus::Invalid;
+        }
+        let Some(doc) = self.handle(item.namespace).await else {
+            return PublishStatus::UnknownNamespace;
+        };
+        let hash = entry.content_hash();
+        match self.blobs.blobs().add_bytes(item.content).await {
+            Ok(tag) if tag.hash == hash => {}
+            Ok(_) => return PublishStatus::Invalid,
+            Err(_) => return PublishStatus::Failed,
+        }
+        // Delivered by nobody we can name: the caller is an HTTP client, not an endpoint. Our own
+        // id keeps the replica's bookkeeping valid, and with the bytes already here nothing is
+        // ever fetched from it.
+        match doc
+            .insert_remote(signed, *self.endpoint.id().as_bytes(), true)
+            .await
+        {
+            Ok(()) => PublishStatus::Stored,
+            Err(error) => {
+                let message = error.to_string();
+                tracing::debug!(%message, "stash.batch: entry refused");
+                if message.contains("validation") || message.contains("signature") {
+                    PublishStatus::Invalid
+                } else {
+                    PublishStatus::Failed
+                }
+            }
+        }
+    }
+
     /// Watch for the bytes behind replicated entries to land — whether pushed by the writer or
     /// pulled by the docs engine's downloader — and wake subscribers once the stash can actually
     /// serve the entry.
@@ -1621,6 +1765,7 @@ impl StashNode {
                 "/v1/namespaces/:id/content/:hash",
                 get(content_handler).put(put_content_handler),
             )
+            .route(BATCH_PATH, post(batch_handler))
             // route_layer applies ONLY to the routes above, not to /healthz added after.
             .route_layer(middleware::from_fn_with_state(psk, psk_guard))
             .route("/healthz", get(healthz))
@@ -1758,6 +1903,20 @@ async fn put_content_handler(
         }
         Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
     }
+}
+
+async fn batch_handler(State(node): State<Arc<StashNode>>, body: Bytes) -> impl IntoResponse {
+    let request = match decode_request(&body) {
+        Ok(request) => request,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let response = node.batch(request).await;
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, BATCH_CONTENT_TYPE)],
+        encode_response(&response),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -2122,6 +2281,92 @@ mod live_tests {
             .await?
             .to_string();
         Ok((ticket, endpoint, router))
+    }
+
+    /// A writer's entry goes in through `POST /v1/batch` and comes back out of it to a reader,
+    /// with no QUIC between the stash and either phone, and an entry whose bytes do not match its
+    /// hash is refused.
+    #[tokio::test]
+    async fn the_batch_takes_a_publish_and_serves_it_to_a_pull() -> anyhow::Result<()> {
+        use streetcryptid_repeater::stash_batch::{
+            BatchEntry, BatchRequest, PublishStatus, PullCursor, BATCH_VERSION,
+        };
+        let writer = spawn_writer_node(61).await?;
+        let stash = StashNode::spawn(
+            SecretKey::from_bytes(&[62u8; 32]),
+            RetentionPolicy::from_hours(48),
+            &[],
+            None,
+            default_delivery(),
+            default_waker(),
+        )
+        .await?;
+        let ns = stash.register(&writer.ticket, None).await?;
+
+        let stream = writer.doc.get_many_signed(Query::all().build()).await?;
+        tokio::pin!(stream);
+        let signed = stream.next().await.expect("the writer holds one entry")?;
+        let content = b"opaque-sealed-envelope".to_vec();
+        let good = BatchEntry {
+            namespace: ns,
+            entry: postcard::to_allocvec(&signed)?,
+            content,
+        };
+        let mut tampered = good.clone();
+        tampered.content = b"not what the hash says".to_vec();
+        let mut elsewhere = good.clone();
+        elsewhere.namespace = [9u8; 32];
+
+        let answer = stash
+            .batch(BatchRequest {
+                v: BATCH_VERSION,
+                publish: vec![tampered, elsewhere, good.clone()],
+                pull: Vec::new(),
+            })
+            .await;
+        assert_eq!(
+            answer.published,
+            vec![
+                PublishStatus::Invalid,
+                PublishStatus::UnknownNamespace,
+                PublishStatus::Stored
+            ]
+        );
+
+        // The watcher marks the bytes servable as the insert lands; give it a moment.
+        let mut served = Vec::new();
+        for _ in 0..100 {
+            served = stash
+                .batch(BatchRequest {
+                    v: BATCH_VERSION,
+                    publish: Vec::new(),
+                    pull: vec![PullCursor {
+                        namespace: ns,
+                        since_us: 0,
+                    }],
+                })
+                .await
+                .entries;
+            if !served.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(served, vec![good]);
+
+        // A reader that already holds it is sent nothing.
+        let caught_up = stash
+            .batch(BatchRequest {
+                v: BATCH_VERSION,
+                publish: Vec::new(),
+                pull: vec![PullCursor {
+                    namespace: ns,
+                    since_us: signed.entry().timestamp(),
+                }],
+            })
+            .await;
+        assert!(caught_up.entries.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

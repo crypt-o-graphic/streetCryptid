@@ -38,4 +38,8 @@ dependencies {
   implementation "net.java.dev.jna:jna:5.14.0@aar"
   implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1"
   implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
+  // Fused location, activity recognition and geofencing (BackgroundLocationService). The same
+  // version expo-location already brings; every use is behind `PlayServices.available`, so a phone
+  // without Google Play services falls back to the platform provider and still shares.
+  implementation "com.google.android.gms:play-services-location:21.0.1"
 }

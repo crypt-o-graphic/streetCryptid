@@ -10,7 +10,7 @@ replicaCount: 1
 
 image:
   # CI publishes to ghcr.io/<owner>/trail-stash. Override with your own registry/owner.
-  repository: ghcr.io/unrealjune/trail-stash
+  repository: ghcr.io/crypt-o-graphic/trail-stash
   # Pin to an immutable tag (a git sha, e.g. sha-abc1234, or a semver) in production.
   # Defaults to the chart's appVersion when left empty.
   tag: ''

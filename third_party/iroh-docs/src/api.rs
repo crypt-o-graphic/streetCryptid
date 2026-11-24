@@ -29,9 +29,9 @@ use self::{
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
         GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveRequest, ListRequest, OpenRequest, SetDownloadPolicyRequest,
-        SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest,
-        SubscribeRequest,
+        ImportRequest, InsertRemoteRequest, LeaveRequest, ListRequest, OpenRequest,
+        SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
+        StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -39,6 +39,7 @@ use crate::{
     engine::{Engine, LiveEvent},
     store::{DownloadPolicy, Query},
     Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
+    SignedEntry,
 };
 
 pub(crate) mod actor;
@@ -95,6 +96,7 @@ impl DocsApi {
                     DocsProtocol::SetHash(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Get(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetExact(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::InsertRemote(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ImportFile(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ExportFile(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Del(msg) => local.send((msg, tx)).await,
@@ -409,6 +411,53 @@ impl Doc {
             Ok(Err(err)) => Err(err.into()),
             Ok(Ok(res)) => Ok(res.into()),
         }))
+    }
+
+    /// [`Self::get_many`] with each entry's signatures kept (streetCryptid): what another replica
+    /// needs to accept it through [`Self::insert_remote`].
+    pub async fn get_many_signed(
+        &self,
+        query: impl Into<Query>,
+    ) -> Result<impl Stream<Item = Result<SignedEntry>>> {
+        self.ensure_open()?;
+        let stream = self
+            .inner
+            .server_streaming(
+                GetManyRequest {
+                    doc_id: self.namespace_id,
+                    query: query.into(),
+                },
+                64,
+            )
+            .await?;
+        Ok(stream.into_stream().map(|res| match res {
+            Err(err) => Err(err.into()),
+            Ok(Err(err)) => Err(err.into()),
+            Ok(Ok(res)) => Ok(res),
+        }))
+    }
+
+    /// Insert an entry another replica signed, as a sync would, recording `from` as the peer that
+    /// delivered it (streetCryptid). The replica verifies both signatures and keeps only the
+    /// newer of two entries for a key, exactly as for an entry that arrived by reconciliation, and
+    /// subscribers see it as `InsertRemote`. Put its content in the blob store FIRST and pass
+    /// `content_complete`, or the engine queues a download from `from`.
+    pub async fn insert_remote(
+        &self,
+        entry: SignedEntry,
+        from: [u8; 32],
+        content_complete: bool,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        self.inner
+            .rpc(InsertRemoteRequest {
+                doc_id: self.namespace_id,
+                entry,
+                from,
+                content_complete,
+            })
+            .await??;
+        Ok(())
     }
 
     /// Returns a single entry.
