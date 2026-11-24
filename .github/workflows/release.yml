@@ -62,6 +62,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      # The bump commit's `license/cla` status (see "Commit and tag the release").
+      statuses: write
     outputs:
       release: ${{ steps.resolve.outputs.release }}
       version: ${{ steps.resolve.outputs.version }}
@@ -183,6 +185,29 @@ jobs:
           # instead (a lightweight tag on the same commit; next-version.sh and `gh release` read
           # either kind), so a tag refusal can no longer cost a release.
           base="$(git rev-parse origin/main)"
+          # The "Require signed CLA" ruleset wants a `license/cla` status on every commit that
+          # reaches main, and CLA Assistant only posts one on pull requests, so the bump commit was
+          # refused (GH013) on every run from 2026-11-21. The ruleset does not pin the status to an
+          # app, so this job posts it itself -- but only on a commit that is exactly this
+          # workflow's bump: one commit on top of main, touching nothing but the two manifests.
+          # A status needs the commit on GitHub first, hence the parking branch; no workflow runs
+          # on pushes to it.
+          if [[ "$(git rev-parse HEAD)" != "$base" ]]; then
+            if [[ "$(git rev-parse HEAD^)" != "$base" ]] ||
+              [[ -n "$(git diff --name-only "$base" HEAD -- . ':!app.json' ':!package.json')" ]]; then
+              echo "The release commit is not a bare version bump on main; refusing to vouch for it." >&2
+              exit 1
+            fi
+            parking="release-pending/$TAG"
+            trap 'git push --quiet origin --delete "$parking" || true' EXIT
+            git push --force origin "HEAD:refs/heads/$parking"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$(git rev-parse HEAD)" \
+              -f state=success \
+              -f context=license/cla \
+              -f description='Version bump by github-actions[bot]; no contributor signature applies.' \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              > /dev/null
+          fi
           pushed=false
           for attempt in 1 2 3; do
             if git push --atomic origin HEAD:main "refs/tags/$TAG"; then
