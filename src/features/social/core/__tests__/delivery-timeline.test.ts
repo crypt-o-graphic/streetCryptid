@@ -77,7 +77,7 @@ describe('stash', () => {
   });
 
   it('names the server, so nobody has to infer that a third party is involved', () => {
-    expect(at('stash', 0.6).slab?.label).toBe('STASH SERVER');
+    expect(at('stash', 0.6).slab?.label).toBe('HOSTED REPEATER');
   });
 });
 
