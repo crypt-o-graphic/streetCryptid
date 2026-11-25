@@ -47,7 +47,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -56,10 +56,17 @@ use axum::{
 };
 use iroh::{protocol::Router, Endpoint, RelayMap, RelayMode, SecretKey};
 use iroh_blobs::{
+    api::{blobs::BlobStatus, TempTag},
     store::{fs::FsStore, mem::MemStore},
     BlobsProtocol, Hash,
 };
-use iroh_docs::{api::Doc, engine::LiveEvent, protocol::Docs, store::Query, DocTicket};
+use iroh_docs::{
+    api::Doc,
+    engine::LiveEvent,
+    protocol::Docs,
+    store::{DownloadPolicy, Query},
+    DocTicket,
+};
 use iroh_gossip::net::Gossip;
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_future::StreamExt;
@@ -69,6 +76,9 @@ use crate::api::{parse_namespace_hex, parse_platform, validate_register, Registe
 use crate::auth::{authorize, bearer_token};
 use crate::book::NamespaceBook;
 use crate::content::ContentIndex;
+use crate::limits::{
+    fetch_retry_delay_ms, pick_fetches, EvictionList, FetchCandidate, Limits, RecordLedger,
+};
 use crate::mls::{Admission, DeliveryService, EnvelopeRef, PassthroughDelivery};
 use crate::repeater::{Repeater, RepeaterProtocol};
 use crate::retention::{release_decisions, RetentionEntry, RetentionPolicy};
@@ -84,6 +94,27 @@ const SETTLE_INTERVAL_MS: u64 = 250;
 
 /// How long one content fetch attempt may run before the settle loop gives up and retries later.
 const FETCH_TIMEOUT_SECS: u64 = 20;
+
+/// How long asking one peer for a blob's verified size may take (dial included).
+const PROBE_TIMEOUT_SECS: u64 = 10;
+
+/// How long a blob uploaded over HTTP batch stays pinned by its temporary tag. The namespace
+/// watcher puts it on the content ledger within milliseconds of the insert; this only has to
+/// outlast that, and must stay well under the GC interval's worth of upload volume.
+const UPLOAD_PIN_MS: u64 = 60_000;
+
+/// Request body ceilings for the control API. The JSON routes carry a ticket (at most
+/// `api::MAX_TICKET_LEN`) or a push token (`api::MAX_TOKEN_LEN`); the batch carries up to
+/// `MAX_PUBLISH` small envelopes and stays at the 2 MiB axum applied implicitly until now, which
+/// every shipped phone already fits under. The content `PUT` is the configured entry cap.
+const JSON_BODY_LIMIT: usize = 16 * 1024;
+const BATCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Headroom over the entry cap for the content `PUT` (the body is the bytes, nothing else).
+const CONTENT_BODY_SLACK: usize = 1024;
+
+/// How many (namespace, limit) pairs are remembered for "already reported" before the set is
+/// cleared. Bounds the memory spent on deduplicating `stash.limit` spans.
+const LIMIT_NOTES_CAP: usize = 4096;
 
 /// How often the blob GC sweep reclaims ciphertext no unpruned entry references any more.
 /// Retention decides *when* an entry dies; this decides how promptly its bytes are freed.
@@ -154,6 +185,81 @@ pub enum PutOutcome {
     UntrackedHash,
     /// The body does not hash to the address in the URL. Never retryable as-is.
     HashMismatch,
+    /// Larger than [`Limits::max_entry_bytes`]. Never retryable as-is.
+    TooLarge,
+    /// Storing it would cross [`Limits::max_content_bytes`]. Retryable once retention frees room.
+    OverBudget,
+}
+
+/// Why a grant was refused by a limit rather than by a malformed ticket or a failed import.
+/// Carried inside the `anyhow::Error` so the control API can answer with the right status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GrantRefused {
+    /// The node holds [`Limits::max_namespaces`] already.
+    #[error("this stash holds as many namespaces as it is configured to; try again later")]
+    Full,
+    /// The namespace was evicted for breaching a limit, and its re-grant is refused for now.
+    #[error("this namespace was evicted for exceeding the stash's limits; try again later")]
+    Evicted,
+}
+
+/// What one content fetch came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchOutcome {
+    /// The bytes are in the store; this many of them.
+    Fetched(u64),
+    /// Nobody served them this time. `size` is the verified size if a peer told us.
+    Failed { size: Option<u64> },
+    /// The blob is larger than [`Limits::max_entry_bytes`] — proven, not claimed.
+    Oversized(u64),
+    /// Fetching it would cross [`Limits::max_content_bytes`]; retried later.
+    OverBudget(u64),
+}
+
+/// Counts of everything a limit refused, for `/healthz`. Monotonic for the process's life.
+#[derive(Debug, Default)]
+struct LimitCounters {
+    grants_refused: std::sync::atomic::AtomicU64,
+    entries_oversized: std::sync::atomic::AtomicU64,
+    keys_refused: std::sync::atomic::AtomicU64,
+    fetches_over_budget: std::sync::atomic::AtomicU64,
+    namespaces_evicted: std::sync::atomic::AtomicU64,
+}
+
+impl LimitCounters {
+    fn counter(&self, limit: LimitKind) -> &std::sync::atomic::AtomicU64 {
+        match limit {
+            LimitKind::Namespaces | LimitKind::Evicted => &self.grants_refused,
+            LimitKind::EntryBytes => &self.entries_oversized,
+            LimitKind::Keys => &self.keys_refused,
+            LimitKind::ContentBudget => &self.fetches_over_budget,
+            LimitKind::RecordBudget => &self.namespaces_evicted,
+        }
+    }
+}
+
+/// Which limit a `stash.limit` span reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LimitKind {
+    Namespaces,
+    Evicted,
+    EntryBytes,
+    Keys,
+    ContentBudget,
+    RecordBudget,
+}
+
+impl LimitKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Namespaces => "namespaces",
+            Self::Evicted => "evicted",
+            Self::EntryBytes => "entry_bytes",
+            Self::Keys => "keys_per_namespace",
+            Self::ContentBudget => "content_budget",
+            Self::RecordBudget => "record_budget",
+        }
+    }
 }
 
 /// Where a node keeps its replica.
@@ -199,6 +305,25 @@ pub struct StashNode {
     /// The node's own background tasks (settle loop, namespace watchers), aborted by
     /// [`StashNode::shutdown`] so their `Arc<Self>` clones release the on-disk stores.
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    /// What an untrusted granter can make this node hold. See [`crate::limits`].
+    limits: Limits,
+    /// Every record the replica holds, for the record budget and the per-namespace key cap.
+    records: std::sync::Mutex<RecordLedger>,
+    /// Namespaces evicted for breaching a limit, refused re-grant for a while.
+    evicted: std::sync::Mutex<EvictionList>,
+    /// Content fetches in flight, by hash, with the namespace each one counts against. A hash is
+    /// fetched once however many entries name it.
+    fetching: std::sync::Mutex<HashMap<Hash, NsBytes>>,
+    /// The fetch tasks themselves, so shutdown can abort them; finished ones are reaped by the
+    /// settle loop.
+    fetch_tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Temporary tags pinning HTTP-uploaded blobs until the watcher has put them on the ledger,
+    /// with when each may be released. See [`UPLOAD_PIN_MS`].
+    upload_pins: std::sync::Mutex<std::collections::VecDeque<(u64, TempTag)>>,
+    limit_counters: LimitCounters,
+    /// (namespace, limit) pairs already reported as a `stash.limit` span, so a namespace that
+    /// keeps breaching a limit reports it once rather than once per record.
+    limit_notes: std::sync::Mutex<HashSet<(NsBytes, LimitKind)>>,
     router: Router,
 }
 
@@ -223,20 +348,13 @@ struct TrackedEntry {
     /// Earliest time to retry the content fetch — exponential backoff so an author that is asleep
     /// for hours costs a couple of attempts, not thousands.
     next_attempt_ms: u64,
-    /// Consecutive failed fetches, used to grow the backoff.
+    /// Consecutive fetches started, used to grow the backoff ([`fetch_retry_delay_ms`]): quick
+    /// while the author may still be connected, then slow, so an entry nobody can serve costs a
+    /// dial every couple of hours rather than every minute.
     attempts: u32,
-}
-
-impl TrackedEntry {
-    /// Backoff schedule: retry quickly at first (the author is often still connected, finishing
-    /// its own sync), then back off toward a slow poll that costs nothing while it sleeps.
-    fn backoff_ms(attempts: u32) -> u64 {
-        const BASE_MS: u64 = 500;
-        const CEILING_MS: u64 = 60_000;
-        BASE_MS
-            .saturating_mul(1u64 << attempts.min(7))
-            .min(CEILING_MS)
-    }
+    /// The blob's size as a peer PROVED it (the last chunk, verified against the hash). Asked
+    /// once, before the first download, so an oversized blob is refused without fetching it.
+    verified_size: Option<u64>,
 }
 
 /// A docs entry reduced to the fields the prune sweep needs after the live stream is drained.
@@ -283,6 +401,32 @@ impl StashNode {
         delivery: Arc<dyn DeliveryService>,
         waker: Arc<dyn Waker>,
     ) -> Result<Arc<Self>> {
+        Self::spawn_with_limits(
+            storage,
+            secret,
+            retention,
+            relay_urls,
+            relay_token,
+            Limits::default(),
+            delivery,
+            waker,
+        )
+        .await
+    }
+
+    /// [`Self::spawn_with`] under explicit resource [`Limits`] (the binary's, from the
+    /// environment). Everything else runs under [`Limits::default`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_limits(
+        storage: Storage,
+        secret: SecretKey,
+        retention: RetentionPolicy,
+        relay_urls: &[String],
+        relay_token: Option<&str>,
+        limits: Limits,
+        delivery: Arc<dyn DeliveryService>,
+        waker: Arc<dyn Waker>,
+    ) -> Result<Arc<Self>> {
         let relays = if !relay_urls.is_empty() {
             let relay_map = RelayMap::try_from_iter(relay_urls.iter().map(String::as_str))
                 .map_err(|e| anyhow!("invalid custom relay URL: {e}"))?;
@@ -294,7 +438,10 @@ impl StashNode {
         } else {
             None
         };
-        Self::spawn_with_relays(storage, secret, retention, relays, delivery, waker).await
+        Self::spawn_with_relays_and_limits(
+            storage, secret, retention, relays, limits, delivery, waker,
+        )
+        .await
     }
 
     /// [`Self::spawn_with`] with independently authenticated relay entries. `None` preserves
@@ -304,6 +451,27 @@ impl StashNode {
         secret: SecretKey,
         retention: RetentionPolicy,
         relays: Option<RelayMap>,
+        delivery: Arc<dyn DeliveryService>,
+        waker: Arc<dyn Waker>,
+    ) -> Result<Arc<Self>> {
+        Self::spawn_with_relays_and_limits(
+            storage,
+            secret,
+            retention,
+            relays,
+            Limits::default(),
+            delivery,
+            waker,
+        )
+        .await
+    }
+
+    async fn spawn_with_relays_and_limits(
+        storage: Storage,
+        secret: SecretKey,
+        retention: RetentionPolicy,
+        relays: Option<RelayMap>,
+        limits: Limits,
         delivery: Arc<dyn DeliveryService>,
         waker: Arc<dyn Waker>,
     ) -> Result<Arc<Self>> {
@@ -433,6 +601,14 @@ impl StashNode {
             book,
             repeater,
             tasks: std::sync::Mutex::new(Vec::new()),
+            limits,
+            records: std::sync::Mutex::new(RecordLedger::new()),
+            evicted: std::sync::Mutex::new(EvictionList::default()),
+            fetching: std::sync::Mutex::new(HashMap::new()),
+            fetch_tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            upload_pins: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            limit_counters: LimitCounters::default(),
+            limit_notes: std::sync::Mutex::new(HashSet::new()),
             router,
         });
         if let Some(repeater) = &node.repeater {
@@ -476,8 +652,10 @@ impl StashNode {
         };
         let mut adopted = 0usize;
         for (_, grant) in &grants {
+            // Not capped: these are grants this node already acknowledged, and a cap lowered
+            // since must not make a repeater come back without some of them.
             let ns = self
-                .register_as(&grant.ticket, None, grant.granted_by.as_deref())
+                .register_inner(&grant.ticket, None, grant.granted_by.as_deref(), false)
                 .await
                 .map_err(|e| anyhow!("reopen a granted namespace: {e}"))?;
             if let Some(doc) = self.handle(ns).await {
@@ -505,12 +683,31 @@ impl StashNode {
         while let Some(entry) = stream.next().await {
             let entry = entry?;
             let hash = entry.content_hash();
-            let present = self.blobs.blobs().has(hash).await.unwrap_or(false);
+            // Counted like any arrival, but never evicted: these are grants already acknowledged.
+            let observed = self
+                .records
+                .lock()
+                .expect("record ledger poisoned")
+                .observe(
+                    ns,
+                    record_digest(&entry),
+                    entry.key().len(),
+                    entry.content_len() > 0,
+                    &self.limits,
+                );
+            if !observed.content_admitted || entry.content_len() > self.limits.max_entry_bytes {
+                continue;
+            }
+            let size = self.blob_size(hash).await;
+            if size.is_some_and(|size| size > self.limits.max_entry_bytes) {
+                continue;
+            }
+            let present = size.is_some();
             let observed_revision = {
                 let mut content = self.content.lock().expect("content index poisoned");
                 let revision = content.want(ns, *hash.as_bytes());
-                if present {
-                    content.mark_present(*hash.as_bytes());
+                if let Some(size) = size {
+                    content.mark_present_sized(*hash.as_bytes(), size);
                 }
                 revision
             };
@@ -545,6 +742,7 @@ impl StashNode {
                     woken: true,
                     next_attempt_ms: 0,
                     attempts: 0,
+                    verified_size: None,
                 });
         }
         Ok(adopted)
@@ -618,6 +816,10 @@ impl StashNode {
         for task in tasks {
             task.abort();
         }
+        self.fetch_tasks
+            .lock()
+            .expect("fetch tasks poisoned")
+            .abort_all();
         if let Err(e) = self.router.shutdown().await {
             tracing::warn!(error = %e, "stash: router did not shut down cleanly");
         }
@@ -798,9 +1000,88 @@ impl StashNode {
                 .expect("content index poisoned")
                 .forget_namespace(&ns);
             tracked.retain(|(namespace, _, _), _| *namespace != ns);
+            self.records
+                .lock()
+                .expect("record ledger poisoned")
+                .forget_namespace(&ns);
+            self.limit_notes
+                .lock()
+                .expect("limit notes poisoned")
+                .retain(|(namespace, _)| *namespace != ns);
         }
         tracing::info!("repeater: stopped carrying a namespace");
         Ok(())
+    }
+
+    /// Drop a namespace that breached a limit: stop carrying it as [`Self::release`] does, drop
+    /// its replica so its records stop costing memory too, and refuse its re-grant for
+    /// [`crate::limits::EVICTION_REFUSAL_MS`].
+    ///
+    /// Called on its own task, never from the namespace's watcher: `release` aborts that watcher,
+    /// and an abort lands at the caller's next `.await` — which would be inside `release` itself.
+    async fn evict(&self, ns: NsBytes, limit: LimitKind) {
+        self.evicted.lock().expect("eviction list poisoned").insert(
+            ns,
+            now_ms(),
+            self.limits.max_namespaces.max(1024),
+        );
+        self.note_limit(ns, limit, true);
+        if let Err(e) = self.release(ns).await {
+            tracing::warn!(error = %e, "stash: could not release an evicted namespace");
+        }
+        if let Err(e) = self.docs.drop_doc(iroh_docs::NamespaceId::from(&ns)).await {
+            tracing::warn!(error = %e, "stash: could not drop an evicted namespace's replica");
+        }
+    }
+
+    /// Count a limit being hit and, the first time per namespace (or always, for the rare kinds:
+    /// refused grants and evictions), record it as a `stash.limit` span. Spans and not events:
+    /// Loki drops event fields, and these are the fields that say which limit and whose.
+    fn note_limit(&self, ns: NsBytes, limit: LimitKind, always: bool) {
+        self.limit_counters
+            .counter(limit)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !always {
+            let mut notes = self.limit_notes.lock().expect("limit notes poisoned");
+            if notes.len() >= LIMIT_NOTES_CAP {
+                notes.clear();
+            }
+            if !notes.insert((ns, limit)) {
+                return;
+            }
+        }
+        let _span = tracing::info_span!(
+            "stash.limit",
+            limit = limit.as_str(),
+            sc.namespace = %crate::telemetry::short_hex(&ns),
+            namespaces = self.registry.known_namespaces().len(),
+            content_bytes = self.content.lock().expect("content index poisoned").present_bytes(),
+            record_bytes = self.records.lock().expect("record ledger poisoned").total_cost(),
+        )
+        .entered();
+        tracing::warn!(
+            limit = limit.as_str(),
+            "stash: a resource limit refused something"
+        );
+    }
+
+    /// The size of a blob held in full, or `None` when it is not (yet) complete.
+    async fn blob_size(&self, hash: Hash) -> Option<u64> {
+        match self.blobs.blobs().status(hash).await {
+            Ok(BlobStatus::Complete { size }) => Some(size),
+            _ => None,
+        }
+    }
+
+    /// A blob's bytes, but only when it is within the entry cap. Every read of content into
+    /// memory goes through here, so an oversized blob — which nothing should ever have let in —
+    /// still cannot be pulled into RAM whole by our own code.
+    async fn bounded_bytes(&self, hash: Hash) -> Option<Bytes> {
+        let size = self.blob_size(hash).await?;
+        if size > self.limits.max_entry_bytes {
+            return None;
+        }
+        self.blobs.blobs().get_bytes(hash).await.ok()
     }
 
     /// Which of `hashes` are held in full — the receipt a phone reads before it stops waiting.
@@ -839,12 +1120,7 @@ impl StashNode {
         if !present {
             return None;
         }
-        self.blobs
-            .blobs()
-            .get_bytes(hash)
-            .await
-            .ok()
-            .map(|bytes| bytes.to_vec())
+        self.bounded_bytes(hash).await.map(|bytes| bytes.to_vec())
     }
 
     /// Store opaque ciphertext uploaded by an authorized writer and verify its content address.
@@ -876,18 +1152,54 @@ impl StashNode {
         if !tracked {
             return Ok(PutOutcome::UntrackedHash);
         }
+        let size = bytes.len() as u64;
+        if size > self.limits.max_entry_bytes {
+            self.note_limit(*ns, LimitKind::EntryBytes, false);
+            return Ok(PutOutcome::TooLarge);
+        }
         if Hash::new(&bytes) != expected {
             return Ok(PutOutcome::HashMismatch);
         }
-        let tag = self.blobs.blobs().add_bytes(bytes).await?;
-        if tag.hash != expected {
+        if self.blob_size(expected).await.is_none() && !self.content_fits(size) {
+            self.note_limit(*ns, LimitKind::ContentBudget, false);
+            return Ok(PutOutcome::OverBudget);
+        }
+        // A TEMPORARY tag: awaiting `add_bytes` directly creates a persistent tag, which the GC
+        // never collects — every upload would have stayed in RAM for the life of the process,
+        // retention or not. The content ledger protects the blob from here on (it is tracked,
+        // checked above), so the temp tag only has to cover the gap until `mark_present_sized`.
+        let tag = self.blobs.blobs().add_bytes(bytes).temp_tag().await?;
+        if tag.hash() != expected {
             return Ok(PutOutcome::HashMismatch);
         }
         self.content
             .lock()
             .expect("content index poisoned")
-            .mark_present(*expected.as_bytes());
+            .mark_present_sized(*expected.as_bytes(), size);
+        drop(tag);
         Ok(PutOutcome::Stored)
+    }
+
+    /// Whether `size` more bytes of content fit under [`Limits::max_content_bytes`].
+    fn content_fits(&self, size: u64) -> bool {
+        self.content
+            .lock()
+            .expect("content index poisoned")
+            .present_bytes()
+            .saturating_add(size)
+            <= self.limits.max_content_bytes
+    }
+
+    /// Keep `tag` pinning its blob for [`UPLOAD_PIN_MS`], and release the pins that are due.
+    fn pin_upload(&self, tag: Option<TempTag>) {
+        let now = now_ms();
+        let mut pins = self.upload_pins.lock().expect("upload pins poisoned");
+        while pins.front().is_some_and(|(until, _)| *until <= now) {
+            pins.pop_front();
+        }
+        if let Some(tag) = tag {
+            pins.push_back((now + UPLOAD_PIN_MS, tag));
+        }
     }
 
     /// The stash's endpoint ticket. Publish this as `EXPO_PUBLIC_TRAIL_STASH_TICKET`; the app
@@ -929,6 +1241,20 @@ impl StashNode {
         subscription: Option<PushSubscription>,
         granted_by: Option<&str>,
     ) -> Result<NsBytes> {
+        self.register_inner(read_ticket, subscription, granted_by, true)
+            .await
+    }
+
+    /// [`Self::register_as`]; `capped` applies [`Limits::max_namespaces`] and the eviction
+    /// refusal to a namespace this node does not hold yet. Re-granting one it holds is never
+    /// refused: that is every phone's routine re-grant.
+    async fn register_inner(
+        self: &Arc<Self>,
+        read_ticket: &str,
+        subscription: Option<PushSubscription>,
+        granted_by: Option<&str>,
+        capped: bool,
+    ) -> Result<NsBytes> {
         let ticket: DocTicket = read_ticket
             .parse()
             .map_err(|e| anyhow!("parse doc ticket: {e}"))?;
@@ -946,10 +1272,37 @@ impl StashNode {
         let doc = if let Some(doc) = handles.get(&ns_bytes) {
             doc.clone()
         } else {
-            self.docs
+            if capped {
+                let refused = if self
+                    .evicted
+                    .lock()
+                    .expect("eviction list poisoned")
+                    .is_refused(&ns_bytes, now_ms())
+                {
+                    Some((GrantRefused::Evicted, LimitKind::Evicted))
+                } else if handles.len() >= self.limits.max_namespaces {
+                    Some((GrantRefused::Full, LimitKind::Namespaces))
+                } else {
+                    None
+                };
+                if let Some((refusal, limit)) = refused {
+                    self.note_limit(ns_bytes, limit, true);
+                    return Err(refusal.into());
+                }
+            }
+            let doc = self
+                .docs
                 .import_namespace(ticket.capability)
                 .await
-                .map_err(|e| anyhow!("import namespace capability: {e}"))?
+                .map_err(|e| anyhow!("import namespace capability: {e}"))?;
+            // Before the live engine starts, so not one record can queue a download: the docs
+            // engine fetches content with no size limit (its download policy filters by key
+            // only), and an entry's `content_len` is whatever its writer claimed. Content comes
+            // in through the settle loop instead, which proves a blob's size before fetching it.
+            doc.set_download_policy(DownloadPolicy::NothingExcept(Vec::new()))
+                .await
+                .map_err(|e| anyhow!("set the namespace's download policy: {e}"))?;
+            doc
         };
 
         // A repeater writes the grant down before reporting success, so a grant it acknowledged is
@@ -1040,6 +1393,45 @@ impl StashNode {
                                 current.record("sc.seq", seq);
                             }
 
+                            // Every record counts against the record budget whatever becomes of
+                            // its content; past the budget the biggest namespace goes. Then the
+                            // content is only tracked within the key and size caps: a refused
+                            // entry is never wanted, so never fetched, never served, and nothing
+                            // protects its blob from GC.
+                            if !self.registry.is_known(&ns_bytes) {
+                                return None;
+                            }
+                            let observed = self
+                                .records
+                                .lock()
+                                .expect("record ledger poisoned")
+                                .observe(
+                                    ns_bytes,
+                                    record_digest(&entry),
+                                    entry.key().len(),
+                                    entry.content_len() > 0,
+                                    &self.limits,
+                                );
+                            if let Some(victim) = observed.evict {
+                                let node = self.clone();
+                                tokio::spawn(async move {
+                                    node.evict(victim, LimitKind::RecordBudget).await;
+                                });
+                                if victim == ns_bytes {
+                                    return None;
+                                }
+                            }
+                            if !observed.content_admitted {
+                                self.note_limit(ns_bytes, LimitKind::Keys, false);
+                                return None;
+                            }
+                            // The writer's claim; the fetch proves the real size before
+                            // downloading, since a writer can sign any `content_len` it likes.
+                            if entry.content_len() > self.limits.max_entry_bytes {
+                                self.note_limit(ns_bytes, LimitKind::EntryBytes, false);
+                                return None;
+                            }
+
                             // Reconciliation delivered the *record*; the bytes are a separate
                             // transfer. Registering the hash both authorizes the writer's push and
                             // puts the entry on the missing-content ledger until it lands.
@@ -1053,7 +1445,14 @@ impl StashNode {
                                     .expect("content index poisoned")
                                     .want(ns_bytes, *hash.as_bytes());
                             }
-                            let present = self.blobs.blobs().has(hash).await.unwrap_or(false);
+                            // Present already: uploaded over HTTP, or the same bytes under
+                            // another entry. Only ever bytes within the cap: nothing else can
+                            // enter the store.
+                            let size = self
+                                .blob_size(hash)
+                                .await
+                                .filter(|size| *size <= self.limits.max_entry_bytes);
+                            let present = size.is_some();
                             let key = entry.key().to_vec();
                             let mut entry = TrackedEntry {
                                 namespace: ns_bytes,
@@ -1068,6 +1467,7 @@ impl StashNode {
                                 woken: false,
                                 next_attempt_ms: 0,
                                 attempts: 0,
+                                verified_size: size,
                             };
                             let admission = if present && entry.is_fix {
                                 self.admit_present(hash, &entry).await
@@ -1102,7 +1502,10 @@ impl StashNode {
                                     self.content
                                         .lock()
                                         .expect("content index poisoned")
-                                        .mark_present(*hash.as_bytes());
+                                        .mark_present_sized(
+                                            *hash.as_bytes(),
+                                            size.unwrap_or_default(),
+                                        );
                                     self.record_arrival(
                                         hash,
                                         live,
@@ -1240,15 +1643,31 @@ impl StashNode {
         {
             return PublishStatus::Invalid;
         }
+        // Too large is never worth retrying as is; over budget is, once retention frees room.
+        let size = item.content.len() as u64;
+        if size > self.limits.max_entry_bytes {
+            self.note_limit(item.namespace, LimitKind::EntryBytes, false);
+            return PublishStatus::Invalid;
+        }
         let Some(doc) = self.handle(item.namespace).await else {
             return PublishStatus::UnknownNamespace;
         };
         let hash = entry.content_hash();
-        match self.blobs.blobs().add_bytes(item.content).await {
-            Ok(tag) if tag.hash == hash => {}
+        if self.blob_size(hash).await.is_none() && !self.content_fits(size) {
+            self.note_limit(item.namespace, LimitKind::ContentBudget, false);
+            return PublishStatus::Failed;
+        }
+        // A TEMPORARY tag, held for `UPLOAD_PIN_MS`: awaiting `add_bytes` directly creates a
+        // persistent tag the GC never collects, so every batch upload stayed in RAM for the life
+        // of the process. The watcher puts the entry on the content ledger within moments of the
+        // insert below, and the ledger protects it from then on; an entry the watcher refuses (a
+        // limit) is simply collected once the pin lapses.
+        let tag = match self.blobs.blobs().add_bytes(item.content).temp_tag().await {
+            Ok(tag) if tag.hash() == hash => tag,
             Ok(_) => return PublishStatus::Invalid,
             Err(_) => return PublishStatus::Failed,
-        }
+        };
+        self.pin_upload(Some(tag));
         // Delivered by nobody we can name: the caller is an HTTP client, not an endpoint. Our own
         // id keeps the replica's bookkeeping valid, and with the bytes already here nothing is
         // ever fetched from it.
@@ -1291,16 +1710,32 @@ impl StashNode {
     /// One settle pass: for every entry still missing its bytes, try to fetch them from the author,
     /// then release the ones that are ready to wake.
     ///
-    /// The docs engine queues its own download when an entry arrives, but that is a single attempt
-    /// against a peer that is usually about to be frozen by the OS — and a failure leaves the hash
-    /// parked until a gossip `ContentReady` that a sleeping phone never sends. Retrying here is
-    /// what makes the stash converge: whenever the author is reachable (notably while it is
-    /// connected doing its own sync) the fetch succeeds and the entry becomes servable.
+    /// The docs engine's own downloader is switched off for every namespace (see
+    /// `register_inner`): it fetched with no size limit, and in any case got a single attempt
+    /// against a peer that is usually about to be frozen by the OS, after which the hash was
+    /// parked until a gossip `ContentReady` a sleeping phone never sends. This loop is the only
+    /// way content comes in over iroh: whenever the author (or the peer that relayed the record)
+    /// is reachable, the fetch succeeds and the entry becomes servable.
     ///
     /// Returns entries whose subscribers should be woken, each flagged with whether it is being
     /// released *without* content (the fallback path). Waking is one-shot; fetching is not — an
     /// entry woken degraded keeps being retried, so late content still becomes servable.
-    async fn settle_once(&self, now: u64) -> Vec<(Hash, TrackedEntry, bool, Option<Admission>)> {
+    ///
+    /// The pass itself never waits on the network. It used to fetch inline, one entry after the
+    /// other with a 20 s timeout each, so three entries nobody could serve held up every other
+    /// namespace's content — and its wakes — for a minute, and a hostile namespace could do it
+    /// forever. Fetches now run on their own tasks ([`Self::start_fetches`]), at most
+    /// [`Limits::fetch_concurrency`] at once and [`crate::limits::FETCH_PER_NAMESPACE`] per
+    /// namespace, freshest first; the pass only notices the bytes once they have landed.
+    async fn settle_once(
+        self: &Arc<Self>,
+        now: u64,
+    ) -> Vec<(Hash, TrackedEntry, bool, Option<Admission>)> {
+        {
+            let mut tasks = self.fetch_tasks.lock().expect("fetch tasks poisoned");
+            while tasks.try_join_next().is_some() {}
+        }
+        self.pin_upload(None);
         let outstanding: Vec<((NsBytes, Vec<u8>, Hash), TrackedEntry)> = {
             let tracked = self.tracked.lock().await;
             tracked
@@ -1311,10 +1746,29 @@ impl StashNode {
         };
 
         let mut wake = Vec::new();
+        let mut due = Vec::new();
         for (key, entry) in outstanding {
             let hash = key.2;
-            let mut present = self.blobs.blobs().has(hash).await.unwrap_or(false)
-                || (now >= entry.next_attempt_ms && self.fetch_content(hash, &entry).await);
+            // Ask the store only about bytes the ledger says have landed (a fetch, an HTTP
+            // upload, another entry with the same bytes): one RPC per outstanding entry per pass
+            // was fine for a handful of entries and is not for a namespace that wrote hundreds
+            // nobody will ever serve.
+            let landed = self
+                .content
+                .lock()
+                .expect("content index poisoned")
+                .is_present(hash.as_bytes());
+            let size = if landed {
+                self.blob_size(hash)
+                    .await
+                    .filter(|size| *size <= self.limits.max_entry_bytes)
+            } else {
+                None
+            };
+            let mut present = size.is_some();
+            if !present && now >= entry.next_attempt_ms {
+                due.push((key.clone(), entry.clone()));
+            }
             let admission = if present && entry.is_fix {
                 self.admit_present(hash, &entry).await
             } else {
@@ -1333,15 +1787,12 @@ impl StashNode {
                 self.content
                     .lock()
                     .expect("content index poisoned")
-                    .mark_present(*hash.as_bytes());
+                    .mark_present_sized(*hash.as_bytes(), size.unwrap_or_default());
                 self.record_arrival(
                     hash,
                     live,
                     matches!(admission.as_ref(), Some(Admission::Accept)),
                 );
-            } else if now >= entry.next_attempt_ms {
-                live.attempts = live.attempts.saturating_add(1);
-                live.next_attempt_ms = now + TrackedEntry::backoff_ms(live.attempts);
             }
 
             let overdue = now.saturating_sub(live.first_seen_ms) >= WAKE_FALLBACK_MS;
@@ -1350,7 +1801,128 @@ impl StashNode {
                 wake.push((hash, entry, !present, admission));
             }
         }
+        self.start_fetches(due).await;
         wake
+    }
+
+    /// Start content fetches for `due` entries, within the concurrency limits, each on its own
+    /// task. A hash already being fetched is not fetched twice.
+    async fn start_fetches(self: &Arc<Self>, due: Vec<((NsBytes, Vec<u8>, Hash), TrackedEntry)>) {
+        if due.is_empty() {
+            return;
+        }
+        let picked = {
+            let fetching = self.fetching.lock().expect("fetching poisoned");
+            let due: Vec<_> = due
+                .into_iter()
+                .filter(|(key, _)| !fetching.contains_key(&key.2))
+                .collect();
+            let mut in_flight: HashMap<NsBytes, usize> = HashMap::new();
+            for ns in fetching.values() {
+                *in_flight.entry(*ns).or_default() += 1;
+            }
+            let candidates: Vec<FetchCandidate> = due
+                .iter()
+                .map(|(key, entry)| FetchCandidate {
+                    namespace: key.0,
+                    attempts: entry.attempts,
+                    next_attempt_ms: entry.next_attempt_ms,
+                })
+                .collect();
+            let chosen = pick_fetches(&candidates, &in_flight, self.limits.fetch_concurrency);
+            let mut due: Vec<Option<_>> = due.into_iter().map(Some).collect();
+            let mut picked = Vec::with_capacity(chosen.len());
+            let mut hashes = HashSet::new();
+            for i in chosen {
+                if let Some(item) = due[i].take() {
+                    // Two entries naming one hash: fetch it once.
+                    if hashes.insert(item.0 .2) {
+                        picked.push(item);
+                    }
+                }
+            }
+            picked
+        };
+        for (key, entry) in picked {
+            {
+                let mut tracked = self.tracked.lock().await;
+                let Some(live) = tracked.get_mut(&key) else {
+                    continue;
+                };
+                live.attempts = live.attempts.saturating_add(1);
+                // Not due again until this attempt has ended; the task sets the real time.
+                live.next_attempt_ms = u64::MAX;
+            }
+            self.fetching
+                .lock()
+                .expect("fetching poisoned")
+                .insert(key.2, key.0);
+            let node = self.clone();
+            self.fetch_tasks
+                .lock()
+                .expect("fetch tasks poisoned")
+                .spawn(async move {
+                    let outcome = node.fetch_content(key.2, &entry).await;
+                    node.finish_fetch(key, outcome).await;
+                });
+        }
+    }
+
+    /// Record how one fetch ended: schedule the next attempt, remember a proven size, or refuse
+    /// an oversized blob for good.
+    async fn finish_fetch(&self, key: (NsBytes, Vec<u8>, Hash), outcome: FetchOutcome) {
+        self.fetching
+            .lock()
+            .expect("fetching poisoned")
+            .remove(&key.2);
+        let now = now_ms();
+        let mut tracked = self.tracked.lock().await;
+        if let FetchOutcome::Oversized(size) = outcome {
+            // Proven by the blob's own hash tree, so no peer can change the answer: stop
+            // tracking it, and drop the reference so nothing protects or serves it. It was never
+            // downloaded — the size probe asks for the last chunk only.
+            tracked.remove(&key);
+            self.content
+                .lock()
+                .expect("content index poisoned")
+                .forget(&key.0, key.2.as_bytes());
+            drop(tracked);
+            tracing::debug!(
+                sc.entry_hash = %crate::telemetry::short_hex(key.2.as_bytes()),
+                size,
+                "stash: refused an oversized blob before fetching it"
+            );
+            self.note_limit(key.0, LimitKind::EntryBytes, false);
+            return;
+        }
+        let Some(live) = tracked.get_mut(&key) else {
+            return;
+        };
+        match outcome {
+            FetchOutcome::Fetched(size) => {
+                // On the ledger, so the next pass looks at the store and marks the entry present
+                // (and wakes for it) there, the one place that does.
+                live.next_attempt_ms = now;
+                self.content
+                    .lock()
+                    .expect("content index poisoned")
+                    .mark_present_sized(*key.2.as_bytes(), size);
+            }
+            FetchOutcome::Failed { size } => {
+                if size.is_some() {
+                    live.verified_size = size;
+                }
+                live.next_attempt_ms = now + fetch_retry_delay_ms(live.attempts);
+            }
+            FetchOutcome::OverBudget(size) => {
+                live.verified_size = Some(size);
+                live.next_attempt_ms = now + fetch_retry_delay_ms(live.attempts);
+                drop(tracked);
+                self.note_limit(key.0, LimitKind::ContentBudget, false);
+            }
+            // Handled before the entry was looked up.
+            FetchOutcome::Oversized(_) => {}
+        }
     }
 
     /// UI activity observes newly servable fixes, independently of push wakes. A degraded wake
@@ -1366,7 +1938,7 @@ impl StashNode {
     }
 
     async fn admit_present(&self, hash: Hash, entry: &TrackedEntry) -> Option<Admission> {
-        let bytes = self.blobs.blobs().get_bytes(hash).await.ok()?;
+        let bytes = self.bounded_bytes(hash).await?;
         Some(self.delivery.admit(&EnvelopeRef {
             namespace: &entry.namespace,
             author: &entry.author,
@@ -1422,6 +1994,7 @@ impl StashNode {
             woken: true,
             next_attempt_ms: 0,
             attempts: 0,
+            verified_size: None,
         };
         node.registry.register(entry.namespace, None);
         node.content
@@ -1505,7 +2078,13 @@ impl StashNode {
     ///
     /// Failure is the normal case for a phone that has gone back to sleep; it is logged at debug
     /// and retried on the next pass, so a transient miss never orphans an entry.
-    async fn fetch_content(&self, hash: Hash, entry: &TrackedEntry) -> bool {
+    ///
+    /// Before the first download a source is asked for the blob's **verified size** (the last
+    /// chunk, checked against the hash tree, so the answer is a property of the hash and no peer
+    /// can lie about it). A blob over [`Limits::max_entry_bytes`] is refused without a byte of it
+    /// being fetched, and one that would cross [`Limits::max_content_bytes`] waits. Without this,
+    /// any writer could sign an entry naming a gigabyte blob and the stash would pull it into RAM.
+    async fn fetch_content(&self, hash: Hash, entry: &TrackedEntry) -> FetchOutcome {
         let mut sources = vec![entry.delivered_by];
         if let Ok(author) = <[u8; 32]>::try_from(entry.author.as_slice()) {
             if let Ok(author) = iroh::EndpointId::from_bytes(&author) {
@@ -1514,6 +2093,24 @@ impl StashNode {
                 }
             }
         }
+        // Delivered by ourselves means uploaded over HTTP: there is nobody to dial for it.
+        sources.retain(|source| *source != self.endpoint.id());
+        if sources.is_empty() {
+            return FetchOutcome::Failed { size: None };
+        }
+        let size = match entry.verified_size {
+            Some(size) => size,
+            None => match self.probe_size(hash, &sources).await {
+                Some(size) => size,
+                None => return FetchOutcome::Failed { size: None },
+            },
+        };
+        if size > self.limits.max_entry_bytes {
+            return FetchOutcome::Oversized(size);
+        }
+        if !self.content_fits(size) {
+            return FetchOutcome::OverBudget(size);
+        }
         let downloader = self.blobs.downloader(&self.endpoint);
         let attempt = tokio::time::timeout(
             tokio::time::Duration::from_secs(FETCH_TIMEOUT_SECS),
@@ -1521,7 +2118,7 @@ impl StashNode {
         )
         .await;
         match attempt {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => FetchOutcome::Fetched(size),
             Ok(Err(error)) => {
                 tracing::debug!(
                     sc.entry_hash = %crate::telemetry::short_hex(hash.as_bytes()),
@@ -1529,16 +2126,50 @@ impl StashNode {
                     %error,
                     "stash: content fetch failed; will retry"
                 );
-                false
+                FetchOutcome::Failed { size: Some(size) }
             }
             Err(_) => {
                 tracing::debug!(
                     sc.entry_hash = %crate::telemetry::short_hex(hash.as_bytes()),
                     "stash: content fetch timed out; will retry"
                 );
-                false
+                FetchOutcome::Failed { size: Some(size) }
             }
         }
+    }
+
+    /// Ask each source in turn for the blob's verified size; the first answer wins.
+    async fn probe_size(&self, hash: Hash, sources: &[iroh::EndpointId]) -> Option<u64> {
+        for source in sources {
+            let probe = tokio::time::timeout(
+                tokio::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+                async {
+                    let connection = self
+                        .endpoint
+                        .connect(*source, iroh_blobs::ALPN)
+                        .await
+                        .map_err(|e| anyhow!("connect: {e}"))?;
+                    let (size, _) = iroh_blobs::get::request::get_verified_size(&connection, &hash)
+                        .await
+                        .map_err(|e| anyhow!("verified size: {e}"))?;
+                    anyhow::Ok(size)
+                },
+            )
+            .await;
+            match probe {
+                Ok(Ok(size)) => return Some(size),
+                Ok(Err(error)) => tracing::debug!(
+                    sc.entry_hash = %crate::telemetry::short_hex(hash.as_bytes()),
+                    %error,
+                    "stash: size probe failed; will retry"
+                ),
+                Err(_) => tracing::debug!(
+                    sc.entry_hash = %crate::telemetry::short_hex(hash.as_bytes()),
+                    "stash: size probe timed out; will retry"
+                ),
+            }
+        }
+        None
     }
 
     /// Run the delivery-service admission check and, if admitted, wake the namespace's subscribers.
@@ -1579,9 +2210,7 @@ impl StashNode {
                     let bytes = if degraded {
                         Vec::new()
                     } else {
-                        self.blobs
-                            .blobs()
-                            .get_bytes(hash)
+                        self.bounded_bytes(hash)
                             .await
                             .map(|b| b.to_vec())
                             .unwrap_or_default()
@@ -1755,17 +2384,31 @@ impl StashNode {
     /// `Authorization: Bearer <psk>` on the `/v1/*` routes (anti-abuse gate; `/healthz` is open).
     pub async fn serve_control_api(self: Arc<Self>, port: u16, psk: Option<String>) -> Result<()> {
         let psk = Arc::new(psk);
+        // Every route that takes a body names its own ceiling, rather than leaning on axum's
+        // implicit default: the content PUT's has to follow the configured entry cap, and the
+        // JSON routes need nowhere near 2 MiB to carry one ticket or one push token.
+        let content_body_limit = usize::try_from(self.limits.max_entry_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(CONTENT_BODY_SLACK);
         let app = AxumRouter::new()
-            .route("/v1/namespaces", post(register_handler))
+            .route(
+                "/v1/namespaces",
+                post(register_handler).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+            )
             .route(
                 "/v1/namespaces/:id/subscription",
-                delete(unsubscribe_handler),
+                delete(unsubscribe_handler).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
             )
             .route(
                 "/v1/namespaces/:id/content/:hash",
-                get(content_handler).put(put_content_handler),
+                get(content_handler)
+                    .put(put_content_handler)
+                    .layer(DefaultBodyLimit::max(content_body_limit)),
             )
-            .route(BATCH_PATH, post(batch_handler))
+            .route(
+                BATCH_PATH,
+                post(batch_handler).layer(DefaultBodyLimit::max(BATCH_BODY_LIMIT)),
+            )
             // route_layer applies ONLY to the routes above, not to /healthz added after.
             .route_layer(middleware::from_fn_with_state(psk, psk_guard))
             .route("/healthz", get(healthz))
@@ -1815,12 +2458,42 @@ pub fn default_waker() -> Arc<dyn Waker> {
 /// never arrived. It spikes as entries land and should fall back toward zero within seconds. If it
 /// sits high, the stash is holding hashes it cannot serve and every reader syncing through it will
 /// get `Unable to download <hash>`, no matter how healthy everything else looks.
+///
+/// `limits` says how close the node is to each resource limit and how often one refused
+/// something — the counts are cumulative for the process, so a rising `grants_refused` is a full
+/// stash and a rising `namespaces_evicted` is someone writing far more than any phone does.
 async fn healthz(State(node): State<Arc<StashNode>>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering::Relaxed;
     let (content_missing, content_tracked) = node.content_stats();
+    let content_bytes = node
+        .content
+        .lock()
+        .expect("content index poisoned")
+        .present_bytes();
+    let record_bytes = node
+        .records
+        .lock()
+        .expect("record ledger poisoned")
+        .total_cost();
+    let namespaces = node.registry.known_namespaces().len();
+    let counters = &node.limit_counters;
     Json(serde_json::json!({
         "status": "ok",
         "content_missing": content_missing,
         "content_tracked": content_tracked,
+        "limits": {
+            "namespaces": namespaces,
+            "max_namespaces": node.limits.max_namespaces,
+            "content_bytes": content_bytes,
+            "max_content_bytes": node.limits.max_content_bytes,
+            "record_bytes": record_bytes,
+            "max_record_bytes": node.limits.max_record_bytes,
+            "grants_refused": counters.grants_refused.load(Relaxed),
+            "entries_oversized": counters.entries_oversized.load(Relaxed),
+            "keys_refused": counters.keys_refused.load(Relaxed),
+            "fetches_over_budget": counters.fetches_over_budget.load(Relaxed),
+            "namespaces_evicted": counters.namespaces_evicted.load(Relaxed),
+        },
     }))
 }
 
@@ -1837,6 +2510,11 @@ async fn register_handler(
         // A malformed ticket that slipped past the light guard is the client's fault (400); a
         // transient import/network failure is not (502).
         Err(e) => {
+            // A limit: the stash is full or this namespace was evicted. 503 tells the phone to
+            // try again later, which is what its regrant floor already does.
+            if let Some(refusal) = e.downcast_ref::<GrantRefused>() {
+                return (StatusCode::SERVICE_UNAVAILABLE, refusal.to_string()).into_response();
+            }
             let msg = e.to_string();
             if msg.contains("parse doc ticket") {
                 (StatusCode::BAD_REQUEST, msg).into_response()
@@ -1901,6 +2579,10 @@ async fn put_content_handler(
         Ok(PutOutcome::HashMismatch) => {
             (StatusCode::BAD_REQUEST, "content does not match its hash").into_response()
         }
+        // Larger than any entry the stash carries. Never retry this one.
+        Ok(PutOutcome::TooLarge) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        // The stash's content budget is full until retention frees room: retry later.
+        Ok(PutOutcome::OverBudget) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
     }
 }
@@ -1948,6 +2630,14 @@ async fn unsubscribe_handler(
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────────
+
+/// The record slot an entry occupies in the replica — its docs author and its key — as a
+/// fixed-size digest for the [`RecordLedger`]. The author is 32 bytes, so the concatenation is
+/// unambiguous; hashing it means a hostile multi-kilobyte key costs the ledger 32 bytes, while
+/// the ledger still charges the key's real length against the record budget.
+fn record_digest(entry: &iroh_docs::Entry) -> [u8; 32] {
+    *Hash::new([entry.author().as_bytes().as_slice(), entry.key()].concat()).as_bytes()
+}
 
 fn is_fix_key(key: &[u8]) -> bool {
     crate::retention::decode_latest_fix_author(key).is_some()
@@ -2899,6 +3589,398 @@ mod live_tests {
             !registration_dialed_writer,
             "registration must import the capability without dialing ticket bootstrap nodes"
         );
+        Ok(())
+    }
+
+    // ── limits: what a granter who is also the writer can make the stash hold ──────────────
+
+    /// A blobs endpoint that accepts a connection and then never answers: a peer the stash can
+    /// reach but never get bytes from, which is what used to hold the sequential settle loop for
+    /// a full fetch timeout per entry.
+    #[derive(Debug)]
+    struct HangingBlobs;
+
+    impl ProtocolHandler for HangingBlobs {
+        async fn accept(
+            &self,
+            _connection: iroh::endpoint::Connection,
+        ) -> Result<(), ProtocolAcceptError> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// What a test writer puts under one key.
+    enum Payload {
+        /// Honest: these bytes, with their real length.
+        Bytes(Vec<u8>),
+        /// The entry names these bytes' hash but CLAIMS `claimed` bytes — a writer can sign any
+        /// `content_len` it likes, so only the blob's verified size can be trusted.
+        Lie { bytes: Vec<u8>, claimed: u64 },
+    }
+
+    /// A writer holding `entries`, serving its blobs honestly or (`hang_blobs`) not at all.
+    async fn spawn_custom_writer(
+        seed: u8,
+        entries: Vec<(Vec<u8>, Payload)>,
+        hang_blobs: bool,
+    ) -> anyhow::Result<Writer> {
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(SecretKey::from_bytes(&[seed; 32]))
+            .bind()
+            .await?;
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let mem = MemStore::new();
+        let docs = Docs::memory()
+            .spawn(endpoint.clone(), (*mem).clone(), gossip.clone())
+            .await?;
+        let router = Router::builder(endpoint.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .accept(iroh_docs::ALPN, docs.clone());
+        let router = if hang_blobs {
+            router.accept(iroh_blobs::ALPN, HangingBlobs)
+        } else {
+            router.accept(iroh_blobs::ALPN, BlobsProtocol::new(&mem, None))
+        };
+        let router = router.spawn();
+
+        let author = docs.author_default().await?;
+        let doc = docs.create().await?;
+        for (key, payload) in entries {
+            match payload {
+                Payload::Bytes(bytes) => {
+                    doc.set_bytes(author, key, bytes).await?;
+                }
+                Payload::Lie { bytes, claimed } => {
+                    let tag = mem.blobs().add_bytes(bytes).await?;
+                    doc.set_hash(author, key, tag.hash, claimed).await?;
+                }
+            }
+        }
+        let ticket = doc
+            .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await?
+            .to_string();
+        Ok(Writer {
+            ticket,
+            doc,
+            _router: router,
+        })
+    }
+
+    async fn spawn_limited_stash(seed: u8, limits: Limits) -> anyhow::Result<Arc<StashNode>> {
+        StashNode::spawn_with_limits(
+            Storage::Memory,
+            SecretKey::from_bytes(&[seed; 32]),
+            RetentionPolicy::from_hours(48),
+            &[],
+            None,
+            limits,
+            default_delivery(),
+            default_waker(),
+        )
+        .await
+    }
+
+    /// Every entry the stash's replica holds for `ns`, as (key, content hash).
+    async fn replica_entries(stash: &StashNode, ns: NsBytes) -> Vec<(Vec<u8>, Hash)> {
+        let Some(doc) = stash.handle(ns).await else {
+            return Vec::new();
+        };
+        let Ok(stream) = doc.get_many(Query::all().build()).await else {
+            return Vec::new();
+        };
+        tokio::pin!(stream);
+        let mut out = Vec::new();
+        while let Some(Ok(entry)) = stream.next().await {
+            out.push((entry.key().to_vec(), entry.content_hash()));
+        }
+        out
+    }
+
+    fn fix_key(n: u8) -> Vec<u8> {
+        format!("{}/fix", format!("{n:02x}").repeat(32)).into_bytes()
+    }
+
+    /// An entry larger than the cap is never fetched — whether its writer admits the size or
+    /// claims it is tiny. The second case is the one that matters: `content_len` is the writer's
+    /// word, and only the size proven by the blob's own hash tree decides.
+    #[tokio::test]
+    async fn an_oversized_blob_is_never_fetched_whatever_its_entry_claims() -> anyhow::Result<()> {
+        init_test_tracing();
+        let limits = Limits {
+            max_entry_bytes: 4096,
+            ..Limits::default()
+        };
+        let stash = spawn_limited_stash(201, limits).await?;
+        let honest_big = vec![1u8; 64 * 1024];
+        let lying_big = vec![2u8; 64 * 1024];
+        let small = b"small-sealed-envelope".to_vec();
+        let writer = spawn_custom_writer(
+            202,
+            vec![
+                (fix_key(1), Payload::Bytes(honest_big.clone())),
+                (
+                    fix_key(2),
+                    Payload::Lie {
+                        bytes: lying_big.clone(),
+                        claimed: 20,
+                    },
+                ),
+                (fix_key(3), Payload::Bytes(small.clone())),
+            ],
+            false,
+        )
+        .await?;
+        let ns = stash.register(&writer.ticket, None).await?;
+        writer.doc.start_sync(vec![stash.endpoint.addr()]).await?;
+
+        // The small entry proves the fetch path works; by then the big ones had their chance.
+        let small_hash = Hash::new(&small);
+        let mut landed = false;
+        for _ in 0..300 {
+            if stash.content_bytes(&ns, small_hash).await.is_some() {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(landed, "the small entry's content should land");
+        // Give the lying entry's probe time to run (it is due as soon as the record lands).
+        for _ in 0..100 {
+            if stash
+                .limit_counters
+                .entries_oversized
+                .load(Ordering::Relaxed)
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for big in [Hash::new(&honest_big), Hash::new(&lying_big)] {
+            assert_eq!(
+                stash.blob_size(big).await,
+                None,
+                "an oversized blob must never enter the store"
+            );
+            assert!(
+                !stash.content.lock().unwrap().is_tracked(big.as_bytes()),
+                "an oversized blob must not be protected from GC or served"
+            );
+        }
+        assert!(
+            stash
+                .limit_counters
+                .entries_oversized
+                .load(Ordering::Relaxed)
+                >= 2
+        );
+        stash.shutdown().await;
+        Ok(())
+    }
+
+    /// Content keys past the per-namespace cap are not tracked, fetched or served; the records
+    /// themselves still replicate (iroh-docs accepts any signed record).
+    #[tokio::test]
+    async fn content_keys_past_the_cap_are_not_carried() -> anyhow::Result<()> {
+        init_test_tracing();
+        let limits = Limits {
+            max_keys_per_namespace: 2,
+            ..Limits::default()
+        };
+        let stash = spawn_limited_stash(203, limits).await?;
+        let writer = spawn_custom_writer(
+            204,
+            (1..=4)
+                .map(|n| {
+                    (
+                        fix_key(n),
+                        Payload::Bytes(format!("envelope-{n}").into_bytes()),
+                    )
+                })
+                .collect(),
+            false,
+        )
+        .await?;
+        let ns = stash.register(&writer.ticket, None).await?;
+        writer.doc.start_sync(vec![stash.endpoint.addr()]).await?;
+
+        for _ in 0..300 {
+            if replica_entries(&stash, ns).await.len() == 4
+                && stash.content.lock().unwrap().missing_count() == 0
+                && stash.content.lock().unwrap().tracked_count() > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let entries = replica_entries(&stash, ns).await;
+        assert_eq!(entries.len(), 4, "every record still replicates");
+        let mut served = 0;
+        for (_, hash) in &entries {
+            if stash.content_bytes(&ns, *hash).await.is_some() {
+                served += 1;
+            }
+        }
+        assert_eq!(served, 2, "only the first two keys' content is carried");
+        assert_eq!(stash.content.lock().unwrap().tracked_count(), 2);
+        assert!(stash.limit_counters.keys_refused.load(Ordering::Relaxed) >= 2);
+        stash.shutdown().await;
+        Ok(())
+    }
+
+    /// Past `max_namespaces` a new grant is refused with a typed error (503 on the wire), and a
+    /// namespace already held can still be re-granted — that is every phone's routine re-grant.
+    #[tokio::test]
+    async fn grants_past_the_namespace_cap_are_refused() -> anyhow::Result<()> {
+        let limits = Limits {
+            max_namespaces: 1,
+            ..Limits::default()
+        };
+        let stash = spawn_limited_stash(205, limits).await?;
+        let first = spawn_writer_node(206).await?;
+        let second = spawn_writer_node(207).await?;
+        stash.register(&first.ticket, None).await?;
+        let refused = stash
+            .register(&second.ticket, None)
+            .await
+            .expect_err("a second namespace exceeds the cap");
+        assert_eq!(
+            refused.downcast_ref::<GrantRefused>(),
+            Some(&GrantRefused::Full)
+        );
+        stash.register(&first.ticket, None).await?;
+        assert_eq!(stash.registry.known_namespaces().len(), 1);
+        assert_eq!(
+            stash.limit_counters.grants_refused.load(Ordering::Relaxed),
+            1
+        );
+        stash.shutdown().await;
+        Ok(())
+    }
+
+    /// A namespace whose records cross the record budget is evicted — dropped and its re-grant
+    /// refused — while the stash keeps running for everyone else.
+    #[tokio::test]
+    async fn a_namespace_past_the_record_budget_is_evicted() -> anyhow::Result<()> {
+        init_test_tracing();
+        let limits = Limits {
+            max_record_bytes: crate::limits::record_cost(68) * 3,
+            ..Limits::default()
+        };
+        let stash = spawn_limited_stash(208, limits).await?;
+        let writer = spawn_custom_writer(
+            209,
+            (1..=6)
+                .map(|n| {
+                    (
+                        fix_key(n),
+                        Payload::Bytes(format!("envelope-{n}").into_bytes()),
+                    )
+                })
+                .collect(),
+            false,
+        )
+        .await?;
+        let ns = stash.register(&writer.ticket, None).await?;
+        writer.doc.start_sync(vec![stash.endpoint.addr()]).await?;
+
+        let mut evicted = false;
+        for _ in 0..300 {
+            if !stash.registry.is_known(&ns) && stash.handle(ns).await.is_none() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(evicted, "the namespace should have been evicted");
+        let again = stash
+            .register(&writer.ticket, None)
+            .await
+            .expect_err("an evicted namespace's re-grant is refused for a while");
+        assert_eq!(
+            again.downcast_ref::<GrantRefused>(),
+            Some(&GrantRefused::Evicted)
+        );
+        assert!(
+            stash
+                .limit_counters
+                .namespaces_evicted
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+        stash.shutdown().await;
+        Ok(())
+    }
+
+    /// **The settle-loop stall.** A namespace whose entries nobody will ever serve (its peer
+    /// accepts the connection and never answers) must not hold up another namespace's content.
+    /// The loop used to fetch inline, 20 s per entry, so four such entries delayed everyone by
+    /// over a minute.
+    #[tokio::test]
+    async fn unfetchable_entries_do_not_stall_another_namespace() -> anyhow::Result<()> {
+        init_test_tracing();
+        let stash = spawn_limited_stash(210, Limits::default()).await?;
+        let hostile = spawn_custom_writer(
+            211,
+            (1..=6)
+                .map(|n| {
+                    (
+                        fix_key(n),
+                        Payload::Bytes(format!("stuck-{n}").into_bytes()),
+                    )
+                })
+                .collect(),
+            true,
+        )
+        .await?;
+        let hostile_ns = stash.register(&hostile.ticket, None).await?;
+        hostile.doc.start_sync(vec![stash.endpoint.addr()]).await?;
+        for _ in 0..300 {
+            if replica_entries(&stash, hostile_ns).await.len() == 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Let the hostile fetches take their slots and hang.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+        let honest = spawn_custom_writer(
+            212,
+            vec![(fix_key(7), Payload::Bytes(b"honest-envelope".to_vec()))],
+            false,
+        )
+        .await?;
+        let honest_ns = stash.register(&honest.ticket, None).await?;
+        let started = std::time::Instant::now();
+        honest.doc.start_sync(vec![stash.endpoint.addr()]).await?;
+        let hash = Hash::new(b"honest-envelope");
+        let mut landed = false;
+        while started.elapsed() < Duration::from_secs(9) {
+            if stash.content_bytes(&honest_ns, hash).await.is_some() {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            landed,
+            "an honest namespace's content must land while another namespace's fetches hang \
+             (inside one probe timeout, not after the hostile queue drains)"
+        );
+        assert!(
+            stash
+                .fetching
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|ns| **ns == hostile_ns)
+                .count()
+                <= crate::limits::FETCH_PER_NAMESPACE,
+            "one namespace holds at most its share of the fetch slots"
+        );
+        stash.shutdown().await;
         Ok(())
     }
 }

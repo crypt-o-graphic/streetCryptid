@@ -47,6 +47,11 @@ pub struct ContentIndex {
     state: HashMap<ContentHash, State>,
     by_namespace: HashMap<NamespaceId, HashMap<ContentHash, u64>>,
     revision: u64,
+    /// The size of every present blob, and their sum — what the content budget
+    /// ([`crate::limits::Limits::max_content_bytes`]) is checked against. Referenced bytes are
+    /// what GC can never reclaim, so this is the number that has to stay bounded.
+    sizes: HashMap<ContentHash, u64>,
+    present_bytes: u64,
 }
 
 impl ContentIndex {
@@ -99,8 +104,29 @@ impl ContentIndex {
     /// Record that the bytes for `hash` are now in the local store. Ignores hashes nobody asked
     /// for, so a stray blob can never register itself as wanted.
     pub fn mark_present(&mut self, hash: ContentHash) {
+        self.mark_present_sized(hash, 0);
+    }
+
+    /// [`Self::mark_present`], charging `size` bytes to the content budget (once per hash).
+    pub fn mark_present_sized(&mut self, hash: ContentHash, size: u64) {
         if let Some(state) = self.state.get_mut(&hash) {
             *state = State::Present;
+            if let Some(old) = self.sizes.insert(hash, size) {
+                self.present_bytes = self.present_bytes.saturating_sub(old);
+            }
+            self.present_bytes = self.present_bytes.saturating_add(size);
+        }
+    }
+
+    /// Bytes of referenced content held, by the sizes [`Self::mark_present_sized`] recorded.
+    pub fn present_bytes(&self) -> u64 {
+        self.present_bytes
+    }
+
+    fn untrack(&mut self, hash: &ContentHash) {
+        self.state.remove(hash);
+        if let Some(size) = self.sizes.remove(hash) {
+            self.present_bytes = self.present_bytes.saturating_sub(size);
         }
     }
 
@@ -158,7 +184,7 @@ impl ContentIndex {
             .values()
             .any(|hashes| hashes.contains_key(hash));
         if !still_referenced {
-            self.state.remove(hash);
+            self.untrack(hash);
         }
         !still_referenced
     }
@@ -173,7 +199,7 @@ impl ContentIndex {
         for (hash, _) in hashes {
             let still_referenced = self.by_namespace.values().any(|h| h.contains_key(&hash));
             if !still_referenced {
-                self.state.remove(&hash);
+                self.untrack(&hash);
                 released.push(hash);
             }
         }
@@ -296,6 +322,26 @@ mod tests {
             "a stray blob must not become tracked"
         );
         assert_eq!(index.tracked_count(), 0);
+    }
+
+    #[test]
+    fn present_bytes_are_charged_once_and_refunded_on_release() {
+        let mut index = ContentIndex::new();
+        index.mark_present_sized(HASH, 100);
+        assert_eq!(index.present_bytes(), 0, "an untracked blob is not charged");
+        index.want(NS_A, HASH);
+        index.want(NS_B, HASH);
+        index.want(NS_A, OTHER);
+        index.mark_present_sized(HASH, 100);
+        index.mark_present_sized(HASH, 100);
+        index.mark_present_sized(OTHER, 7);
+        assert_eq!(index.present_bytes(), 107);
+        assert!(!index.forget(&NS_A, &HASH), "NS_B still names it");
+        assert_eq!(index.present_bytes(), 107);
+        index.forget_namespace(&NS_A);
+        assert_eq!(index.present_bytes(), 100);
+        assert!(index.forget(&NS_B, &HASH));
+        assert_eq!(index.present_bytes(), 0);
     }
 
     #[test]

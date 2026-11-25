@@ -56,6 +56,19 @@ spec:
               value: {{ .Values.config.pruneIntervalMin | quote }}
             - name: RUST_LOG
               value: {{ .Values.config.logLevel | quote }}
+            # What an untrusted granter can make the stash hold (src/limits.rs).
+            - name: TRAIL_STASH_MAX_NAMESPACES
+              value: {{ .Values.config.limits.maxNamespaces | quote }}
+            - name: TRAIL_STASH_MAX_ENTRY_KIB
+              value: {{ .Values.config.limits.maxEntryKiB | quote }}
+            - name: TRAIL_STASH_MAX_KEYS_PER_NAMESPACE
+              value: {{ .Values.config.limits.maxKeysPerNamespace | quote }}
+            - name: TRAIL_STASH_MAX_CONTENT_MIB
+              value: {{ .Values.config.limits.maxContentMiB | quote }}
+            - name: TRAIL_STASH_MAX_RECORD_MIB
+              value: {{ .Values.config.limits.maxRecordMiB | quote }}
+            - name: TRAIL_STASH_FETCH_CONCURRENCY
+              value: {{ .Values.config.limits.fetchConcurrency | quote }}
             {{- if .Values.config.relayUrls }}
             - name: TRAIL_STASH_RELAY_URLS
               value: {{ join "," .Values.config.relayUrls | quote }}

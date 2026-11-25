@@ -60,6 +60,7 @@ there.
 | `PORT`                           | no               | `8787`                   | Control-API port.                                         |
 | `TRAIL_STASH_RETENTION_HOURS`    | no               | `48`                     | Prune window (clamped 1–336). Lower ⇒ less data at rest.  |
 | `TRAIL_STASH_PRUNE_INTERVAL_MIN` | no               | `15`                     | Prune sweep cadence.                                      |
+| `TRAIL_STASH_MAX_*`              | no               | see README               | Resource limits (README "Resource limits").               |
 | `APNS_BUNDLE_ID` / `APNS_HOST`   | for iOS push     | — / `api.push.apple.com` | Enables the APNs route.                                   |
 | `FCM_PROJECT_ID`                 | for Android push | —                        | Enables the FCM route.                                    |
 | `APNS_BEARER` / `FCM_BEARER`     | for push         | —                        | **Placeholder** static push credentials (see "Push").     |

@@ -24,6 +24,17 @@
 //! * `TRAIL_STASH_PRUNE_INTERVAL_MIN`   — prune cadence (default 15).
 //! * `TRAIL_STASH_RELAY_URLS`           — comma-separated custom iroh relay URLs.
 //! * `TRAIL_STASH_RELAY_TOKEN`          — optional bearer token for the custom relays.
+//! * `TRAIL_STASH_MAX_NAMESPACES`       — namespaces held at once; new grants past it get a 503
+//!   (default 2048).
+//! * `TRAIL_STASH_MAX_ENTRY_KIB`        — largest content blob carried (default 512, floor 320:
+//!   the sealed repeater card is ~256 KiB).
+//! * `TRAIL_STASH_MAX_KEYS_PER_NAMESPACE` — content-bearing keys carried per namespace
+//!   (default 256).
+//! * `TRAIL_STASH_MAX_CONTENT_MIB`      — total ciphertext held (default 128).
+//! * `TRAIL_STASH_MAX_RECORD_MIB`       — total entry records; past it the largest namespace is
+//!   evicted (default 64).
+//! * `TRAIL_STASH_FETCH_CONCURRENCY`    — content fetches in flight (default 8, two per namespace).
+//!   All six: see `trail_stash::limits`.
 //! * `OTEL_EXPORTER_OTLP_ENDPOINT`      — developer telemetry (`otel` builds only): OTLP/HTTP
 //!   base URL of a collector (e.g. `http://otel-collector:4318`). Unset ⇒ telemetry dormant.
 //! * `OTEL_SERVICE_NAME`                — telemetry service name (default `trail-stash`).
@@ -86,12 +97,13 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let node = StashNode::spawn_with(
+    let node = StashNode::spawn_with_limits(
         storage,
         secret,
         config.retention,
         &config.relay_urls,
         config.relay_token.as_deref(),
+        config.limits,
         default_delivery(), // MLS passthrough stub
         build_waker(),      // HttpPushWaker when push env is set, else no-op
     )
@@ -111,6 +123,16 @@ async fn main() -> Result<()> {
         "stash up — latest-fix backstop {}h, prune every {}m",
         config.retention.retention_ms() / trail_stash::retention::MS_PER_HOUR,
         config.prune_interval_min,
+    );
+    tracing::info!(
+        "stash limits — {} namespaces, {} KiB per entry, {} keys per namespace, {} MiB content, \
+         {} MiB records, {} fetches at once",
+        config.limits.max_namespaces,
+        config.limits.max_entry_bytes / 1024,
+        config.limits.max_keys_per_namespace,
+        config.limits.max_content_bytes / (1024 * 1024),
+        config.limits.max_record_bytes / (1024 * 1024),
+        config.limits.fetch_concurrency,
     );
     if std::env::var("TRAIL_STASH_PRINT_TICKET").as_deref() == Ok("1") {
         println!("TRAIL_STASH_TICKET={}", node.node_ticket());

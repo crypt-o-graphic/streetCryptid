@@ -2,7 +2,22 @@
 //! testable without touching the real process environment (the same pattern the pairing-mailbox
 //! uses for its clock). All numeric knobs are clamped to sane bounds.
 
+use crate::limits::Limits;
 use crate::retention::RetentionPolicy;
+
+/// Bounds on the resource limits (see [`crate::limits`]). Floors keep an operator typo from
+/// refusing every legitimate entry; ceilings keep one from switching a bound off.
+pub const MIN_MAX_NAMESPACES: usize = 1;
+pub const MAX_MAX_NAMESPACES: usize = 1_000_000;
+/// The floor still holds the largest legitimate entry (the ~256 KiB sealed repeater card).
+pub const MIN_MAX_ENTRY_KIB: u64 = 320;
+pub const MAX_MAX_ENTRY_KIB: u64 = 16 * 1024;
+pub const MIN_MAX_KEYS_PER_NAMESPACE: usize = 16;
+pub const MAX_MAX_KEYS_PER_NAMESPACE: usize = 65_536;
+pub const MIN_BUDGET_MIB: u64 = 8;
+pub const MAX_BUDGET_MIB: u64 = 64 * 1024;
+pub const MIN_FETCH_CONCURRENCY: usize = 1;
+pub const MAX_FETCH_CONCURRENCY: usize = 64;
 
 /// Control-API port.
 pub const DEFAULT_PORT: u16 = 8787;
@@ -47,6 +62,8 @@ pub struct StashConfig {
     pub peers: Vec<String>,
     /// Cadence of that reconciliation.
     pub peer_sync_interval_min: u64,
+    /// What an untrusted granter can make this node hold. See [`crate::limits`].
+    pub limits: Limits,
 }
 
 impl StashConfig {
@@ -57,8 +74,59 @@ impl StashConfig {
     /// `TRAIL_STASH_PRUNE_INTERVAL_MIN`, `TRAIL_STASH_PSK`, comma-separated
     /// `TRAIL_STASH_RELAY_URLS`, optional `TRAIL_STASH_RELAY_TOKEN`, and the repeater keys
     /// `TRAIL_STASH_DATA_DIR`, comma-separated `TRAIL_STASH_PEERS` and
-    /// `TRAIL_STASH_PEER_SYNC_INTERVAL_MIN`.
+    /// `TRAIL_STASH_PEER_SYNC_INTERVAL_MIN`, and the limits `TRAIL_STASH_MAX_NAMESPACES`,
+    /// `TRAIL_STASH_MAX_ENTRY_KIB`, `TRAIL_STASH_MAX_KEYS_PER_NAMESPACE`,
+    /// `TRAIL_STASH_MAX_CONTENT_MIB`, `TRAIL_STASH_MAX_RECORD_MIB` and
+    /// `TRAIL_STASH_FETCH_CONCURRENCY`.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Limits::default();
+        let number = |key: &str, default: u64, min: u64, max: u64| -> u64 {
+            get(key)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
+                .clamp(min, max)
+        };
+        let limits = Limits {
+            max_namespaces: number(
+                "TRAIL_STASH_MAX_NAMESPACES",
+                defaults.max_namespaces as u64,
+                MIN_MAX_NAMESPACES as u64,
+                MAX_MAX_NAMESPACES as u64,
+            ) as usize,
+            max_entry_bytes: number(
+                "TRAIL_STASH_MAX_ENTRY_KIB",
+                defaults.max_entry_bytes / 1024,
+                MIN_MAX_ENTRY_KIB,
+                MAX_MAX_ENTRY_KIB,
+            ) * 1024,
+            max_keys_per_namespace: number(
+                "TRAIL_STASH_MAX_KEYS_PER_NAMESPACE",
+                defaults.max_keys_per_namespace as u64,
+                MIN_MAX_KEYS_PER_NAMESPACE as u64,
+                MAX_MAX_KEYS_PER_NAMESPACE as u64,
+            ) as usize,
+            max_content_bytes: number(
+                "TRAIL_STASH_MAX_CONTENT_MIB",
+                defaults.max_content_bytes / (1024 * 1024),
+                MIN_BUDGET_MIB,
+                MAX_BUDGET_MIB,
+            ) * 1024
+                * 1024,
+            max_record_bytes: number(
+                "TRAIL_STASH_MAX_RECORD_MIB",
+                defaults.max_record_bytes / (1024 * 1024),
+                MIN_BUDGET_MIB,
+                MAX_BUDGET_MIB,
+            ) * 1024
+                * 1024,
+            fetch_concurrency: number(
+                "TRAIL_STASH_FETCH_CONCURRENCY",
+                defaults.fetch_concurrency as u64,
+                MIN_FETCH_CONCURRENCY as u64,
+                MAX_FETCH_CONCURRENCY as u64,
+            ) as usize,
+        };
+
         let port = get("PORT")
             .and_then(|v| v.trim().parse::<u16>().ok())
             .filter(|p| *p != 0)
@@ -121,6 +189,7 @@ impl StashConfig {
             data_dir,
             peers,
             peer_sync_interval_min,
+            limits,
         }
     }
 }
@@ -227,6 +296,44 @@ mod tests {
         assert_eq!(
             StashConfig::from_env(getter(&[("TRAIL_STASH_PSK", "   ")])).psk,
             None
+        );
+    }
+
+    #[test]
+    fn limits_default_parse_and_clamp() {
+        assert_eq!(StashConfig::from_env(getter(&[])).limits, Limits::default());
+        let cfg = StashConfig::from_env(getter(&[
+            ("TRAIL_STASH_MAX_NAMESPACES", " 100 "),
+            ("TRAIL_STASH_MAX_ENTRY_KIB", "1024"),
+            ("TRAIL_STASH_MAX_KEYS_PER_NAMESPACE", "32"),
+            ("TRAIL_STASH_MAX_CONTENT_MIB", "64"),
+            ("TRAIL_STASH_MAX_RECORD_MIB", "16"),
+            ("TRAIL_STASH_FETCH_CONCURRENCY", "4"),
+        ]));
+        assert_eq!(
+            cfg.limits,
+            Limits {
+                max_namespaces: 100,
+                max_entry_bytes: 1024 * 1024,
+                max_keys_per_namespace: 32,
+                max_content_bytes: 64 * 1024 * 1024,
+                max_record_bytes: 16 * 1024 * 1024,
+                fetch_concurrency: 4,
+            }
+        );
+        // A typo cannot refuse the largest legitimate entry, nor switch a bound off.
+        let cfg = StashConfig::from_env(getter(&[
+            ("TRAIL_STASH_MAX_NAMESPACES", "0"),
+            ("TRAIL_STASH_MAX_ENTRY_KIB", "1"),
+            ("TRAIL_STASH_MAX_CONTENT_MIB", "99999999999"),
+            ("TRAIL_STASH_FETCH_CONCURRENCY", "junk"),
+        ]));
+        assert_eq!(cfg.limits.max_namespaces, MIN_MAX_NAMESPACES);
+        assert_eq!(cfg.limits.max_entry_bytes, MIN_MAX_ENTRY_KIB * 1024);
+        assert_eq!(cfg.limits.max_content_bytes, MAX_BUDGET_MIB * 1024 * 1024);
+        assert_eq!(
+            cfg.limits.fetch_concurrency,
+            Limits::default().fetch_concurrency
         );
     }
 
