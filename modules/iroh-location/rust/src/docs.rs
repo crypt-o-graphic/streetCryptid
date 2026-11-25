@@ -85,6 +85,23 @@ const SYNC_FIRST_EVENT_TIMEOUT_SECS: u64 = 25;
 /// but a peer that connects and then stalls would otherwise hold a headless context open.
 pub const PUSH_TIMEOUT_SECS: u64 = 30;
 
+/// The largest entry content this node will load into memory from a namespace it does not write.
+///
+/// Every legitimate entry is bounded by its own type: a v3/v4 envelope is a 64-byte padded
+/// payload plus about 150 bytes per wrap ([`crate::crypto::MAX_V3_WRAPS`] at most), a profile
+/// record is at most `profile::MAX_PROFILE_BYTES`, and the largest, a sealed repeater card, is
+/// [`crate::repeater::MAX_CARD_BYTES`] plus sealing overhead. Any friend can write an entry of any
+/// size into their own namespace, and `get_bytes` reads it whole, so without this bound one paired
+/// friend could make every read of their slot allocate (and every pull fetch) as much as they
+/// liked. Twice the card, matching the stash's default (`TRAIL_STASH_MAX_ENTRY_KIB`). Reads and
+/// stranded fetches skip a larger entry as if its content were absent.
+pub const MAX_ENTRY_BYTES: u64 = 2 * crate::repeater::MAX_CARD_BYTES as u64;
+
+/// Whether an entry of `content_len` bytes is small enough to read ([`MAX_ENTRY_BYTES`]).
+pub fn entry_fits(content_len: u64) -> bool {
+    content_len <= MAX_ENTRY_BYTES
+}
+
 /// How much longer a push waits for friends once a durable carrier — the stash, or one of our
 /// repeaters — has its copy (`settle_on` in [`TrailDocs::push`]).
 ///
@@ -541,6 +558,9 @@ pub fn keys_to_prune(entries: &[(Vec<u8>, u64)], older_than_ts: u64) -> Vec<Vec<
 pub struct ReplicaSlot {
     pub author: Vec<u8>,
     pub seq: u64,
+    /// The header's `ts`. From builds that seal it at publish time (see `write_ratcheted`) this
+    /// is when the envelope was SEALED, not when the position was measured; older senders wrote
+    /// the capture time here. The name is kept because it crosses the binding.
     pub fix_ts: u64,
     pub has_content: bool,
 }
@@ -1256,7 +1276,10 @@ impl TrailDocs {
         while let Some(signed) = stream.next().await {
             let signed = signed?;
             let entry = signed.entry();
-            if entry.timestamp() <= since_us || entry.content_len() == 0 {
+            if entry.timestamp() <= since_us
+                || entry.content_len() == 0
+                || !entry_fits(entry.content_len())
+            {
                 continue;
             }
             let Ok(content) = self.blobs.blobs().get_bytes(entry.content_hash()).await else {
@@ -1480,6 +1503,9 @@ impl TrailDocs {
                 if !is_fix && !is_null {
                     continue; // resync record, or a key an older build left behind
                 }
+                if !entry_fits(entry.content_len()) {
+                    continue;
+                }
                 match self.blobs.blobs().get_bytes(entry.content_hash()).await {
                     Ok(bytes) => out.push(bytes.to_vec()),
                     // Content not local. Not counted here — this runs on every read, and a read
@@ -1509,6 +1535,10 @@ impl TrailDocs {
                 let entry = entry?;
                 if entry.content_len() == 0 {
                     continue; // a tombstone names no bytes
+                }
+                if !entry_fits(entry.content_len()) {
+                    // Never fetch what we would refuse to read (`MAX_ENTRY_BYTES`).
+                    continue;
                 }
                 let Some(author) = decode_lane_author(entry.key()) else {
                     continue;
@@ -1691,8 +1721,8 @@ impl TrailDocs {
                 .key_exact(key.clone())
                 .build();
             let entry = match doc.get_one(query).await? {
-                Some(e) => e,
-                None => continue,
+                Some(e) if entry_fits(e.content_len()) => e,
+                _ => continue,
             };
             let bytes = match self.blobs.blobs().get_bytes(entry.content_hash()).await {
                 Ok(b) => b,
@@ -1738,7 +1768,7 @@ impl TrailDocs {
                     Some(author) => author,
                     None => continue, // null, resync, or a key an older build left behind
                 };
-                let bytes = if entry.content_len() == 0 {
+                let bytes = if entry.content_len() == 0 || !entry_fits(entry.content_len()) {
                     None
                 } else {
                     self.blobs
@@ -2164,7 +2194,10 @@ impl TrailDocs {
             let mut out = Vec::new();
             while let Some(entry) = rx.recv().await? {
                 let entry = entry?;
-                if entry.content_len() == 0 || decode_key(entry.key()).is_none() {
+                if entry.content_len() == 0
+                    || decode_key(entry.key()).is_none()
+                    || !entry_fits(entry.content_len())
+                {
                     continue;
                 }
                 let hash = entry.content_hash();

@@ -63,7 +63,14 @@ pub struct WireRequest {
     pub ts: u64,
 }
 
-/// The tag a follower addresses a request to its `leader` with.
+/// The LEGACY tag a follower addressed a request to its `leader` with: an unkeyed hash of two
+/// public endpoint ids.
+///
+/// It did not hide what the comment on [`WireRequest`] says it hides. Every friend reads the
+/// record and knows its own friends' endpoint ids, so any friend could compute
+/// `request_tag(their_friend, you)` for each of them and learn which of their friends are also
+/// yours, and which of those you are failing to reach. Writers now use [`RequestKey::tag`];
+/// readers still accept this form so a request from a follower on an older build is answered.
 pub fn request_tag(leader: &[u8; 32], follower: &[u8; 32]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new_derive_key(REQUEST_TAG_CONTEXT);
     hasher.update(leader);
@@ -71,6 +78,54 @@ pub fn request_tag(leader: &[u8; 32], follower: &[u8; 32]) -> [u8; 16] {
     let mut tag = [0u8; 16];
     tag.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     tag
+}
+
+/// Context for the keyed request tag. A different context from the legacy one, so the two forms
+/// can never collide.
+const KEYED_REQUEST_TAG_CONTEXT: &str = "sc-dr/v2/restart-request-keyed";
+
+/// Our half of the pair secret that keys request tags: the X25519 form of our endpoint identity.
+///
+/// The pair secret is a static-static DH between the two endpoint identities (Ed25519 keys taken
+/// to Montgomery form). Only the two ends of the pair can compute it, which is the whole
+/// requirement: a third friend who knows both endpoint ids learns nothing from the tag. It keys a
+/// hash and nothing else. No session or message key is ever derived from it, so §4's rule that no
+/// root comes from static-static DH still holds (a seized identity already yields every tag, and
+/// the tag only ever said "this pair has a request outstanding").
+pub struct RequestKey {
+    secret: x25519_dalek::StaticSecret,
+}
+
+impl RequestKey {
+    /// From the node's Ed25519 identity seed.
+    pub fn from_identity_seed(seed: &[u8; 32]) -> Self {
+        let signing = ed25519_dalek::SigningKey::from_bytes(seed);
+        Self {
+            secret: x25519_dalek::StaticSecret::from(signing.to_scalar_bytes()),
+        }
+    }
+
+    /// The pair secret with `peer` (an endpoint id), or `None` when `peer` is not a valid point or
+    /// the exchange is non-contributory.
+    fn shared(&self, peer: &[u8; 32]) -> Option<[u8; 32]> {
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(peer).ok()?;
+        let public = x25519_dalek::PublicKey::from(verifying.to_montgomery().to_bytes());
+        let shared = self.secret.diffie_hellman(&public);
+        shared.was_contributory().then(|| *shared.as_bytes())
+    }
+
+    /// The keyed tag for a request from `follower` to `leader`. `peer` is whichever of the two is
+    /// NOT us; both ends compute the same tag.
+    pub fn tag(&self, leader: &[u8; 32], follower: &[u8; 32], peer: &[u8; 32]) -> Option<[u8; 16]> {
+        let shared = self.shared(peer)?;
+        let mut hasher = blake3::Hasher::new_derive_key(KEYED_REQUEST_TAG_CONTEXT);
+        hasher.update(&shared);
+        hasher.update(leader);
+        hasher.update(follower);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Some(tag)
+    }
 }
 
 impl ControlRecord {
@@ -101,6 +156,25 @@ impl ControlRecord {
         }
     }
 
+    /// Like [`Self::new`], but addressing each request with the keyed tag ([`RequestKey::tag`]),
+    /// which only the leader it is meant for can recognise. A request to a peer whose id is not a
+    /// usable point keeps the legacy tag rather than being dropped.
+    pub fn new_keyed(
+        author: &[u8; 32],
+        ts: u64,
+        prekeys: &[PublishedPrekey],
+        requests: &[RestartRequest],
+        key: &RequestKey,
+    ) -> Self {
+        let mut record = Self::new(author, ts, prekeys, requests);
+        for (wire, request) in record.requests.iter_mut().zip(requests) {
+            if let Some(tag) = key.tag(&request.peer, author, &request.peer) {
+                wire.to = tag;
+            }
+        }
+        record
+    }
+
     pub fn encode(&self) -> Option<Vec<u8>> {
         postcard::to_allocvec(self).ok()
     }
@@ -124,12 +198,24 @@ impl ControlRecord {
             })
     }
 
-    /// The author's request to `leader` (us), if it has one outstanding.
+    /// The author's request to `leader` (us), if it has one outstanding, under the legacy tag only.
     pub fn request_for(&self, leader: &[u8; 32], author: &[u8; 32]) -> Option<u64> {
-        let tag = request_tag(leader, author);
+        self.request_for_keyed(leader, author, None)
+    }
+
+    /// The author's request to `leader` (us) under either tag: the keyed one (when we hold our
+    /// [`RequestKey`]) or the legacy one an older follower still writes.
+    pub fn request_for_keyed(
+        &self,
+        leader: &[u8; 32],
+        author: &[u8; 32],
+        key: Option<&RequestKey>,
+    ) -> Option<u64> {
+        let legacy = request_tag(leader, author);
+        let keyed = key.and_then(|key| key.tag(leader, author, author));
         self.requests
             .iter()
-            .filter(|r| r.to == tag)
+            .filter(|r| r.to == legacy || Some(r.to) == keyed)
             .map(|r| r.ts)
             .max()
     }
@@ -184,12 +270,24 @@ pub fn plan_leader(
     follower: &[u8; 32],
     now_ms: u64,
 ) -> Action {
+    plan_leader_keyed(assessment, peer_control, leader, follower, now_ms, None)
+}
+
+/// [`plan_leader`], also recognising keyed request tags with `key`.
+pub fn plan_leader_keyed(
+    assessment: &Assessment,
+    peer_control: Option<&ControlRecord>,
+    leader: &[u8; 32],
+    follower: &[u8; 32],
+    now_ms: u64,
+    key: Option<&RequestKey>,
+) -> Action {
     debug_assert_eq!(assessment.role, Role::Leader);
     if assessment.health == Health::NoSession {
         return Action::None;
     }
     let request = peer_control
-        .and_then(|c| c.request_for(leader, follower))
+        .and_then(|c| c.request_for_keyed(leader, follower, key))
         .filter(|ts| *ts > assessment.answered_request_ts);
     let own_evidence = matches!(
         assessment.health,
@@ -297,7 +395,14 @@ pub fn run_pass(
         }
         match assessment.role {
             Role::Leader => {
-                match plan_leader(&assessment, peer_controls.get(peer), &self_id, peer, now_ms) {
+                match plan_leader_keyed(
+                    &assessment,
+                    peer_controls.get(peer),
+                    &self_id,
+                    peer,
+                    now_ms,
+                    manager.request_key(),
+                ) {
                     Action::Restart { prekey, answering } => {
                         match manager.restart_as_leader(peer, &prekey, answering, now_ms) {
                             Ok(_) => report.restarted += 1,
@@ -354,10 +459,8 @@ pub fn our_control_record(
 ) -> Result<ControlRecord, SessionError> {
     let prekeys = manager.prekeys_for_publication(now_ms)?;
     let requests = manager.requests()?;
-    Ok(ControlRecord::new(
-        &manager.self_id(),
-        now_ms,
-        &prekeys,
-        &requests,
-    ))
+    Ok(match manager.request_key() {
+        Some(key) => ControlRecord::new_keyed(&manager.self_id(), now_ms, &prekeys, &requests, key),
+        None => ControlRecord::new(&manager.self_id(), now_ms, &prekeys, &requests),
+    })
 }

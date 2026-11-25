@@ -98,14 +98,35 @@ pub(crate) async fn post(
     if !status.is_success() {
         return Err(BatchFailure::Status(status.as_u16()));
     }
-    let bytes = response
-        .bytes()
+    // Read the body in chunks against a ceiling rather than `bytes()`, which buffers whatever the
+    // server sends: the stash URL is configurable, and a hostile or broken one must not be able to
+    // make a background wake allocate without bound.
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(BatchFailure::Decode("batch response too large".into()));
+    }
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| BatchFailure::Transport(e.to_string()))?;
+        .map_err(|e| BatchFailure::Transport(e.to_string()))?
+    {
+        if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(BatchFailure::Decode("batch response too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     let received = bytes.len();
     let decoded = decode_response(&bytes).map_err(|e| BatchFailure::Decode(e.to_string()))?;
     Ok((decoded, sent, received))
 }
+
+/// The largest batch response this client will read. A response carries at most a few hundred
+/// small entries (each bounded by `docs::MAX_ENTRY_BYTES` on the read side); this is generous.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

@@ -73,6 +73,16 @@ pub const CONTROL_V: u8 = 1;
 /// restarted before the peer answers, with the pairing session still readable behind both.
 pub const MAX_PREVIOUS_SESSIONS: usize = 2;
 
+/// How long a replaced session is kept for decryption after it was replaced.
+///
+/// An archived session holds a root key, our ratchet secret and a receiving chain: everything a
+/// copy of this device needs to open what was sealed under it. Kept by count alone, two of them
+/// sat on disk until two MORE restarts happened, which for a healthy pair can be months. It only
+/// exists for envelopes sealed before the sender adopted the restart; a week is well past any
+/// such straggler being the newest thing in its slot (the replica keeps one per author), and past
+/// the follower's own prekey retention.
+pub const ARCHIVED_SESSION_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// Another writer in this process already holds this directory (see the module docs).
@@ -144,6 +154,31 @@ impl SessionRecord {
         }
         self.previous.truncate(MAX_PREVIOUS_SESSIONS);
         self.current = Some(entry);
+    }
+
+    /// Drop archived sessions replaced more than [`ARCHIVED_SESSION_MAX_AGE_MS`] ago. Returns
+    /// whether anything was dropped.
+    ///
+    /// A session's replacement time is its successor's install time, which the record already
+    /// holds: `previous[0]` was replaced when `current` was installed, `previous[i]` when
+    /// `previous[i - 1]` was. A clock that runs backwards keeps sessions longer, never shorter.
+    pub fn prune_archive(&mut self, now_ms: u64) -> bool {
+        let mut replaced_at = match self.current.as_ref() {
+            Some(current) => current.created_ms,
+            None => return false,
+        };
+        let mut keep = 0;
+        for entry in &self.previous {
+            if now_ms.saturating_sub(replaced_at) > ARCHIVED_SESSION_MAX_AGE_MS {
+                break;
+            }
+            keep += 1;
+            replaced_at = entry.created_ms;
+        }
+        let dropped = keep < self.previous.len();
+        // Zeroize-on-drop is the state's own (`RatchetState` holds its keys in zeroizing types).
+        self.previous.truncate(keep);
+        dropped
     }
 }
 

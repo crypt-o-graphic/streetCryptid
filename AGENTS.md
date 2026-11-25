@@ -455,9 +455,10 @@ failed` for the life of the process. On 2026-11-15 a single panicking accept tas
 - **The stash grant belongs to the node** (`rust/src/stash.rs`, span `stash.grant`). The stash keeps
   its namespace list in memory and forgets it on every restart (2026-10-03 18:39, 2026-10-06 03:56);
   JS re-registered only on a foreground launch, so a phone the native runtime drove stayed
-  unregistered. The node grants on every start, on a stash opt-in change, per imported friend, and
-  (floored, 10 min) when an upload reports `untracked` slots — what a stash that forgot us looks
-  like. JS's `syncStashGrants` calls `grantStash()` and keeps its HTTP only for older binaries.
+  unregistered. The node grants on every start, on a stash opt-in change, and (floored, 10 min)
+  when an upload reports `untracked` slots — what a stash that forgot us looks like. It grants
+  OUR namespaces only (trail and profile), never a friend's: granting friends' tickets put a
+  friend who had turned the stash off back on it through everyone who had it on. JS's `syncStashGrants` calls `grantStash()` and keeps its HTTP only for older binaries.
 - **`IrohBackgroundBootstrap.swift` runs before React, and must return `true`.**
   `ExpoAppDelegateSubscriberManager` reduces `willFinishLaunchingWithOptions` with
   `?? false || result` and short-circuits to `true` only when NO subscriber implements it; once ours
