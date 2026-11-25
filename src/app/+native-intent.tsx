@@ -1,3 +1,4 @@
+import { DEV_COMMANDS_ENABLED } from '@/features/dev/commands/gate';
 import { checkClaimLink, isWebClaimLink } from '@/features/repeaters/core/repeaters';
 import { decodePairLink, isWebPairLink } from '@/features/social/core/pair-link';
 
@@ -57,6 +58,8 @@ export function redirectSystemPath({ path }: NativeIntentOptions): string {
     const route = url.hostname || url.pathname.replace(/^\/+/, '').split('/')[0];
 
     if (route === 'dev') {
+      // A store build does not answer the command channel (`DEV_COMMANDS_ENABLED`); open the map.
+      if (!DEV_COMMANDS_ENABLED) return '/';
       const cmd = url.searchParams.get('cmd');
       const id = url.searchParams.get('id');
       // Both halves or nothing: a command with no nonce could not be observed, and a

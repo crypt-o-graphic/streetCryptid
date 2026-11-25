@@ -132,6 +132,10 @@ function getDb(): Promise<SqliteDb | null> {
     if (!mod) return null;
     try {
       const db = await mod.openDatabaseAsync(DB_NAME);
+      // Per connection, so on every open: shipped and trimmed rows carry location-pipeline detail
+      // (`sc.*` join keys, drop reasons, timings), and a deleted row must not survive in a freed
+      // page (social/net/persistence.ts says why).
+      await db.execAsync('PRAGMA secure_delete = ON;');
       await db.execAsync(`CREATE TABLE IF NOT EXISTS event_log (
         id TEXT PRIMARY KEY NOT NULL,
         timestamp INTEGER NOT NULL,

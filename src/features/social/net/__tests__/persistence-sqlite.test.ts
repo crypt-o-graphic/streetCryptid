@@ -134,6 +134,13 @@ maybe('SQLite trail storage', () => {
     expect(strayPeers).toEqual([]);
   });
 
+  it('turns secure_delete on for the connection it opens', async () => {
+    const { db, storage } = openStorage();
+    await storage.friendLatest();
+    // Without it a removed friend's fix stays in a freed page of the file.
+    expect(db.prepare('PRAGMA secure_delete').get()).toEqual({ secure_delete: 1 });
+  });
+
   it('adds the deliverer column to a table that predates it', async () => {
     const { storage } = openStorage((raw) => {
       raw.exec(LEGACY_SCHEMA);

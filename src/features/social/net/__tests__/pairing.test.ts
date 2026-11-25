@@ -1257,6 +1257,37 @@ describe('LocationSharingService — pairing / profile wiring', () => {
     expect(mockHolder.mod.calls.cancelPair).toContain('sess-rejected');
     expect(mockHolder.mod.calls.forgetSession).not.toContain('peer-rejected');
     expect(mockHolder.mod.calls.importDocTicket).not.toContain('peer-trail');
+    // `finalize` imported both namespaces into the node's book before the reveal; a reject that
+    // left them there would have the node reopen and sync a rejected person on every start.
+    expect(mockHolder.mod.calls.forgetDocTicket).toEqual(['peer-trail']);
+    expect(mockHolder.mod.calls.forgetProfileTicket).toEqual(['peer-profile']);
+  });
+
+  it('does not forget the namespaces of a friend whose re-pair is rejected', async () => {
+    const svc = newService();
+    const snap = watch(svc);
+    await svc.init('@me', 'mothman');
+    await discover(svc, mockHolder.mod, 'same-peer', 'old-session');
+    await svc.acknowledgeDiscoveredFriend();
+    await discover(svc, mockHolder.mod, 'same-peer', 'new-session');
+    await svc.rejectDiscoveredFriend();
+    expect(snap.current?.friends.map((friend) => friend.endpointId)).toEqual(['same-peer']);
+    // A phone's trail namespace is stable, so the rejected round named the one the standing
+    // friendship still reads.
+    expect(mockHolder.mod.calls.forgetDocTicket).toEqual([]);
+    expect(mockHolder.mod.calls.forgetProfileTicket).toEqual([]);
+  });
+
+  it('tolerates a binary without the forget calls when a discovery is rejected', async () => {
+    const svc = newService();
+    const snap = watch(svc);
+    await svc.init('@me', 'mothman');
+    await discover(svc, mockHolder.mod, 'peer-old-binary');
+    (mockHolder.mod as { forgetDocTicket?: unknown }).forgetDocTicket = undefined;
+    (mockHolder.mod as { forgetProfileTicket?: unknown }).forgetProfileTicket = undefined;
+    await svc.rejectDiscoveredFriend();
+    expect(snap.current?.pairing.discoveredFriend).toBeNull();
+    expect(snap.current?.friends).toEqual([]);
   });
 
   it('does not resurrect a rejected discovery from a stale completion or late profile', async () => {

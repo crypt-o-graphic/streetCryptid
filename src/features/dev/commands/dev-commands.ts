@@ -2,6 +2,8 @@ import type { TrailReplicaAuthor } from 'iroh-location';
 
 import { flushEventLog, recordEventLog } from '@/features/dev/telemetry';
 
+import { DEV_COMMANDS_ENABLED } from './gate';
+
 /**
  * The developer command channel: `streetcryptid://dev?cmd=<name>&id=<nonce>`.
  *
@@ -14,9 +16,12 @@ import { flushEventLog, recordEventLog } from '@/features/dev/telemetry';
  *
  * Every command calls an ORDINARY service method — there is no test-only path behind any of them.
  * `sync-trail` is exactly what a resume already runs; `replica-status` is local metadata with no
- * location data in it. That is also why this ships in Release ungated, on the same footing as the
- * Settings DEBUG section, whose `PUSH NOW` button is not `__DEV__`-gated either: the surface is a
- * convenience, not a new capability.
+ * location data in it.
+ *
+ * It is still gated to dev and developer-telemetry builds (`DEV_COMMANDS_ENABLED`). Unlike a
+ * Settings button, a URL can be opened by anything on the phone — a web page, another app — so in
+ * a store build it let a stranger make the app dial the stash and every friend whenever they
+ * liked, and its acknowledgement goes to an event log a store build does not have.
  */
 export interface DevCommandContext {
   /** Reconcile the durable replica against the stash and the pool — the resume path. */
@@ -77,6 +82,10 @@ export async function runDevCommand(
   id: string,
   context: DevCommandContext
 ): Promise<void> {
+  // Here, at the one place a command runs, and not only in `+native-intent`: a plain
+  // `streetcryptid:///?dev=…&devId=…` reaches the map screen's params without passing the
+  // redirect's `dev` route.
+  if (!DEV_COMMANDS_ENABLED) return;
   const started = Date.now();
   try {
     if (!isDevCommandName(name)) {

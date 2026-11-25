@@ -1408,36 +1408,42 @@ final class BackgroundLocationRuntime: NSObject, CLLocationManagerDelegate {
     defaults.set(Int(slotIntervalMs), forKey: "sc.bg.interval_ms")
     defaults.set(movingDistanceFilter, forKey: "sc.bg.distance_m")
     defaults.set(movingAccuracy, forKey: "sc.bg.accuracy_m")
-    if let stopAnchor {
-      defaults.set(stopAnchor.coordinate.latitude, forKey: "sc.bg.anchor.lat")
-      defaults.set(stopAnchor.coordinate.longitude, forKey: "sc.bg.anchor.lon")
-      defaults.set(stopAnchor.timestamp.timeIntervalSince1970, forKey: "sc.bg.anchor.ts")
-      defaults.set(stopVia?.rawValue, forKey: "sc.bg.anchor.via")
-    } else {
-      defaults.removeObject(forKey: "sc.bg.anchor.lat")
-      defaults.removeObject(forKey: "sc.bg.anchor.lon")
-      defaults.removeObject(forKey: "sc.bg.anchor.ts")
-      defaults.removeObject(forKey: "sc.bg.anchor.via")
-    }
     if let lastVisitAt {
       defaults.set(lastVisitAt.timeIntervalSince1970, forKey: "sc.bg.last_visit_ts")
     }
-    Self.write(unverifiedDeparture?.anchor, prefix: "sc.bg.departed", to: defaults)
-    if let at = unverifiedDeparture?.at {
-      defaults.set(at.timeIntervalSince1970, forKey: "sc.bg.departed.at")
+    // Positions go to `RuntimeLocationStore`, not `UserDefaults`: defaults are always in the
+    // device backup, and where the phone last stopped is not something a backup should carry.
+    let places = RuntimeLocationStore.shared
+    if let stopAnchor {
+      places.set(stopAnchor.coordinate.latitude, forKey: "sc.bg.anchor.lat")
+      places.set(stopAnchor.coordinate.longitude, forKey: "sc.bg.anchor.lon")
+      places.set(stopAnchor.timestamp.timeIntervalSince1970, forKey: "sc.bg.anchor.ts")
+      places.set(stopVia?.rawValue, forKey: "sc.bg.anchor.via")
     } else {
-      defaults.removeObject(forKey: "sc.bg.departed.at")
+      places.removeObject(forKey: "sc.bg.anchor.lat")
+      places.removeObject(forKey: "sc.bg.anchor.lon")
+      places.removeObject(forKey: "sc.bg.anchor.ts")
+      places.removeObject(forKey: "sc.bg.anchor.via")
     }
-    writeCandidate(to: defaults)
+    Self.write(unverifiedDeparture?.anchor, prefix: "sc.bg.departed", to: places)
+    if let at = unverifiedDeparture?.at {
+      places.set(at.timeIntervalSince1970, forKey: "sc.bg.departed.at")
+    } else {
+      places.removeObject(forKey: "sc.bg.departed.at")
+    }
+    writeCandidate(to: places)
+    places.commit()
   }
 
   /// Write the dwell-in-progress — `stopCandidate` and `visitArrival` — if it changed. See both.
   private func persistCandidateIfChanged() {
     guard candidateDirty else { return }
-    writeCandidate(to: UserDefaults.standard)
+    let places = RuntimeLocationStore.shared
+    writeCandidate(to: places)
+    places.commit()
   }
 
-  private func writeCandidate(to defaults: UserDefaults) {
+  private func writeCandidate(to defaults: RuntimeLocationStore) {
     candidateDirty = false
     Self.write(stopCandidate?.centre, prefix: "sc.bg.candidate", to: defaults)
     if let since = stopCandidate?.since {
@@ -1449,7 +1455,9 @@ final class BackgroundLocationRuntime: NSObject, CLLocationManagerDelegate {
     Self.write(visitArrival, prefix: "sc.bg.visit_arrival", to: defaults)
   }
 
-  private static func write(_ location: CLLocation?, prefix: String, to defaults: UserDefaults) {
+  private static func write(
+    _ location: CLLocation?, prefix: String, to defaults: RuntimeLocationStore
+  ) {
     guard let location else {
       for key in ["lat", "lon", "acc", "ts"] { defaults.removeObject(forKey: "\(prefix).\(key)") }
       return
@@ -1460,7 +1468,9 @@ final class BackgroundLocationRuntime: NSObject, CLLocationManagerDelegate {
     defaults.set(location.timestamp.timeIntervalSince1970, forKey: "\(prefix).ts")
   }
 
-  private static func readLocation(prefix: String, from defaults: UserDefaults) -> CLLocation? {
+  private static func readLocation(
+    prefix: String, from defaults: RuntimeLocationStore
+  ) -> CLLocation? {
     guard defaults.object(forKey: "\(prefix).lat") != nil else { return nil }
     return CLLocation(
       coordinate: CLLocationCoordinate2D(
@@ -1474,7 +1484,7 @@ final class BackgroundLocationRuntime: NSObject, CLLocationManagerDelegate {
 
   /// Bring back a dwell an earlier process started. Only while `moving` — a restored `stopped`
   /// already has its anchor, and a candidate beside it would be a contradiction.
-  private func restoreCandidate(from defaults: UserDefaults) {
+  private func restoreCandidate(from defaults: RuntimeLocationStore) {
     guard state == .moving else { return }
     if let centre = Self.readLocation(prefix: "sc.bg.candidate", from: defaults),
       defaults.object(forKey: "sc.bg.candidate.since") != nil
@@ -1536,12 +1546,15 @@ final class BackgroundLocationRuntime: NSObject, CLLocationManagerDelegate {
     if accuracy > 0 { movingAccuracy = accuracy }
     let visitTs = defaults.double(forKey: "sc.bg.last_visit_ts")
     if visitTs > 0 { lastVisitAt = Date(timeIntervalSince1970: visitTs) }
-    restoreCandidate(from: defaults)
-    guard defaults.object(forKey: "sc.bg.anchor.lat") != nil else { return }
-    stopVia = defaults.string(forKey: "sc.bg.anchor.via").flatMap(StopEvidence.init(rawValue:))
-    let lat = defaults.double(forKey: "sc.bg.anchor.lat")
-    let lon = defaults.double(forKey: "sc.bg.anchor.lon")
-    let ts = defaults.double(forKey: "sc.bg.anchor.ts")
+    // Behind `ProtectedDataGate` like the rest of this function; the first read moves the keys
+    // older builds left in `UserDefaults` (see `RuntimeLocationStore`).
+    let places = RuntimeLocationStore.shared
+    restoreCandidate(from: places)
+    guard places.object(forKey: "sc.bg.anchor.lat") != nil else { return }
+    stopVia = places.string(forKey: "sc.bg.anchor.via").flatMap(StopEvidence.init(rawValue:))
+    let lat = places.double(forKey: "sc.bg.anchor.lat")
+    let lon = places.double(forKey: "sc.bg.anchor.lon")
+    let ts = places.double(forKey: "sc.bg.anchor.ts")
     stopAnchor = CLLocation(
       coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
       altitude: 0,

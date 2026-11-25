@@ -94,6 +94,11 @@ public class IrohBackgroundAppDelegateSubscriber: ExpoAppDelegateSubscriber {
     // launch reaches here a moment after `willFinishLaunching`, inside the same launch transaction.
     BackgroundWakeLedger.noteLaunch(background: background)
 
+    // Before React can open a database: expo-sqlite's directory and the runtime's location state
+    // are stamped out of the device backup on every launch, since a re-created directory loses
+    // the flag. Behind the gate because a locked phone cannot stamp its files.
+    AppDataBackupExclusion.apply()
+
     // Rust telemetry, but ONLY on a launch that will not start React.
     //
     // The OTLP layer is dormant until something hands it an endpoint, and a JS-free wake has
