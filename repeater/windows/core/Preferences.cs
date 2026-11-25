@@ -20,7 +20,12 @@ public sealed record Preferences
 
     [JsonIgnore] public bool UsesService => RunAsService == true;
     /// <summary>What this person chose for the host; the app brings the host into line on every connection.</summary>
-    public bool Telemetry { get; init; } = true;
+    /// <remarks>
+    /// Off until the person turns <b>Send diagnostics</b> on. It defaulted to on, with the setup
+    /// toggle pre-ticked, which made export opt-out while the README promised opt-in; a choice
+    /// saved in settings.json is kept either way.
+    /// </remarks>
+    public bool Telemetry { get; init; }
     public bool KeepAwake { get; init; }
 
     [JsonIgnore] public HostSettings HostSettings => new(Telemetry, KeepAwake);

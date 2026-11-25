@@ -76,8 +76,12 @@ Turning it on asks for administrator approval once. The installer then:
 - registers `StreetCryptidRepeater` as its own virtual account (`NT SERVICE\StreetCryptidRepeater`),
   delayed automatic start, restart on failure, holding only `SeChangeNotifyPrivilege` — in
   particular not `SeImpersonatePrivilege`;
-- secures `%ProgramData%\streetCryptid` to SYSTEM, Administrators and the service (ProgramData lets
-  any user pre-create folders, so it takes ownership first);
+- secures `%ProgramData%\streetCryptid` to SYSTEM, Administrators and the service. ProgramData lets
+  any user pre-create folders, so a `streetCryptid`, `Repeater` or `Repeater.incoming` that is a
+  link, or holds anything owned by someone other than SYSTEM, Administrators, the service or the
+  installing administrator, is renamed aside to `<name>.untrusted-<id>` and never used (it may hold
+  a key someone planted, or one they could read); a missing root is created with its DACL in one
+  call. The service refuses to start on a state directory that fails the same check;
 - **moves** the identity and everything the node keeps from the per-user directory into
   `%ProgramData%\streetCryptid\Repeater`, and marks the per-user directory so a per-user host can
   never mint a second identity there (`moved-to-service`).
@@ -87,7 +91,8 @@ deletes the source; an interrupted move is finished by running it again. Two dif
 are never merged or overwritten: the installer stops and says so.
 
 The app talks to the service over the `streetcryptid-repeater` pipe, which only the installing
-account (plus SYSTEM and the service) may open, and which refuses remote clients. Before trusting
+account (plus SYSTEM and the service) may open, and which refuses remote clients
+(`PIPE_REJECT_REMOTE_CLIENTS` on every instance, and a deny for `NETWORK`). Before trusting
 it the app checks that the process serving the pipe is the running service. The service forwards only the host's settings, network, name and release commands, and drops a
 client that sends anything else.
 
@@ -153,8 +158,8 @@ the screen reports when a restart is required. See [connection settings](../host
 key handling, defaults and storage.
 
 `SC_REPEATER_OTEL_ENDPOINT` (CI's `REPEATER_OTEL_ENDPOINT` variable) is the default collector,
-overridden by the local URL. Nothing is sent until the person leaves **Send diagnostics** on at
-setup: the host starts with it off, and
+overridden by the local URL. Nothing is sent until the person turns **Send diagnostics** on (it
+is off by default, at setup and in Settings): the host starts with it off, and
 the choice is enforced per span, so turning it off stops export at once. What is sent: the stash's
 own `repeater.*` spans and `repeater.host.start` / `.pulse` / `.stop` (every five minutes: roster
 size, tracked/missing content, arrivals, connections, bytes in/out, power state, uptime), keyed by the short endpoint id as `service.instance.id`. A silent gap between pulses is
@@ -200,14 +205,18 @@ service executable's `update` verb, demand-start, LocalSystem, startable only by
 administrators). The app that restarted into a new version starts it with that version; it refuses
 anything not newer than itself (`NotNewer`), downloads
 `windows-v<version>/StreetCryptid.Repeater.Service-<rid>.zip` from this repository's releases over
-HTTPS into an admin-only staging directory under Program Files, stops the service, swaps the files
+HTTPS (every redirect must stay on `github.com` or `*.githubusercontent.com`) into an admin-only
+staging directory under Program Files, checks it against the `.zip.sha256` published beside it,
+refuses executables whose Authenticode signature fails or, once the installed copy is signed, whose
+signer's subject differs from the installed copy's, stops the service, swaps the files
 (renaming the running ones aside), and starts it again, putting the old files back if it will not
 start. Its exit code comes back through the SCM. It never reads from a directory the person can
 write, so a process in their session cannot hand SYSTEM a binary. A service installed before the
 updater existed, or an updater that fails, leaves the UPDATE button, which falls back to the
 elevated `install`; an unattended run never raises a prompt. Until releases are signed, the
-updater's trust is HTTPS to GitHub, the same as the app's own update; once they are, it should also
-check the download's publisher against the installed copy's.
+updater's trust is HTTPS to GitHub plus a checksum from the same release, the same as the app's own
+update: it catches a damaged or swapped archive, not a replaced release. Signing is what closes
+that, and the signer check is already in place for the first signed install.
 
 ## Release acceptance still required
 
