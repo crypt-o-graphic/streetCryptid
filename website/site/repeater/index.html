@@ -109,6 +109,21 @@
                     <code>irm https://streetcrypt.id/repeater/install.ps1 | iex</code>
                     <button class="copy" type="button" aria-live="polite">Copy</button>
                   </div>
+                  <p class="footnote">
+                    It checks the installer against the checksum published with it before running
+                    it. To read the script before it runs, save it, open it, then run it:
+                  </p>
+                  <div class="cmd">
+                    <code
+                      >irm https://streetcrypt.id/repeater/install.ps1 -OutFile install.ps1; notepad
+                      install.ps1</code
+                    >
+                    <button class="copy" type="button" aria-live="polite">Copy</button>
+                  </div>
+                  <div class="cmd">
+                    <code>powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1</code>
+                    <button class="copy" type="button" aria-live="polite">Copy</button>
+                  </div>
                 </div>
                 <div class="panel" role="tabpanel" id="win-cmd" aria-labelledby="tab-win-cmd">
                   <div class="cmd">
@@ -158,7 +173,8 @@
                     anything.
                   </li>
                   <li>
-                    Turn off <strong>Send diagnostics</strong> if you don't want to send them.
+                    <strong>Send diagnostics</strong> is off. Turn it on only if you want to send
+                    them to the developers.
                   </li>
                   <li>Press <strong>CONTINUE</strong>.</li>
                 </ul>
@@ -260,8 +276,22 @@
                   >
                 </div>
                 <p class="caveat">
-                  <strong>Check the download</strong> against the release's
-                  <code>SHA256SUMS</code> before you run it.
+                  <strong>Check the download</strong> before you run it. Every file in a release is
+                  signed by the workflow that built it; with the
+                  <a href="https://cli.github.com/">GitHub CLI</a>:
+                </p>
+                <div class="cmd">
+                  <code
+                    >gh attestation verify streetcryptid-repeater-*-$(uname -m)-linux.tar.gz --repo
+                    unrealJune/streetCryptid</code
+                  >
+                  <button class="copy" type="button" aria-live="polite">Copy</button>
+                </div>
+                <p class="footnote">
+                  Without it, compare the file with the release's <code>SHA256SUMS</code> (<code
+                    >sha256sum --check --ignore-missing SHA256SUMS</code
+                  >). That catches a damaged download, not a replaced one: whoever could replace the
+                  file could replace <code>SHA256SUMS</code> too.
                 </p>
                 <div class="cmd">
                   <code

@@ -154,7 +154,7 @@ impl Settings {
         let mut current = self.current.lock().expect("settings poisoned");
         let tmp = self.path.with_extension("json.tmp");
         {
-            let mut file = File::create(&tmp)?;
+            let mut file = fresh_file(&tmp)?;
             file.write_all(&serde_json::to_vec(&next)?)?;
             file.sync_all()?;
         }
@@ -164,6 +164,20 @@ impl Settings {
         self.keep_awake.store(next.keep_awake, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// A staging file created new, never opened through whatever is already at `tmp`. The state
+/// directory belongs to the service account, but `install --system` (Linux, as root) writes the
+/// settings into it: `File::create` would follow a link the account planted there and let root
+/// truncate a file of its choosing. Removing the old entry unlinks a link itself, and `create_new`
+/// (`O_EXCL`) refuses one put back in between.
+fn fresh_file(tmp: &Path) -> Result<File> {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(OpenOptions::new().write(true).create_new(true).open(tmp)?)
 }
 
 const NAME_FILE: &str = "repeater-name.txt";
@@ -195,7 +209,7 @@ pub fn write_name(dir: &Path, name: Option<&str>) -> Result<Option<String>> {
     };
     let tmp = path.with_extension("txt.tmp");
     {
-        let mut file = File::create(&tmp)?;
+        let mut file = fresh_file(&tmp)?;
         file.write_all(name.as_bytes())?;
         file.sync_all()?;
     }
