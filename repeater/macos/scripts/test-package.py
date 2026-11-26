@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline release gates: failed signing/notarization must never produce a feed."""
+"""Offline release gates: failed signing/notarization or a missing update key must never produce a feed."""
 import json
 import os
 from pathlib import Path
@@ -99,6 +99,31 @@ elif tool == "generate_appcast":
         sign_calls = [call for call in calls if call[0] == "codesign" and "--sign" in call]
         self.assertEqual(sign_calls[-1][-1], str(self.app))
         self.assertNotIn("--deep", sign_calls[-1])
+
+    def test_adhoc_signs_feed_without_developer_id_or_notarization(self):
+        for name in ["MACOS_SIGN_IDENTITY", "MACOS_NOTARY_PROFILE"]:
+            self.env.pop(name)
+        self.env["MACOS_SIGNING"] = "adhoc"
+        self.assertEqual(self.run_package(), 0)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertFalse(any(call[0] in ("xcrun", "spctl") for call in calls))
+        sign_calls = [call for call in calls if call[0] == "codesign" and "--sign" in call]
+        self.assertTrue(sign_calls)
+        for call in sign_calls:
+            self.assertEqual(call[call.index("--sign") + 1], "-")
+        self.assertEqual(sign_calls[-1][-1], str(self.app))
+        self.assertTrue(self.feed.exists())
+
+    def test_adhoc_still_requires_update_key(self):
+        self.env["MACOS_SIGNING"] = "adhoc"
+        self.env.pop("MACOS_SPARKLE_PUBLIC_KEY")
+        self.assertNotEqual(self.run_package(), 0)
+        self.assertFalse(self.log.exists())
+
+    def test_unknown_signing_mode_is_refused(self):
+        self.env["MACOS_SIGNING"] = "none"
+        self.assertNotEqual(self.run_package(), 0)
+        self.assertFalse(self.log.exists())
 
 
 if __name__ == "__main__":
