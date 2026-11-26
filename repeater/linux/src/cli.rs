@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::paths::Mode;
-use crate::{client, daemon, install, VERSION};
+use crate::{client, daemon, install, update, VERSION};
 
 #[derive(Parser)]
 #[command(
@@ -138,6 +138,9 @@ enum Commands {
         /// Hold off sleep while on mains power.
         #[arg(long, value_enum)]
         keep_awake: Option<Switch>,
+        /// Install new releases by itself, from a systemd timer (on unless you turned it off).
+        #[arg(long, value_enum)]
+        auto_update: Option<Switch>,
         /// Install and enable, but do not start it now.
         #[arg(long)]
         no_start: bool,
@@ -154,6 +157,16 @@ enum Commands {
         /// With --system: leave the identity in /var/lib/streetcryptid-repeater.
         #[arg(long)]
         keep_state: bool,
+    },
+    /// Install the newest release over the installed daemon and restart it, putting the old one
+    /// back if the new one does not start. The update timer runs this.
+    Update {
+        /// Update the machine's repeater (needs root).
+        #[arg(long)]
+        system: bool,
+        /// Only say whether there is a newer release.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -177,6 +190,7 @@ pub fn main() -> i32 {
             admin,
             telemetry,
             keep_awake,
+            auto_update,
             no_start,
         } => install::install(install::InstallArgs {
             system,
@@ -186,6 +200,7 @@ pub fn main() -> i32 {
             admin,
             telemetry: telemetry.map(Into::into),
             keep_awake: keep_awake.map(Into::into),
+            auto_update: auto_update.map(Into::into),
             no_start,
         }),
         Commands::Uninstall {
@@ -197,6 +212,7 @@ pub fn main() -> i32 {
             move_to,
             keep_state,
         }),
+        Commands::Update { system, check } => update::update(system, check),
         command => client_command(command),
     };
     match result {

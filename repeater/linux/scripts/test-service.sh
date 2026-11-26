@@ -40,7 +40,7 @@ fail() {
     echo "--- $(basename "$log")" >&2
     sed 's#streetcrypt\.id/repeater[^#[:space:]]*\#.*#<claim link>#' "$log" >&2
   done
-  journalctl -u streetcryptid-repeater --no-pager -n 50 2>/dev/null |
+  journalctl -u streetcryptid-repeater -u streetcryptid-repeater-update --no-pager -n 50 2>/dev/null |
     sed 's#streetcrypt\.id/repeater[^#[:space:]]*\#.*#<claim link>#' >&2 || true
   exit 1
 }
@@ -100,6 +100,31 @@ id -nG "$person" | grep -qw streetcryptid-repeater || fail "$person was not made
 if [[ -d /etc/polkit-1/rules.d ]]; then
   [[ -f /etc/polkit-1/rules.d/50-streetcryptid-repeater.rules ]] || fail "the keep-awake polkit rule was not installed"
 fi
+systemctl is-enabled --quiet streetcryptid-repeater-update.timer || fail "the update timer is not enabled"
+systemctl is-active --quiet streetcryptid-repeater-update.timer || fail "the update timer is not running"
+
+echo "== the update unit's sandbox lets it do an update's work"
+# Everything `update --system` does but install a newer release: write beside the binary (and
+# nowhere else), restart the service, and read the feed. The unit's own ExecStart would replace
+# this build with the published release.
+dropin=/run/systemd/system/streetcryptid-repeater-update.service.d
+mkdir -p "$dropin"
+cat > "$dropin/test.conf" <<'UNIT'
+[Service]
+ExecStart=
+ExecStart=/bin/sh -c 'touch /usr/local/lib/streetcryptid-repeater/.probe && rm /usr/local/lib/streetcryptid-repeater/.probe'
+ExecStart=/bin/sh -c 'if touch /etc/.streetcryptid-probe 2>/dev/null; then rm -f /etc/.streetcryptid-probe; exit 1; fi'
+ExecStart=/usr/bin/env systemctl restart streetcryptid-repeater
+ExecStart=/usr/local/lib/streetcryptid-repeater/streetcryptid-repeater update --system --check
+UNIT
+systemctl daemon-reload
+before="$(systemctl show -p InvocationID --value streetcryptid-repeater)"
+systemctl start streetcryptid-repeater-update.service || fail "the update unit could not do an update's work"
+rm -rf "$dropin"
+systemctl daemon-reload
+[[ "$(systemctl show -p InvocationID --value streetcryptid-repeater)" != "$before" ]] ||
+  fail "the update unit did not restart the service"
+systemctl is-active --quiet streetcryptid-repeater || fail "the service is not running after the update unit"
 
 echo "== root manages it over the system socket"
 for _ in $(seq 60); do
@@ -133,12 +158,25 @@ echo "== re-running install updates in place"
 SUDO_USER="$person" "$bin" install --system < /dev/null > /dev/null 2>&1 || fail "a second install failed"
 systemctl is-active --quiet streetcryptid-repeater || fail "the service is not running after an update"
 
+echo "== automatic updates turn off, and stay off"
+SUDO_USER="$person" "$bin" install --system --auto-update off < /dev/null > /dev/null 2>&1 ||
+  fail "install --auto-update off failed"
+systemctl is-enabled --quiet streetcryptid-repeater-update.timer && fail "the update timer is still enabled"
+SUDO_USER="$person" "$bin" install --system < /dev/null > /dev/null 2>&1 || fail "a third install failed"
+systemctl is-enabled --quiet streetcryptid-repeater-update.timer && fail "install turned automatic updates back on"
+SUDO_USER="$person" "$bin" install --system --auto-update on < /dev/null > /dev/null 2>&1 ||
+  fail "install --auto-update on failed"
+systemctl is-enabled --quiet streetcryptid-repeater-update.timer || fail "the update timer was not turned back on"
+
 echo "== uninstall --system moves it back"
 SUDO_USER="$person" "$bin" uninstall --system > "$work/uninstall.log" 2>&1 || {
   cat "$work/uninstall.log" >&2
   fail "uninstall --system failed"
 }
 systemctl list-unit-files streetcryptid-repeater.service --no-legend | grep -q . && fail "the unit is still installed"
+for unit in streetcryptid-repeater-update.service streetcryptid-repeater-update.timer; do
+  [[ ! -e "/etc/systemd/system/$unit" ]] || fail "$unit was left behind"
+done
 [[ ! -e /etc/polkit-1/rules.d/50-streetcryptid-repeater.rules ]] || fail "the polkit rule was left behind"
 cmp -s "$user_state/secret.key" "$work/identity" || fail "the identity did not come back byte-identical"
 [[ "$(stat -c %U "$user_state/secret.key")" == "$person" ]] || fail "the identity did not go back to $person"

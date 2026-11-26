@@ -1,7 +1,7 @@
 //! `streetcryptid-repeater` — the streetCryptid repeater for Linux.
 //!
 //! One binary is the daemon (`run`) and every way of managing it (`status`, `claim`, `settings`,
-//! `watch`, `install`, `uninstall`). The daemon embeds the same node the Windows host does
+//! `watch`, `install`, `uninstall`, `update`). The daemon embeds the same node the Windows host does
 //! (`repeater/host`, on the server crate's `Storage::MemoryRepeater`) and serves the Windows
 //! management plane's line protocol on a Unix socket instead of a named pipe: a `service` line, the
 //! latest snapshot, then snapshots and arrivals; the one command it takes is `settings`. README.md
@@ -23,6 +23,8 @@ mod paths;
 mod power;
 #[cfg(target_os = "linux")]
 mod qr;
+#[cfg(target_os = "linux")]
+mod update;
 
 /// The release version, stamped by the release workflow; a local build reports the crate's.
 pub const VERSION: &str = match option_env!("REPEATER_VERSION") {

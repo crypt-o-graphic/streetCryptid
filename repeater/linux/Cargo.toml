@@ -18,6 +18,13 @@ libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `update`: the release feed and archive over HTTPS (the same reqwest and rustls the stash already
+# links, verifying against the system's certificates), checked by SHA-256 and unpacked in memory.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+sha2 = "0.10"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+semver = "1"
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
