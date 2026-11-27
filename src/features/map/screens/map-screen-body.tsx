@@ -292,25 +292,35 @@ export default function MapScreenBody() {
    * the OS and re-centres if the answer moved. From cold there is nothing to show first and the
    * read is the whole of it, which is what the spinner is for.
    */
-  const locateSelf = useCallback(() => {
-    closeLayers();
-    if (selfFix) {
-      setLocateTarget((current) => ({
-        requestId: (current?.requestId ?? 0) + 1,
-        location: { lat: selfFix.lat, lon: selfFix.lon },
-      }));
-    }
-    setLocating(true);
-    void locateNow()
-      .then((fix) => {
-        if (!fix) return;
+  const centreOnSelf = useCallback(
+    (ask: 'button' | 'quiet') => {
+      if (selfFix) {
         setLocateTarget((current) => ({
           requestId: (current?.requestId ?? 0) + 1,
-          location: { lat: fix.lat, lon: fix.lon },
+          location: { lat: selfFix.lat, lon: selfFix.lon },
         }));
-      })
-      .finally(() => setLocating(false));
-  }, [closeLayers, selfFix, locateNow]);
+      }
+      const button = ask === 'button';
+      if (button) setLocating(true);
+      // Only the locate button may raise the OS permission dialog; a tab tap reads silently.
+      void locateNow(button ? undefined : { prompt: false })
+        .then((fix) => {
+          if (!fix) return;
+          setLocateTarget((current) => ({
+            requestId: (current?.requestId ?? 0) + 1,
+            location: { lat: fix.lat, lon: fix.lon },
+          }));
+        })
+        .finally(() => {
+          if (button) setLocating(false);
+        });
+    },
+    [selfFix, locateNow]
+  );
+  const locateSelf = useCallback(() => {
+    closeLayers();
+    centreOnSelf('button');
+  }, [closeLayers, centreOnSelf]);
   // The island's segmented bar is the app's only navigation. Either tab also
   // dismisses whatever trace was drilled into, so the bar can never look dead —
   // and so tapping the tab you are already "on" is a way back out of a trace.
@@ -322,8 +332,10 @@ export default function MapScreenBody() {
       // Asking for a tab is asking to see it. Landing on `peek` rather than carrying the current
       // detent across is what keeps a tap from answering with the one-line collapsed panel.
       setDetent('peek');
+      // ME is about you: bring the camera home, including from a friend the map flew to.
+      if (tab === 'me') centreOnSelf('quiet');
     },
-    [closeHistory, closeLayers]
+    [centreOnSelf, closeHistory, closeLayers]
   );
   // Tapping a roster row is the same gesture as tapping the locator: fly there
   // and open the trace. The roster steps aside so the map it just moved is
