@@ -215,6 +215,14 @@ const PAIR_CLOSE_REFUSED: u32 = 2;
 /// suspended mid-Bump) cannot starve sync. The app's window is 2 min, plus the search.
 const BLE_PAIRING_HOLD_MAX: Duration = Duration::from_secs(150);
 
+/// How long `set_pairing_ready(true)` admits nearby Hellos without being renewed.
+///
+/// The flag is the only thing that lets a stranger's nearby Hello in, and it was a plain boolean:
+/// an app suspended or killed mid-Bump, or a JS path that never called `false`, left this node
+/// admitting nearby pairing requests for the life of the process. Every Bump sets it afresh, and
+/// the app's window is two minutes plus the search; this is well past that.
+const PAIRING_READY_MAX: Duration = Duration::from_secs(5 * 60);
+
 /// The answering phone is not taking nearby pair requests right now: its Bump window is shut.
 #[derive(Debug)]
 struct NotListening;
@@ -1561,6 +1569,8 @@ pub struct PairCore {
     notices: Mutex<VecDeque<PairNotice>>,
     runtime: Mutex<Option<PairRuntime>>,
     pairing_ready: AtomicBool,
+    /// When `pairing_ready` lapses on its own ([`PAIRING_READY_MAX`]).
+    pairing_ready_until: std::sync::Mutex<Option<Instant>>,
     /// Until when BLE is kept for pairing alone. See [`BLE_PAIRING_HOLD_MAX`].
     ble_hold_until: std::sync::Mutex<Option<Instant>>,
     /// Whether this node has been seen fully online (relay handshake complete) at least once,
@@ -1581,6 +1591,7 @@ impl PairCore {
             notices: Mutex::new(VecDeque::new()),
             runtime: Mutex::new(None),
             pairing_ready: AtomicBool::new(false),
+            pairing_ready_until: std::sync::Mutex::new(None),
             ble_hold_until: std::sync::Mutex::new(None),
             endpoint_was_online: AtomicBool::new(false),
             endpoint_wait_spent: AtomicBool::new(false),
@@ -1621,6 +1632,11 @@ impl PairCore {
     /// Opening the window also keeps BLE for pairing alone, for at most [`BLE_PAIRING_HOLD_MAX`];
     /// closing it lets friend sync back on.
     pub fn set_pairing_ready(&self, ready: bool) {
+        *self
+            .pairing_ready_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            ready.then(|| Instant::now() + PAIRING_READY_MAX);
         self.pairing_ready.store(ready, Ordering::SeqCst);
         self.hold_ble_for_pairing(ready.then(|| Instant::now() + BLE_PAIRING_HOLD_MAX));
     }
@@ -1651,6 +1667,11 @@ impl PairCore {
 
     pub fn pairing_ready(&self) -> bool {
         self.pairing_ready.load(Ordering::SeqCst)
+            && self
+                .pairing_ready_until
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|until| Instant::now() < until)
     }
 
     async fn runtime_endpoint(&self) -> Result<Endpoint> {
@@ -2008,7 +2029,11 @@ impl PairCore {
     ) -> Result<EndpointAddr> {
         if let Some(t) = ticket {
             if let Ok(et) = t.parse::<EndpointTicket>() {
-                return Ok(et.endpoint_addr().clone());
+                // A ticket is only a dial hint for THIS peer. One naming another endpoint would
+                // send our signed pairing messages somewhere else, so it is ignored, not trusted.
+                if et.endpoint_addr().id.as_bytes() == &peer_endpoint {
+                    return Ok(et.endpoint_addr().clone());
+                }
             }
         }
         let id =
@@ -2180,6 +2205,11 @@ impl PairCore {
                 );
             }
             if let Some(s) = sessions.get_mut(&session_id) {
+                // The same invite id redeemed again must name the same issuer: a second link with
+                // a reused id must not redirect a session already under way to someone else.
+                if s.peer_endpoint != peer_endpoint {
+                    bail!("invite id already in use by a different peer");
+                }
                 s.peer_endpoint_ticket = Some(inv.endpoint_ticket.clone());
             }
         }
@@ -3240,13 +3270,57 @@ async fn dial_exchange_in(
 
 /// The inbound `streetcryptid/pair/4` protocol handler.
 #[derive(Clone)]
+/// Whether this node's BLE scanner has seen an endpoint's advertisement (`BleHandle::has_scan_hint`).
+pub type ScanHint = Arc<dyn Fn(&[u8; ENDPOINT_LEN]) -> bool + Send + Sync>;
+
 pub struct PairProtocol {
     core: Arc<PairCore>,
+    scan_hint: Option<ScanHint>,
 }
 
 impl PairProtocol {
     pub fn new(core: Arc<PairCore>) -> Self {
-        Self { core }
+        Self {
+            core,
+            scan_hint: None,
+        }
+    }
+
+    /// Let nearby Hellos count a BLE sighting as proximity (see [`Self::nearby_evidence`]).
+    pub fn with_scan_hint(mut self, scan_hint: ScanHint) -> Self {
+        self.scan_hint = Some(scan_hint);
+        self
+    }
+
+    /// Whether `conn` comes from someone plausibly in the room: a path over BLE or a local
+    /// network, or a BLE advertisement from that endpoint seen this session.
+    ///
+    /// A nearby Hello is authorised by nothing but `pairing_ready` and a session id derived from
+    /// the two PUBLIC endpoint ids. Without this check anyone on the internet who knew our endpoint
+    /// id (a friend's friend, an old invite, our always-on BLE advertisement seen once) could dial
+    /// us over the relay during a Bump window and take the SAS screen — at best denying the Bump,
+    /// at worst a 1-in-256 guess at the emoji the human then confirms.
+    fn nearby_evidence(&self, conn: &Connection, remote: &[u8; ENDPOINT_LEN]) -> bool {
+        let local_path = conn
+            .paths()
+            .iter()
+            .any(|path| is_proximate_addr(path.remote_addr()));
+        local_path || self.scan_hint.as_ref().is_some_and(|seen| seen(remote))
+    }
+}
+
+/// BLE, or an address on this network: private, link-local, unique-local or loopback.
+fn is_proximate_addr(addr: &iroh::TransportAddr) -> bool {
+    match addr {
+        iroh::TransportAddr::Custom(_) => true,
+        iroh::TransportAddr::Ip(ip) => match ip.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        },
+        _ => false,
     }
 }
 
@@ -3289,6 +3363,17 @@ impl ProtocolHandler for PairProtocol {
                 tracing::field::display(crate::telemetry::short_hex(&msg.session_id)),
             );
             span.record("decision", tracing::field::debug(msg.decision));
+            if matches!(msg.decision, Decision::Hello)
+                && msg.invite_secret.is_empty()
+                && !self.nearby_evidence(&conn, &remote_bytes)
+            {
+                // Read by the dialler as "not listening", the same answer a shut window gives.
+                conn.close(PAIR_CLOSE_NOT_LISTENING.into(), b"pair-not-nearby");
+                refused.store(true, Ordering::Relaxed);
+                return Err(accept_err(anyhow!(
+                    "nearby hello from a peer that is not nearby"
+                )));
+            }
             let resp = match self.core.handle_incoming(remote_bytes, msg).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -4235,6 +4320,29 @@ mod tests {
         OsRng.fill_bytes(&mut recv);
         let core = PairCore::new(sk.to_bytes(), endpoint, recv.to_vec());
         (core, endpoint, recv)
+    }
+
+    #[test]
+    fn pairing_ready_lapses_on_its_own() {
+        let (core, _, _) = test_core();
+        assert!(!core.pairing_ready());
+        core.set_pairing_ready(true);
+        assert!(core.pairing_ready());
+        *core.pairing_ready_until.lock().unwrap() = Some(Instant::now());
+        assert!(
+            !core.pairing_ready(),
+            "a window nobody closed stops admitting nearby Hellos"
+        );
+    }
+
+    #[test]
+    fn only_local_paths_count_as_nearby() {
+        let ip = |s: &str| iroh::TransportAddr::Ip(s.parse().unwrap());
+        assert!(is_proximate_addr(&ip("192.168.1.20:4433")));
+        assert!(is_proximate_addr(&ip("127.0.0.1:4433")));
+        assert!(is_proximate_addr(&ip("[fe80::1]:4433")));
+        assert!(!is_proximate_addr(&ip("203.0.113.7:4433")));
+        assert!(!is_proximate_addr(&ip("[2001:db8::1]:4433")));
     }
 
     #[test]

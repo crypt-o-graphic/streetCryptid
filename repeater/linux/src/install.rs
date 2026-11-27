@@ -193,9 +193,13 @@ fn apply_settings(dir: &Path, telemetry: Option<bool>, keep_awake: Option<bool>)
 /// True when the repeater in `dir` is running: it holds `host.lock`.
 fn is_running(dir: &Path) -> bool {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Root runs this against someone else's directory: never through a link, never blocked on a
+    // planted FIFO.
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join("host.lock"))
     else {
         return false;
@@ -394,18 +398,17 @@ fn install_system(args: InstallArgs) -> Result<()> {
                 source.display()
             );
         }
-        match migrate::move_state(source, &state)? {
+        // Root reads the source on the person's behalf: only their files (or root's), never
+        // through a link, and the service's directory may hold only the service's (or root's).
+        let person: Vec<u32> = invoker.iter().map(|u| u.uid).collect();
+        match migrate::move_state(source, &state, &person, &[account.uid])? {
             Moved::Moved => {
-                let marker = source.join(SERVICE_MARKER);
-                write_file(
-                    &marker,
+                migrate::mark_moved(
+                    source,
+                    &person,
                     "This repeater's identity moved to the system service \
                      (/var/lib/streetcryptid-repeater).\n",
-                    0o644,
                 )?;
-                if let Some(owner) = lookup_owner(source) {
-                    let _ = std::os::unix::fs::lchown(&marker, Some(owner.0), Some(owner.1));
-                }
                 println!(
                     "Moved the repeater identity from {} into the system service.",
                     source.display()
@@ -416,7 +419,7 @@ fn install_system(args: InstallArgs) -> Result<()> {
     }
     migrate::create_private_dir(&state)?;
     apply_settings(&state, args.telemetry, args.keep_awake)?;
-    migrate::chown_tree(&state, account.uid, account.gid)?;
+    migrate::chown_tree(&state, &[account.uid], account.uid, account.gid)?;
 
     write_file(
         Path::new(SYSTEM_UNIT),
@@ -477,12 +480,6 @@ fn after_start(socket: Option<PathBuf>) -> Result<()> {
         }
         Ok(())
     })
-}
-
-/// The owner of `path`, for files root writes into someone else's directory.
-fn lookup_owner(path: &Path) -> Option<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
 }
 
 /// The service's own system account (and its group), created on first install.
@@ -582,20 +579,19 @@ fn uninstall_system(args: UninstallArgs) -> Result<()> {
         }
         return Ok(());
     };
-    match migrate::move_state(state, &target)? {
+    // The service's directory may hold only the service's files (or root's), and the target only
+    // the person's: root writes into a directory they control, so never through a link.
+    let service: Vec<u32> = lookup_user(SYSTEM_USER)
+        .map(|a| a.uid)
+        .into_iter()
+        .collect();
+    let person: Vec<u32> = owner.iter().map(|u| u.uid).collect();
+    match migrate::move_state(state, &target, &service, &person)? {
         Moved::Moved => {
-            let _ = std::fs::remove_file(target.join(SERVICE_MARKER));
+            migrate::clear_marker(&target, &person)?;
             if let Some(user) = owner {
-                migrate::chown_tree(&target, user.uid, user.gid)?;
-                // Directories root created on the way down to it belong to them too.
-                let mut parent = target.parent();
-                while let Some(dir) = parent {
-                    if dir == user.home || !dir.starts_with(&user.home) {
-                        break;
-                    }
-                    let _ = std::os::unix::fs::lchown(dir, Some(user.uid), Some(user.gid));
-                    parent = dir.parent();
-                }
+                // With the directories root created on the way down to it from their home.
+                migrate::hand_over(&target, &user.home, user.uid, user.gid)?;
             }
             println!(
                 "Moved the repeater identity back to {}. `streetcryptid-repeater run` (or \

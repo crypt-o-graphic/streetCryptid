@@ -1,10 +1,13 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
+using Microsoft.Win32.SafeHandles;
 using StreetCryptid.Repeater.Core;
 
 namespace StreetCryptid.Repeater.Service;
@@ -203,10 +206,22 @@ internal sealed class PipeServer(SecurityIdentifier owner, Hub hub, Supervisor s
     private const int MaxClients = 8;
     private const int MaxCommandLength = 4096;
 
+    private const uint PipeAccessDuplex = 0x3;
+    private const uint FileFlagFirstPipeInstance = 0x00080000;
+    private const uint FileFlagOverlapped = 0x40000000;
+    private const uint PipeTypeByte = 0x0, PipeRejectRemoteClients = 0x8;
+
     public async Task RunAsync(CancellationToken stop)
     {
         var security = new PipeSecurity();
         security.SetAccessRuleProtection(true, false);
+        // "Refuses remote clients" is enforced twice, independently of what .NET passes by default:
+        // PIPE_REJECT_REMOTE_CLIENTS on every instance (CreateInstance), and a deny for NETWORK
+        // (S-1-5-2), which every logon over SMB carries. The owner's SID alone would otherwise let
+        // the owner's account — or anyone holding its credentials — read the claim code over
+        // \\host\pipe\ from another machine. Deny ACEs are ordered first.
+        security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null),
+            PipeAccessRights.FullControl, AccessControlType.Deny));
         using var self = WindowsIdentity.GetCurrent();
         security.AddAccessRule(new PipeAccessRule(
             new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl,
@@ -217,9 +232,7 @@ internal sealed class PipeServer(SecurityIdentifier owner, Hub hub, Supervisor s
         bool first = true;
         while (!stop.IsCancellationRequested)
         {
-            var options = PipeOptions.Asynchronous | (first ? PipeOptions.FirstPipeInstance : PipeOptions.None);
-            var server = NamedPipeServerStreamAcl.Create(ServiceLayout.PipeName, PipeDirection.InOut, MaxClients,
-                PipeTransmissionMode.Byte, options, 0, 0, security);
+            var server = CreateInstance(security, first);
             first = false;
             try { await server.WaitForConnectionAsync(stop); }
             catch (OperationCanceledException)
@@ -276,4 +289,45 @@ internal sealed class PipeServer(SecurityIdentifier owner, Hub hub, Supervisor s
         }
         return null;
     }
+
+    /// <summary>
+    /// One pipe instance, made with CreateNamedPipeW directly because .NET exposes no option for
+    /// PIPE_REJECT_REMOTE_CLIENTS: whether NamedPipeServerStream sets it is an implementation
+    /// detail, and this pipe's promise not to serve another machine must not rest on one.
+    /// </summary>
+    private static unsafe NamedPipeServerStream CreateInstance(PipeSecurity security, bool first)
+    {
+        byte[] descriptor = security.GetSecurityDescriptorBinaryForm();
+        fixed (byte* pointer = descriptor)
+        {
+            var attributes = new SecurityAttributes
+            {
+                Length = (uint)sizeof(SecurityAttributes),
+                SecurityDescriptor = (IntPtr)pointer,
+                InheritHandle = 0,
+            };
+            uint openMode = PipeAccessDuplex | FileFlagOverlapped | (first ? FileFlagFirstPipeInstance : 0);
+            var handle = CreateNamedPipeW(@"\\.\pipe\" + ServiceLayout.PipeName, openMode,
+                PipeTypeByte | PipeRejectRemoteClients, MaxClients, 0, 0, 0, &attributes);
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastPInvokeError();
+                handle.Dispose();
+                throw new Win32Exception(error);
+            }
+            return new NamedPipeServerStream(PipeDirection.InOut, isAsync: true, isConnected: false, handle);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes
+    {
+        public uint Length;
+        public IntPtr SecurityDescriptor;
+        public int InheritHandle;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern unsafe SafePipeHandle CreateNamedPipeW(string name, uint openMode, uint pipeMode,
+        uint maxInstances, uint outBufferSize, uint inBufferSize, uint defaultTimeout, SecurityAttributes* attributes);
 }

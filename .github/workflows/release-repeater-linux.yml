@@ -126,12 +126,35 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      # Keyless signing for the attestation below: the job's OIDC identity is the signer, so no
+      # signing key exists to store or leak. Only this job gets these.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: repeater-linux-*
           path: dist
           merge-multiple: true
+      - name: Name the source archive and write the checksums
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # One source archive is enough: both architectures archived the same commit.
+          rm -f dist/*-source-aarch64.tar.gz
+          mv dist/*-source-x86_64.tar.gz "dist/streetcryptid-repeater-${VERSION}-source.tar.gz"
+          (cd dist && sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS && rm -f SHA256SUMS-*)
+      # A checksum file published beside the tarballs proves nothing against whoever can replace
+      # both. The attestation is signed by this workflow's identity (Sigstore, recorded in GitHub's
+      # attestation store and the public transparency log), so `gh attestation verify` ties each
+      # file to this repository, this workflow and this commit; the website's guide shows how.
+      - name: Attest the release files
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
       - name: Publish the tested commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -142,10 +165,6 @@ jobs:
           COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # One source archive is enough: both architectures archived the same commit.
-          rm -f dist/*-source-aarch64.tar.gz
-          mv dist/*-source-x86_64.tar.gz "dist/streetcryptid-repeater-${VERSION}-source.tar.gz"
-          (cd dist && sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS && rm -f SHA256SUMS-*)
           if [[ "$CREATE_TAG" == "true" ]]; then
             target=(--target "$COMMIT")
           else
@@ -153,4 +172,4 @@ jobs:
           fi
           gh release create "$TAG" dist/* "${target[@]}" --prerelease --latest=false \
             --title "streetCryptid Linux repeater $VERSION" \
-            --notes "The Linux repeater: one binary for the CLI and the opt-in systemd daemon, for x86_64 and aarch64 (glibc 2.35+), built and tested from $COMMIT. Unpack, then \`./streetcryptid-repeater run\` or \`install\`; see README.md. Check downloads against SHA256SUMS."
+            --notes "The Linux repeater: one binary for the CLI and the opt-in systemd daemon, for x86_64 and aarch64 (glibc 2.35+), built and tested from $COMMIT. Unpack, then \`./streetcryptid-repeater run\` or \`install\`; see README.md. Verify a download with \`gh attestation verify FILE --repo $GH_REPO\` (signed provenance for every file here, SHA256SUMS included), or at least against SHA256SUMS."

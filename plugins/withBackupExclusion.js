@@ -12,8 +12,13 @@ const path = require('path');
  *   key). Its Keystore master key never leaves the device, so a restored copy is undecryptable
  *   garbage at best — and once key state is sequential, a *same-device* restore (uninstall →
  *   reinstall → auto-restore) would rewind counters, which is key reuse.
- * - `databases/` — `streetcryptid.social.db` holds friends' fixes as plaintext; the exploration
- *   and telemetry DBs are location-derived too. All excluded wholesale.
+ * - `files/SQLite/` — where expo-sqlite actually keeps every database it opens
+ *   (`SQLiteModule.defaultDatabaseDirectory` = `filesDir/SQLite`, NOT `databases/`).
+ *   `streetcryptid.social.db` holds the own trail, friends' last fixes and the pool with their
+ *   tickets; the exploration DB and the `streetcryptid.events.db` telemetry journal are
+ *   location-derived too. Until this rule existed only `databases/` was excluded, which holds
+ *   none of them, so all of it rode along in cloud backups and device transfer.
+ * - `databases/` — kept excluded wholesale in case anything opens a database the platform way.
  * - `files/streetcryptid/` — the Rust node's **ratchet session state** (FORWARD-SECRECY.md §4.2).
  *   This is the one that must not be missed. Session state is sequential: a restored copy rewinds
  *   `ns`, the next publish re-derives a message key already used, and that key seals a different
@@ -37,6 +42,7 @@ const RES_XML = {
     <exclude domain="sharedpref" path="SecureStore.xml" />
     <exclude domain="database" path="." />
     <exclude domain="file" path="streetcryptid" />
+    <exclude domain="file" path="SQLite" />
 </full-backup-content>
 `,
   // API 31+ cloud backup AND device-to-device transfer (android:dataExtractionRules).
@@ -46,11 +52,13 @@ const RES_XML = {
         <exclude domain="sharedpref" path="SecureStore.xml" />
         <exclude domain="database" path="." />
         <exclude domain="file" path="streetcryptid" />
+        <exclude domain="file" path="SQLite" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="SecureStore.xml" />
         <exclude domain="database" path="." />
         <exclude domain="file" path="streetcryptid" />
+        <exclude domain="file" path="SQLite" />
     </device-transfer>
 </data-extraction-rules>
 `,
@@ -88,3 +96,5 @@ module.exports = function withBackupExclusion(config) {
 
   return config;
 };
+
+module.exports.RES_XML = RES_XML;

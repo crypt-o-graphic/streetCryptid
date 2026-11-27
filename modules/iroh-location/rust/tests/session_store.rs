@@ -282,3 +282,34 @@ fn a_removed_session_is_gone_and_removing_twice_is_fine() {
     // Revocation runs on paths that may already have cleaned up; it must be idempotent.
     store.remove(PEER).unwrap();
 }
+
+#[test]
+fn archived_sessions_age_out_a_week_after_they_were_replaced() {
+    use iroh_location::session_store::{SessionEntry, SessionRecord, ARCHIVED_SESSION_MAX_AGE_MS};
+    let entry = |created_ms| SessionEntry {
+        state: a_session(),
+        created_ms,
+        pending_boot: None,
+    };
+    let day = 24 * 60 * 60 * 1000;
+    let mut record = SessionRecord::with_current(entry(0));
+    record.install(entry(10 * day)); // the first session was replaced on day 10
+    record.install(entry(12 * day)); // the second on day 12
+    assert_eq!(record.previous.len(), 2);
+
+    assert!(!record.prune_archive(10 * day + ARCHIVED_SESSION_MAX_AGE_MS));
+    assert_eq!(record.previous.len(), 2, "both replaced at most a week ago");
+
+    // A moment later the session replaced on day 10 is past a week; the one replaced on day 12
+    // is not.
+    assert!(record.prune_archive(10 * day + ARCHIVED_SESSION_MAX_AGE_MS + 1));
+    assert_eq!(record.previous.len(), 1);
+    assert_eq!(record.previous[0].created_ms, 10 * day);
+
+    assert!(record.prune_archive(12 * day + ARCHIVED_SESSION_MAX_AGE_MS + 1));
+    assert!(record.previous.is_empty());
+    assert!(
+        record.current.is_some(),
+        "the session in use is never pruned"
+    );
+}

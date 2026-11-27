@@ -944,8 +944,9 @@ impl ProfileDocs {
         let doc = self.doc_for(ns).await?;
         let query = Query::single_latest_per_key().key_exact(key).build();
         let entry = match doc.get_one(query).await? {
-            Some(e) => e,
-            None => return Ok(None),
+            // Read like an absent entry: see `docs::MAX_ENTRY_BYTES`.
+            Some(e) if crate::docs::entry_fits(e.content_len()) => e,
+            _ => return Ok(None),
         };
         match self.blobs.blobs().get_bytes(entry.content_hash()).await {
             Ok(b) => Ok(Some(b.to_vec())),
@@ -1085,6 +1086,10 @@ impl ProfileDocs {
                 let entry = entry?;
                 if entry.content_len() == 0 {
                     continue; // a tombstone names no bytes
+                }
+                if !crate::docs::entry_fits(entry.content_len()) {
+                    // Never fetch what we would refuse to read (`MAX_ENTRY_BYTES`).
+                    continue;
                 }
                 if self.blobs.blobs().has(entry.content_hash()).await? {
                     continue;

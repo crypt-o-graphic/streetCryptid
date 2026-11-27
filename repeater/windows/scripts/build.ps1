@@ -168,6 +168,20 @@ try {
                     try { $from.CopyTo($to) } finally { $to.Dispose(); $from.Dispose() }
                 }
             } finally { $bundle.Dispose() }
+            # Its SHA-256 (sha256sum format), which the updater checks the download against before
+            # unpacking anything it will run as LocalSystem (ServiceLayout.ServiceArchiveChecksum).
+            # The workflow publishes everything in this directory, so it lands beside the archive.
+            $serviceHash = (Get-FileHash -LiteralPath $serviceZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText("$serviceZip.sha256",
+                "$serviceHash  StreetCryptid.Repeater.Service-$rid.zip`n", [System.Text.UTF8Encoding]::new($false))
+            # The same for each installer Velopack wrote: website/site/repeater/install.ps1 refuses
+            # to run a Setup.exe whose `<name>.sha256` is missing from the repeater-preview release.
+            Get-ChildItem -LiteralPath (Join-Path $root "artifacts\$rid\releases") -Filter '*-Setup.exe' |
+                ForEach-Object {
+                    $setupHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    [System.IO.File]::WriteAllText("$($_.FullName).sha256",
+                        "$setupHash  $($_.Name)`n", [System.Text.UTF8Encoding]::new($false))
+                }
         } finally { $archive.Dispose() }
     }
 } finally { Pop-Location }

@@ -75,6 +75,19 @@ config:
   relayUrls: []
   #  - https://relay.example.com
 
+  # Resource limits. The control-API PSK ships inside the public app, so every granter is
+  # untrusted, and whoever grants a namespace also chose its writer. Without these one PSK holder
+  # could grow this RAM-only process until it is OOM-killed, which wipes every grant. The content
+  # and record budgets together stay under half of resources.limits.memory; raise them with it.
+  # /healthz reports usage and refusal counts under "limits". Server-side clamps in brackets.
+  limits:
+    maxNamespaces: 2048 # held at once; new grants past it get a 503 [1–1000000]
+    maxEntryKiB: 512 # largest blob carried; the sealed repeater card is ~256 KiB [320–16384]
+    maxKeysPerNamespace: 256 # content-bearing keys per namespace; a phone uses ~10 [16–65536]
+    maxContentMiB: 128 # total ciphertext held; fetches past it wait for retention [8–65536]
+    maxRecordMiB: 64 # total entry records; past it the largest namespace is evicted [8–65536]
+    fetchConcurrency: 8 # content fetches in flight, at most two per namespace [1–64]
+
   # Push wake (optional). Leave IDs empty to keep the waker a no-op; offline catch-up
   # still works via reconciliation. Bearers come from the Secret (secret.apnsBearer / fcmBearer).
   push:

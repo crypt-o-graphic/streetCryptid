@@ -61,6 +61,19 @@ const NONCE_LEN: usize = 12;
 const PUBKEY_LEN: usize = 32;
 const AUTHOR_LEN: usize = 32;
 
+/// How many wraps [`open`] will trial-decrypt when no wrap carries our key id. Each attempt is one
+/// HPKE decapsulation; an unbounded list would let any author who can write an entry we read
+/// make every read cost as many of them as they like. Comfortably above any friend count the app
+/// supports.
+pub const MAX_TRIAL_WRAPS: usize = 64;
+
+/// The most wraps a v3/v4 envelope may carry and still be read.
+///
+/// Matching a wrap against a session can walk up to the acceptance window (2^17 hashes) on each
+/// session a record holds, so the wrap list is the multiplier on the most expensive thing a read
+/// does — and the author alone chooses it. Well above the number of friends the app supports.
+pub const MAX_V3_WRAPS: usize = 256;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("invalid key length")]
@@ -581,6 +594,9 @@ pub fn verify_v3(envelope_bytes: &[u8]) -> Result<VerifiedEnvelope, CryptoError>
         .clone()
         .try_into()
         .map_err(|_| CryptoError::Decode)?;
+    if env.wraps.len() > MAX_V3_WRAPS {
+        return Err(CryptoError::Decode);
+    }
     let vk = VerifyingKey::from_bytes(&author).map_err(|_| CryptoError::BadSignature)?;
     let sig = Signature::from_slice(&env.sig).map_err(|_| CryptoError::BadSignature)?;
     vk.verify_strict(&env.signed, &sig)
@@ -728,6 +744,63 @@ pub fn seal(
     payload: &[u8],
     recipients: &[Vec<u8>],
 ) -> Result<Vec<u8>, CryptoError> {
+    seal_with_kids(
+        signing_seed,
+        author,
+        seq,
+        ts,
+        mesh_epoch,
+        payload,
+        recipients,
+        false,
+    )
+}
+
+/// [`seal`], but every wrap carries a RANDOM key id instead of `blake3(recv_pub)[..8]`.
+///
+/// A v2 kid is the same for a recipient in every envelope from every author, so whoever holds
+/// several authors' namespaces (the stash, a repeater, any friend) can line the kids up and
+/// recover who shares friends with whom. v3 fixed that for location envelopes with per-session
+/// rotating kids; the restart control record is the one thing still sealed v2, to friends'
+/// static receiving keys, so it re-opened the hole. Readers find their wrap by trial decryption
+/// instead ([`open`] falls back to it, bounded by [`MAX_TRIAL_WRAPS`]).
+#[allow(clippy::too_many_arguments)]
+pub fn seal_unlinkable(
+    signing_seed: &[u8],
+    author: &[u8],
+    seq: u64,
+    ts: u64,
+    mesh_epoch: u32,
+    payload: &[u8],
+    recipients: &[Vec<u8>],
+) -> Result<Vec<u8>, CryptoError> {
+    seal_with_kids(
+        signing_seed,
+        author,
+        seq,
+        ts,
+        mesh_epoch,
+        payload,
+        recipients,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_with_kids(
+    signing_seed: &[u8],
+    author: &[u8],
+    seq: u64,
+    ts: u64,
+    mesh_epoch: u32,
+    payload: &[u8],
+    recipients: &[Vec<u8>],
+    random_kids: bool,
+) -> Result<Vec<u8>, CryptoError> {
+    // A reader gives up trial decryption after `MAX_TRIAL_WRAPS`, so a longer list would leave
+    // some recipients unable to find their wrap. Past that, fall back to the stable kids every
+    // reader can find: less private, but never unreadable.
+    let random_kids = random_kids && recipients.len() <= MAX_TRIAL_WRAPS;
     if signing_seed.len() != 32 || author.len() != AUTHOR_LEN {
         return Err(CryptoError::KeyLength);
     }
@@ -773,8 +846,15 @@ pub fn seal(
             &mut OsRng,
         )
         .map_err(|_| CryptoError::Cipher)?;
+        let kid = if random_kids {
+            let mut kid = [0u8; 8];
+            OsRng.fill_bytes(&mut kid);
+            kid
+        } else {
+            recv_kid(recip_pub)
+        };
         wraps.push(Wrap {
-            kid: recv_kid(recip_pub),
+            kid,
             enc: encapped.to_bytes().to_vec(),
             ct: hpke_ct,
         });
@@ -832,26 +912,33 @@ pub fn open(my_recv_secret: &[u8], envelope_bytes: &[u8]) -> Result<Opened, Cryp
         .map_err(|_| CryptoError::KeyLength)?;
     let my_pub = <HpkeKem as hpke::Kem>::sk_to_pk(&sk);
     let my_kid = recv_kid(&my_pub.to_bytes());
-    let wrap = env
-        .wraps
-        .iter()
-        .find(|w| w.kid == my_kid)
-        .ok_or(CryptoError::NotARecipient)?;
-
     let ad = aad(env.v, &env.author, env.seq, env.ts, env.mesh_epoch);
 
     // unwrap the content key with HPKE.
-    let encapped = <HpkeKem as hpke::Kem>::EncappedKey::from_bytes(&wrap.enc)
-        .map_err(|_| CryptoError::Cipher)?;
-    let key = single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
-        &OpModeR::Base,
-        &sk,
-        &encapped,
-        HPKE_INFO,
-        &wrap.ct,
-        &ad,
-    )
-    .map_err(|_| CryptoError::Cipher)?;
+    let unwrap = |wrap: &Wrap| -> Result<Vec<u8>, CryptoError> {
+        let encapped = <HpkeKem as hpke::Kem>::EncappedKey::from_bytes(&wrap.enc)
+            .map_err(|_| CryptoError::Cipher)?;
+        single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
+            &OpModeR::Base,
+            &sk,
+            &encapped,
+            HPKE_INFO,
+            &wrap.ct,
+            &ad,
+        )
+        .map_err(|_| CryptoError::Cipher)
+    };
+    // Our kid first (every envelope from an older sender), then trial decryption for wraps sealed
+    // with random kids (`seal_unlinkable`), bounded so a hostile wrap list costs a fixed amount.
+    let key = match env.wraps.iter().find(|w| w.kid == my_kid) {
+        Some(wrap) => unwrap(wrap)?,
+        None => env
+            .wraps
+            .iter()
+            .take(MAX_TRIAL_WRAPS)
+            .find_map(|wrap| unwrap(wrap).ok())
+            .ok_or(CryptoError::NotARecipient)?,
+    };
 
     // decrypt the payload.
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::KeyLength)?;
@@ -1418,6 +1505,69 @@ mod tests {
 
         let env = seal(&seed, &author, 1, 1000, 0, b"secret", &[b_pk]).unwrap();
         assert!(matches!(open(&d_sk, &env), Err(CryptoError::NotARecipient)));
+    }
+
+    #[test]
+    fn unlinkable_wraps_open_by_trial_and_carry_no_stable_kid() {
+        let (seed, author) = identity();
+        let (b_sk, b_pk) = generate_recv_keypair();
+        let (c_sk, c_pk) = generate_recv_keypair();
+        let (d_sk, _d_pk) = generate_recv_keypair();
+
+        let first = seal_unlinkable(
+            &seed,
+            &author,
+            0,
+            1000,
+            0,
+            b"control",
+            &[b_pk.clone(), c_pk.clone()],
+        )
+        .unwrap();
+        let second = seal_unlinkable(
+            &seed,
+            &author,
+            0,
+            2000,
+            0,
+            b"control",
+            &[b_pk.clone(), c_pk],
+        )
+        .unwrap();
+
+        assert_eq!(open(&b_sk, &first).unwrap().payload.as_slice(), b"control");
+        assert_eq!(open(&c_sk, &first).unwrap().payload.as_slice(), b"control");
+        assert!(matches!(
+            open(&d_sk, &first),
+            Err(CryptoError::NotARecipient)
+        ));
+
+        // No wrap names its recipient, and nothing repeats from one record to the next.
+        let kids = |bytes: &[u8]| -> Vec<[u8; 8]> {
+            let env: Envelope = postcard::from_bytes(bytes).unwrap();
+            env.wraps.iter().map(|w| w.kid).collect()
+        };
+        assert!(!kids(&first).contains(&recv_kid(&b_pk)));
+        assert!(kids(&first).iter().all(|k| !kids(&second).contains(k)));
+    }
+
+    #[test]
+    fn trial_decryption_is_bounded() {
+        let (seed, author) = identity();
+        let mut recipients: Vec<Vec<u8>> = (0..MAX_TRIAL_WRAPS)
+            .map(|_| generate_recv_keypair().1)
+            .collect();
+        let (last_sk, last_pk) = generate_recv_keypair();
+        recipients.push(last_pk.clone());
+        // Past the bound the sealer falls back to stable kids, so the last recipient still opens.
+        let env = seal_unlinkable(&seed, &author, 0, 1000, 0, b"x", &recipients).unwrap();
+        assert_eq!(open(&last_sk, &env).unwrap().payload.as_slice(), b"x");
+        assert!(kids_are_stable(&env, &last_pk));
+
+        fn kids_are_stable(bytes: &[u8], pk: &[u8]) -> bool {
+            let env: Envelope = postcard::from_bytes(bytes).unwrap();
+            env.wraps.iter().any(|w| w.kid == recv_kid(pk))
+        }
     }
 
     #[test]

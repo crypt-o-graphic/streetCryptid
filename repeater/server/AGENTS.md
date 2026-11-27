@@ -58,3 +58,12 @@ release too.
   telemetry ids are 10-hex-char truncations for the same reason.
 - Helm chart in `charts/trail-stash/` (`config.otel.*` values); single replica only — the iroh
   identity cannot be shared between pods.
+- **Every granter is untrusted** (the PSK ships in the public app), so everything a granter
+  controls is bounded by `src/limits.rs` (`config.limits.*` in the chart). Rules that keep the
+  bounds real: the docs engine's downloader stays OFF (`DownloadPolicy::NothingExcept([])`, set
+  before `start_sync`) because it fetches with no size limit; content comes in only through the
+  settle loop, which proves a blob's size (`get_verified_size`) before downloading; content is read
+  into memory only through `bounded_bytes`; a blob added from an HTTP body takes a TEMP tag
+  (awaiting `add_bytes` directly makes a persistent tag the GC never collects); the settle pass
+  never awaits the network (fetches are tasks, `pick_fetches` decides who goes). Request-path
+  telemetry goes through `log_redaction::redact_url_path`.

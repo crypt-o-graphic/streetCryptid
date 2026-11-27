@@ -46,6 +46,15 @@ public static class ServiceLayout
         $"{Repository}/releases/download/windows-v{Uri.EscapeDataString(version.Text)}/{ServiceArchive(rid)}";
 
     /// <summary>
+    /// The archive's SHA-256, <c>sha256sum</c> format, cut beside it by <c>build.ps1 -Package</c>.
+    /// The updater refuses an archive that does not match it.
+    /// </summary>
+    public static string ServiceArchiveChecksum(string rid) => ServiceArchive(rid) + ".sha256";
+
+    public static string ServiceArchiveChecksumUrl(ReleaseVersion version, string rid) =>
+        $"{Repository}/releases/download/windows-v{Uri.EscapeDataString(version.Text)}/{ServiceArchiveChecksum(rid)}";
+
+    /// <summary>
     /// Where the updater unpacks a download. Under Program Files, so only SYSTEM and administrators
     /// can write it: the service's own account must not be able to swap a file between unpacking
     /// and installing, because the next update runs the installed executable as LocalSystem.
@@ -123,11 +132,18 @@ public static class StateMigration
 
     public static bool HasIdentity(string directory) => File.Exists(Path.Combine(directory, IdentityFile));
 
+    /// <summary>
+    /// The staging directory beside <paramref name="destination"/>. A key found in it is swapped
+    /// into place, so the service's installer checks who made it before calling <see cref="Move"/>.
+    /// </summary>
+    public static string StagingFor(string destination) =>
+        destination.TrimEnd(Path.DirectorySeparatorChar) + ".incoming";
+
     /// <summary>Move node state from <paramref name="source"/> into <paramref name="destination"/>.</summary>
     public static ServiceVerbResult Move(string source, string destination)
     {
         Directory.CreateDirectory(destination);
-        string staging = destination.TrimEnd(Path.DirectorySeparatorChar) + ".incoming";
+        string staging = StagingFor(destination);
         // A staging directory holding a key is a complete copy whose swap was interrupted.
         if (Directory.Exists(staging) && HasIdentity(staging))
         {

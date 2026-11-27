@@ -289,6 +289,9 @@ async function openSqliteExplorationDb(): Promise<ExplorationDb | null> {
   }
   try {
     const db = await mod.openDatabaseAsync(DB_NAME);
+    // Per connection, so on every open: every cell is a place the user has been, and a cell
+    // removed by a reset must not linger in a freed page (social/net/persistence.ts says why).
+    await db.execAsync('PRAGMA secure_delete = ON;');
     await db.execAsync(
       `CREATE TABLE IF NOT EXISTS explored (
          cell TEXT PRIMARY KEY NOT NULL,

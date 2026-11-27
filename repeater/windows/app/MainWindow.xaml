@@ -128,7 +128,7 @@
                             <StackPanel Spacing="4">
                                 <ToggleSwitch x:Name="ServiceChoice" Header="Run as a Windows service" IsOn="True" Toggled="SaveDraft" />
                                 <ToggleSwitch x:Name="AwakeChoice" Header="Keep awake on mains power" Toggled="SaveDraft" />
-                                <ToggleSwitch x:Name="DiagnosticsChoice" Header="Send diagnostics" IsOn="True" Toggled="SaveDraft" />
+                                <ToggleSwitch x:Name="DiagnosticsChoice" Header="Send diagnostics" IsOn="False" Toggled="SaveDraft" />
                                 <ToggleSwitch x:Name="UpdatesChoice" Header="Automatic updates" IsOn="True" Toggled="SaveDraft" />
                             </StackPanel>
                             <StackPanel Grid.Column="1" Spacing="4">

@@ -1,5 +1,4 @@
 using System.Reflection;
-using System.Security.AccessControl;
 using System.Security.Principal;
 using StreetCryptid.Repeater.Core;
 
@@ -40,6 +39,15 @@ public static class Program
     {
         bool dispatched = ServiceDispatcher.Run(async (_, stop) =>
         {
+            // The installer made and secured the state directory; refuse to start the host on one
+            // that has since become a link or holds anything owned outside SYSTEM, Administrators
+            // and the service, rather than let it read or write the identity there. The SCM's
+            // recovery retries, and reinstalling sets the directory aside.
+            if (!StateDirectory.IsTrusted(Path.GetDirectoryName(ServiceLayout.ServiceStateDirectory)!,
+                    StateDirectory.ServiceSid(), null, deep: false) ||
+                !StateDirectory.IsTrusted(ServiceLayout.ServiceStateDirectory, StateDirectory.ServiceSid(), null,
+                    deep: true))
+                return (uint)ServiceVerbResult.Failed;
             var hub = new Hub(Version);
             var supervisor = new Supervisor(
                 Path.Combine(AppContext.BaseDirectory, ServiceLayout.HostExecutable),
@@ -91,12 +99,18 @@ internal static class Installer
         Scm.InstallUpdater(ServiceLayout.CommandLine(
             [Path.Combine(install, ServiceLayout.ServiceExecutable), "update"]), owner.Value);
 
-        var service = (SecurityIdentifier)new NTAccount(ServiceLayout.Account).Translate(typeof(SecurityIdentifier));
+        var service = StateDirectory.ServiceSid();
+        using var self = WindowsIdentity.GetCurrent();
         string state = ServiceLayout.ServiceStateDirectory;
-        SecureServiceRoot(Path.GetDirectoryName(state)!, service);
+        SecureServiceRoot(Path.GetDirectoryName(state)!, service, self.User);
+        // Only now, with the root closed to everyone else, are its children judged: anything in
+        // them was made by us or before the root was ours, and the latter is set aside.
+        StateDirectory.SetAsideIfUntrusted(state, service, self.User, deep: true);
+        StateDirectory.SetAsideIfUntrusted(StateMigration.StagingFor(state), service, self.User, deep: true);
         Directory.CreateDirectory(from);
         var moved = StateMigration.Move(from, state);
         if (moved != ServiceVerbResult.Ok) return moved;
+        StateDirectory.Secure(state, service);
         // The per-user host refuses a directory whose identity went to the service.
         File.WriteAllText(Path.Combine(from, ServiceLayout.MovedMarker),
             "This repeater's identity now belongs to the streetCryptid repeater Windows service.\r\n");
@@ -109,6 +123,12 @@ internal static class Installer
         if (!Scm.Stop(StopTimeout, ServiceLayout.UpdaterName)) return ServiceVerbResult.StillRunning;
         if (!Scm.Stop(StopTimeout)) return ServiceVerbResult.StillRunning;
         string state = ServiceLayout.ServiceStateDirectory;
+        // An identity in a directory someone else made may be one they planted (and know the key
+        // of); never hand it to the person as their repeater.
+        using var self = WindowsIdentity.GetCurrent();
+        var service = StateDirectory.ServiceSid();
+        StateDirectory.SetAsideIfUntrusted(state, service, self.User, deep: true);
+        StateDirectory.SetAsideIfUntrusted(StateMigration.StagingFor(state), service, self.User, deep: true);
         if (Directory.Exists(state))
         {
             Directory.CreateDirectory(to);
@@ -200,23 +220,18 @@ internal static class Installer
 
     /// <summary>
     /// ProgramData lets every user create folders, so one could exist before we do — owned by
-    /// whoever made it. Take ownership and replace its DACL: SYSTEM, Administrators and the
-    /// service, nobody else, inherited by everything beneath.
+    /// whoever made it, or a junction to somewhere they can read. Such a root is moved aside
+    /// (<see cref="StateDirectory"/>). A missing one is created WITH its DACL, in one call: created
+    /// and then secured, it would inherit ProgramData's ACL for a moment, and a handle opened in that
+    /// moment keeps its access after the DACL changes. Ours is re-secured as before: SYSTEM,
+    /// Administrators and the service, nobody else, inherited by everything beneath.
     /// </summary>
-    private static void SecureServiceRoot(string root, SecurityIdentifier service)
+    private static void SecureServiceRoot(string root, SecurityIdentifier service, SecurityIdentifier? installer)
     {
-        var directory = Directory.CreateDirectory(root);
-        var administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-        var security = new DirectorySecurity();
-        security.SetOwner(administrators);
-        security.SetAccessRuleProtection(true, false);
-        const InheritanceFlags inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
-        foreach (var sid in new[]
-                 {
-                     new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), administrators, service,
-                 })
-            security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, inherit,
-                PropagationFlags.None, AccessControlType.Allow));
-        directory.SetAccessControl(security);
+        StateDirectory.SetAsideIfUntrusted(root, service, installer, deep: false);
+        var directory = new DirectoryInfo(root);
+        var security = StateDirectory.Security(service);
+        if (directory.Exists) directory.SetAccessControl(security);
+        else directory.Create(security);
     }
 }

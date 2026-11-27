@@ -57,6 +57,8 @@ export class FakeNativeModule {
     setPairingReady: [] as boolean[],
     importProfileTicket: [] as string[],
     importDocTicket: [] as string[],
+    forgetDocTicket: [] as string[],
+    forgetProfileTicket: [] as string[],
     publishIntroduction: 0,
     ingestFix: 0,
     watchReplica: 0,
@@ -281,6 +283,12 @@ export class FakeNativeModule {
     this.calls.forgetSession.push(endpointId);
     if (this.forgetSessionError) throw this.forgetSessionError;
     this.ratchets.delete(endpointId);
+  }
+  async forgetDocTicket(ticket: string) {
+    this.calls.forgetDocTicket.push(ticket);
+  }
+  async forgetProfileTicket(ticket: string) {
+    this.calls.forgetProfileTicket.push(ticket);
   }
   async pollPairEvents() {
     this.calls.pollPairEvents += 1;

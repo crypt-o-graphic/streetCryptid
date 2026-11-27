@@ -514,6 +514,18 @@ impl RatchetState {
     ///
     /// [`accept`]: Self::accept
     pub fn matches(&self, header: &RatchetHeader, kid: &[u8; KID_LEN], window: u32) -> bool {
+        self.matches_within(header, kid, window, &mut WalkBudget::unlimited())
+    }
+
+    /// [`Self::matches`], charging the chain steps it walks (and a flat cost per DH) to `budget`,
+    /// and answering `false` without walking once the budget cannot cover the step count.
+    pub fn matches_within(
+        &self,
+        header: &RatchetHeader,
+        kid: &[u8; KID_LEN],
+        window: u32,
+        budget: &mut WalkBudget,
+    ) -> bool {
         match (self.ckr.as_ref(), self.dh_peer) {
             // The chain we are already on.
             (Some(ckr), Some(peer)) if peer == header.sender_ratchet_pub => {
@@ -522,6 +534,9 @@ impl RatchetState {
                 }
                 let skip = header.counter - self.nr;
                 if skip > window {
+                    return false;
+                }
+                if !budget.spend(u64::from(skip) + 1) {
                     return false;
                 }
                 kid_at(ckr, skip) == *kid
@@ -534,6 +549,9 @@ impl RatchetState {
                 // A DH ratchet resets the receiving counter, so the claimed position is measured
                 // from zero rather than from `nr`.
                 if header.counter > window {
+                    return false;
+                }
+                if !budget.spend(u64::from(header.counter) + 1 + WalkBudget::DH_COST) {
                     return false;
                 }
                 let Ok(dh) = dh_or_err(&self.dh_self, &header.sender_ratchet_pub) else {
@@ -892,6 +910,45 @@ fn derive(context: &str, input: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
 ///
 /// Lookup-only: this derives no message key, so a probe against a wrap that turns out not to be
 /// ours costs nothing but hashing and leaves nothing behind.
+/// What matching wraps against sessions may still spend, in chain steps.
+///
+/// One wrap matched against one session can walk up to the acceptance window (2^17 hashes), and
+/// an author chooses how many wraps, with which counters, their envelope carries. Without a bound
+/// a single paired friend could make every read of their slot cost minutes of CPU on a
+/// single-threaded runtime, under the session lock. A read gets a fixed allowance instead
+/// ([`crate::sessions`] sizes it in windows); an envelope that exhausts it is read as not ours.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkBudget {
+    steps: u64,
+}
+
+impl WalkBudget {
+    /// A DH counted in chain steps: roughly what one X25519 costs next to one hash.
+    pub const DH_COST: u64 = 64;
+
+    pub fn new(steps: u64) -> Self {
+        Self { steps }
+    }
+
+    pub fn unlimited() -> Self {
+        Self { steps: u64::MAX }
+    }
+
+    /// Take `steps`, or nothing (and empty the budget) when they do not fit.
+    fn spend(&mut self, steps: u64) -> bool {
+        if steps > self.steps {
+            self.steps = 0;
+            return false;
+        }
+        self.steps -= steps;
+        true
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.steps == 0
+    }
+}
+
 fn kid_at(ck: &[u8; KEY_LEN], skip: u32) -> [u8; KID_LEN] {
     let mut cur = *ck;
     for _ in 0..skip {

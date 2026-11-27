@@ -64,6 +64,32 @@ pub fn redact_log_line(input: &str) -> String {
     output
 }
 
+/// Length of the `sc.*` join-key form (`telemetry::short_hex`: the first five bytes as hex).
+const SHORT_ID_CHARS: usize = 10;
+
+/// The request path as telemetry may carry it: every segment long enough to be an id
+/// (`/v1/namespaces/{namespace}/content/{hash}`) cut to its first ten characters.
+///
+/// A full namespace id is half of a read capability (the other half is ticket material the app
+/// hands out alongside it), and either id is a stable handle that links one user's requests
+/// across days. Ten hex chars of a namespace are exactly the `sc.namespace` join key the phones
+/// and the rest of the stash's spans use, so a path still joins in Tempo; a segment that is not
+/// plain alphanumerics (it cannot be one of ours) is dropped whole.
+pub fn redact_url_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.len() < 32 {
+                segment
+            } else if segment.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                &segment[..SHORT_ID_CHARS]
+            } else {
+                REDACTED
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn is_network_char(byte: u8) -> bool {
     byte.is_ascii_hexdigit() || matches!(byte, b'.' | b':')
 }
@@ -97,6 +123,27 @@ mod tests {
         assert_eq!(redacted.matches(REDACTED).count(), 2);
         assert!(!redacted.contains("0123456789abcdef"));
         assert!(!redacted.contains("AbCdEfGh"));
+    }
+
+    #[test]
+    fn url_paths_keep_only_the_join_key_of_an_id() {
+        let ns = "0123456789abcdef".repeat(4);
+        let hash = "fedcba9876543210".repeat(4);
+        assert_eq!(
+            redact_url_path(&format!("/v1/namespaces/{ns}/content/{hash}")),
+            "/v1/namespaces/0123456789/content/fedcba9876"
+        );
+        assert_eq!(
+            redact_url_path(&format!("/v1/namespaces/{ns}/subscription")),
+            "/v1/namespaces/0123456789/subscription"
+        );
+        assert_eq!(redact_url_path("/v1/batch"), "/v1/batch");
+        assert_eq!(redact_url_path("/healthz"), "/healthz");
+        let odd = format!("{}%2F{}", "a".repeat(20), "b".repeat(20));
+        assert_eq!(
+            redact_url_path(&format!("/v1/namespaces/{odd}")),
+            format!("/v1/namespaces/{REDACTED}")
+        );
     }
 
     #[test]

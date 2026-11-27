@@ -1,5 +1,10 @@
 import type { ProfileView } from 'iroh-location';
 
+import {
+  MAX_FRIEND_HANDLE_CODE_POINTS,
+  MAX_FRIEND_NAME_CODE_POINTS,
+  sanitizeDisplayText,
+} from './display-text';
 import type { Friend } from './types';
 
 /**
@@ -27,13 +32,18 @@ export function isNewerProfile(friend: Friend, profile: ProfileView): boolean {
  */
 export function mergeProfileIntoFriend(friend: Friend, profile: ProfileView): Friend {
   if (!isNewerProfile(friend, profile)) return friend;
+  // Every received profile passes through here (the pair's Accept, profile events, backfill), so
+  // this is the one place the peer's own text is cleaned before anything stores or draws it.
+  // A name that cleans to nothing counts as no name, like an empty one.
+  const handle = sanitizeDisplayText(profile.handle ?? '', MAX_FRIEND_HANDLE_CODE_POINTS);
+  const cryptidName = sanitizeDisplayText(profile.cryptidName ?? '', MAX_FRIEND_NAME_CODE_POINTS);
   return {
     ...friend,
-    handle: profile.handle || friend.handle,
+    handle: handle || friend.handle,
     sigil: profile.sigil || friend.sigil,
     recvPublic: profile.recvPub || friend.recvPublic,
     profileEpoch: profile.epoch,
-    ...(profile.cryptidName ? { cryptidName: profile.cryptidName } : {}),
+    ...(cryptidName ? { cryptidName } : {}),
     ...(profile.color ? { color: profile.color } : {}),
   };
 }

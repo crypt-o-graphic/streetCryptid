@@ -1159,7 +1159,7 @@ export class LocationSharingService {
   }
 
   /**
-   * Grant the stash replication of our own + every friend's trail namespace (best-effort). The
+   * Grant the stash replication of our own trail and profile namespaces (best-effort). The
    * stash is ciphertext-blind, so this only lets it hold + reconcile sealed envelopes, never read
    * them. A failure just degrades offline delivery to peer-only reconciliation.
    *
@@ -1180,21 +1180,18 @@ export class LocationSharingService {
       await this.mod.grantStash().catch(() => undefined);
       return;
     }
-    const tasks: Promise<void>[] = [];
+    // OUR namespaces only, never a friend's, matching the native grant (REPEATERS.md §2.1).
+    // Whether a trail is on the stash is its owner's choice: granting friends' tickets registered
+    // a friend who had opted out of the stash on behalf of every friend who had it on.
     const swallow = () => {
       /* best-effort */
     };
-    if (this.docTicketStr) {
-      tasks.push(this.stash.registerNamespace({ readTicket: this.docTicketStr }).catch(swallow));
-    }
-    const friendTickets = new Set<string>();
-    for (const friend of Object.values(this.state.friends)) {
-      if (friend.docTicket) friendTickets.add(friend.docTicket);
-    }
-    for (const readTicket of friendTickets) {
-      tasks.push(this.stash.registerNamespace({ readTicket }).catch(swallow));
-    }
-    await Promise.all(tasks);
+    const own = new Set<string>();
+    if (this.docTicketStr) own.add(this.docTicketStr);
+    if (this.profileTicketStr) own.add(this.profileTicketStr);
+    await Promise.all(
+      [...own].map((readTicket) => this.stash.registerNamespace({ readTicket }).catch(swallow))
+    );
   }
 
   /** Whether the native module exists at all (false on web / in Expo Go). */
@@ -2174,6 +2171,9 @@ export class LocationSharingService {
   ): Promise<void> {
     this.rejectedPairSessions.add(sessionId);
     this.handledPairSessions.add(sessionId);
+    // Read before anything below deletes it: these are the tickets `finalize` already imported
+    // into the node's namespace book, whether or not this pair ever reached the pool.
+    const discovered = this.discoveries.get(sessionId);
     const friend = this.state.friends[endpointId];
     if (friend?.pairingSessionId === sessionId) {
       // Native withdrawal erases only this round's ratchet. Endpoint-wide unfriend erasure
@@ -2188,11 +2188,38 @@ export class LocationSharingService {
       });
     }
     this.discoveries.delete(sessionId);
-    if (![...this.discoveries.values()].some((friend) => friend.endpointId === endpointId)) {
+    const stillPending = [...this.discoveries.values()].some(
+      (friend) => friend.endpointId === endpointId
+    );
+    if (!stillPending) {
       this.pendingProfiles.delete(endpointId);
       this.profileBackfill.delete(endpointId);
     }
+    // A pair rejected at the reveal never reached the pool, so `removeFriendLocally` above did not
+    // run and nothing forgot what `finalize` imported: the node would reopen, sync and stash-grant
+    // a rejected person's trail and profile on every start. Forget them here — but only when
+    // nobody else needs them. A peer who is still a friend (an earlier pairing that succeeded)
+    // shares the same namespaces, since a trail namespace is stable per phone, and another pending
+    // discovery of the same peer is imported again by `connectNewFriend` if it is acknowledged.
+    if (discovered && !this.state.friends[endpointId] && !stillPending) {
+      await this.forgetImportedTickets(discovered);
+    }
     this.emit();
+  }
+
+  /** Best-effort: the decision is already made, and a failure only leaves a namespace open. */
+  private async forgetImportedTickets(friend: Friend): Promise<void> {
+    const mod = this.mod;
+    if (!mod) return;
+    const pending: Promise<unknown>[] = [];
+    // Guarded: a phone can be running a binary older than this bundle.
+    if (friend.docTicket && typeof mod.forgetDocTicket === 'function') {
+      pending.push(mod.forgetDocTicket(friend.docTicket).catch(() => undefined));
+    }
+    if (friend.profileTicket && typeof mod.forgetProfileTicket === 'function') {
+      pending.push(mod.forgetProfileTicket(friend.profileTicket).catch(() => undefined));
+    }
+    await Promise.all(pending);
   }
 
   /**
@@ -4033,15 +4060,10 @@ export class LocationSharingService {
       this.state.friends[card.endpointId]?.ticket === card.ticket;
     if (!stillCurrent()) return;
     if (card.docTicket) {
-      await mod.importDocTicket(card.docTicket);
-      // A binary with the native grant has already registered their trail with the stash inside
-      // `importDocTicket`; an older one needs the HTTP fallback. No push token — see
+      // Not granted to the stash from here: a friend's trail is on the stash only if THEY put it
+      // there (REPEATERS.md §2.1), so only our own namespaces are ever granted — see
       // `syncStashGrants`.
-      if (this.stashEnabled() && typeof mod.grantStash !== 'function') {
-        void this.stash.registerNamespace({ readTicket: card.docTicket }).catch(() => {
-          /* best-effort */
-        });
-      }
+      await mod.importDocTicket(card.docTicket);
     }
     if (card.profileTicket) {
       try {

@@ -23,6 +23,9 @@ jest.mock('expo-secure-store', () => ({
     }
     mockSecureStore.store.set(key, value);
   },
+  deleteItemAsync: async (key: string) => {
+    mockSecureStore.store.delete(key);
+  },
 }));
 
 // Fail the SQLite open so persistence.ts falls back to in-memory (see location-sharing.test.ts).
@@ -129,7 +132,7 @@ jest.mock('iroh-location', () => ({
 }));
 
 // eslint-disable-next-line import/first
-import { saveKeys, SECURE_STORE_OPTIONS } from '../secure-keys';
+import { loadKeys, saveKeys, SECURE_STORE_OPTIONS } from '../secure-keys';
 // eslint-disable-next-line import/first
 import { loadSeq, saveSeq, SEQ_RESERVATION_BLOCK, SEQ_RESERVATION_LOW_WATER } from '../state-store';
 // eslint-disable-next-line import/first
@@ -166,6 +169,38 @@ describe('secure-store accessibility class (step 0)', () => {
 
     await expect(loadSeq()).resolves.toBe(41);
     expect(mockSecureStore.store.get('sc.social.seq.v2')).toBe('41');
+  });
+
+  it('deletes the legacy key copies once the migrated ones read back', async () => {
+    mockSecureStore.store.set('sc.iroh.identitySecret', 'legacy-id');
+    mockSecureStore.store.set('sc.iroh.recvSecret', 'legacy-recv');
+
+    await expect(loadKeys()).resolves.toEqual({
+      identitySecret: 'legacy-id',
+      recvSecret: 'legacy-recv',
+    });
+    expect(mockSecureStore.store.get('sc.iroh.identitySecret.v2')).toBe('legacy-id');
+    expect(mockSecureStore.store.get('sc.iroh.recvSecret.v2')).toBe('legacy-recv');
+    // The old items carry the weaker accessibility class; keeping them defeats the migration.
+    expect(mockSecureStore.store.has('sc.iroh.identitySecret')).toBe(false);
+    expect(mockSecureStore.store.has('sc.iroh.recvSecret')).toBe(false);
+  });
+
+  it('keeps the legacy copy when the migrated write fails', async () => {
+    mockSecureStore.store.set('sc.iroh.identitySecret', 'legacy-id');
+    mockSecureStore.failKeys.add('sc.iroh.identitySecret.v2');
+
+    await expect(loadKeys()).rejects.toThrow('secure store write failed');
+    // Deleting first and losing the write would mint a new identity on the next launch.
+    expect(mockSecureStore.store.get('sc.iroh.identitySecret')).toBe('legacy-id');
+  });
+
+  it('removes a legacy copy left behind by an earlier migration', async () => {
+    mockSecureStore.store.set('sc.iroh.identitySecret.v2', 'current-id');
+    mockSecureStore.store.set('sc.iroh.identitySecret', 'stale-id');
+
+    await expect(loadKeys()).resolves.toMatchObject({ identitySecret: 'current-id' });
+    expect(mockSecureStore.store.has('sc.iroh.identitySecret')).toBe(false);
   });
 });
 

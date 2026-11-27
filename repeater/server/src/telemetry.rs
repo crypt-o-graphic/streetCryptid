@@ -19,7 +19,8 @@
 //! Console logging runs every line through [`crate::log_redaction::redact_log_line`]; exported
 //! OTLP log **bodies** pass through the same function via [`RedactingLogProcessor`]. Structured
 //! *attributes* on logs/spans are NOT redacted (the SDK offers no mutable pass over them):
-//! attributes we emit ourselves are short non-identifying hashes by construction, but
+//! attributes we emit ourselves are short non-identifying hashes by construction (the request
+//! path included: `url.path` goes through `log_redaction::redact_url_path`), but
 //! dependencies' fields ship as-is — acceptable only because the OTLP endpoint is a
 //! developer-controlled collector, opted into per deployment, never a hosted log store.
 
@@ -152,11 +153,15 @@ mod imp {
 
     /// Axum middleware: one span per control-API request, parented on the phone's `traceparent`
     /// header when present — this is where an app→stash trace joins into one tree.
+    ///
+    /// `url.path` is redacted to the short join-key form: the raw path carries full namespace ids
+    /// and content hashes (`/v1/namespaces/{id}/content/{hash}`), and attributes are exported
+    /// as-is (see the module docs), so this is the one place they can be cut.
     pub async fn http_request_span(req: Request, next: Next) -> Response {
         let span = tracing::info_span!(
             "http.request",
             http.request.method = %req.method(),
-            url.path = %req.uri().path(),
+            url.path = %crate::log_redaction::redact_url_path(req.uri().path()),
             http.response.status_code = tracing::field::Empty,
         );
         let mut carrier: HashMap<String, String> = HashMap::new();

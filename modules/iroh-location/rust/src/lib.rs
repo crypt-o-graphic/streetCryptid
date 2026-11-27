@@ -1162,9 +1162,14 @@ impl ProfileSink for ProfileEventQueue {
 
 /// What [`LocationNode::grant_stash`] registers.
 enum StashGrant {
-    /// One newly imported friend ticket.
-    One(String),
-    /// Our trail and every friend's; `floored` defers to [`stash::REGRANT_FLOOR_MS`].
+    /// Our trail and profile; `floored` defers to [`stash::REGRANT_FLOOR_MS`].
+    ///
+    /// OURS ONLY. This used to add every friend's trail and profile ticket, and each import
+    /// granted the friend's namespace at once, so a friend who had turned the stash off still had
+    /// their namespaces registered there by every friend who had it on (REPEATERS.md §2.1 says the
+    /// opt-out keeps your trail off the hosted stash). The cost is availability after a stash
+    /// restart: a friend's namespace is back on the stash when THEIR phone next grants (every
+    /// start, and floored on the first upload that reports it untracked), not when ours does.
     All { floored: bool },
 }
 
@@ -1351,7 +1356,6 @@ impl LocationNode {
         };
         let base_url = base_url.to_string();
         let tickets = match scope {
-            StashGrant::One(ticket) => vec![ticket],
             StashGrant::All { floored } => {
                 let now = now_ms();
                 if floored && !stash::regrant_due(self.stash_grant_at.load(Ordering::Relaxed), now)
@@ -1366,7 +1370,6 @@ impl LocationNode {
                         tracing::warn!(error = %err, "stash grant: no ticket for our trail")
                     }
                 }
-                tickets.extend(live.trail.friend_tickets());
                 // Profiles too: sealed, so the stash holds them blind and serves them while their
                 // owners' phones sleep (`profile_seal`).
                 match live.profile.ticket().await {
@@ -1375,7 +1378,6 @@ impl LocationNode {
                         tracing::warn!(error = %err, "stash grant: no ticket for our profile")
                     }
                 }
-                tickets.extend(live.profile.friend_tickets());
                 tickets
             }
         };
@@ -2561,7 +2563,9 @@ impl LocationNode {
         let payload = record
             .encode()
             .ok_or_else(|| LocationError::Decode("encode control record".into()))?;
-        let envelope = crypto::seal(
+        // Random kids: a stable `blake3(recv_pub)` kid per friend would let anyone holding several
+        // authors' namespaces line the records up and recover who shares friends with whom.
+        let envelope = crypto::seal_unlinkable(
             &self.identity_seed,
             &self.author,
             0,
@@ -3070,7 +3074,10 @@ impl LocationNode {
                     .map_err(|e| LocationError::Network(e.to_string()))?;
                 let store = session_store::SessionStore::open(&self.state_dir, &self.identity_seed)
                     .map_err(|e| LocationError::Network(e.to_string()))?;
-                *slot = Some(Arc::new(sessions::SessionManager::new(store, self.author)));
+                *slot = Some(Arc::new(
+                    sessions::SessionManager::new(store, self.author)
+                        .with_request_key(&self.identity_seed),
+                ));
             }
         }
         // The publish counter, claimed in the same breath and under the same rule. It shares the
@@ -3268,7 +3275,11 @@ impl LocationNode {
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
             .accept(iroh_docs::ALPN, docs.clone())
-            .accept(pairing::PAIR_ALPN, PairProtocol::new(self.pair.clone()))
+            .accept(pairing::PAIR_ALPN, {
+                let ble = ble.clone();
+                PairProtocol::new(self.pair.clone())
+                    .with_scan_hint(Arc::new(move |id: &[u8; 32]| ble.has_scan_hint(id)))
+            })
             .spawn();
 
         let trail = Arc::new(
@@ -4221,8 +4232,8 @@ impl LocationNode {
     /// namespace and can recover their missed fixes via [`sync_trail`]. This grants only
     /// replication; reading still requires our per-recipient wrap in each envelope (ARCHITECTURE §6).
     ///
-    /// The namespace is recorded so every later start reopens it, JS or not (see [`ns_book`]), and
-    /// the stash is granted it at once.
+    /// The namespace is recorded so every later start reopens it, JS or not (see [`ns_book`]). It
+    /// is NOT granted to the stash: only its owner decides that (see [`StashGrant`]).
     pub async fn import_doc_ticket(&self, ticket: String) -> Result<(), LocationError> {
         let started = self.live().await?;
         started
@@ -4230,7 +4241,6 @@ impl LocationNode {
             .import_ticket(&ticket)
             .await
             .map_err(|e| LocationError::Network(e.to_string()))?;
-        self.grant_stash(StashGrant::One(ticket), "import").await;
         Ok(())
     }
 
@@ -4319,8 +4329,7 @@ impl LocationNode {
             .map_err(|e| LocationError::Network(e.to_string()))?;
         let sink: Arc<dyn ProfileSink> = Arc::new(self.profile_events.clone());
         profile.watch(ns, sink);
-        // The stash holds it sealed, for when this friend's phone is away.
-        self.grant_stash(StashGrant::One(ticket), "import").await;
+        // Not granted to the stash: the owner's phone grants its own profile (see `StashGrant`).
         Ok(())
     }
 
@@ -5932,8 +5941,7 @@ impl LocationNode {
         fix: LocationFix,
         recipient_endpoints: Vec<String>,
     ) -> Result<Vec<String>, LocationError> {
-        let ts = fix.ts;
-        self.write_ratcheted(seq, Some(fix), ts, recipient_endpoints)
+        self.write_ratcheted(seq, Some(fix), recipient_endpoints)
             .await
     }
 
@@ -5947,10 +5955,9 @@ impl LocationNode {
     pub async fn docs_write_null_ratcheted(
         &self,
         seq: u64,
-        ts: u64,
         watcher_endpoints: Vec<String>,
     ) -> Result<Vec<String>, LocationError> {
-        self.write_ratcheted(seq, None, ts, watcher_endpoints).await
+        self.write_ratcheted(seq, None, watcher_endpoints).await
     }
 
     /// Both lanes. `fix.is_none()` is the null lane, which differs only in carrying an empty padded
@@ -5960,11 +5967,19 @@ impl LocationNode {
         &self,
         seq: u64,
         fix: Option<LocationFix>,
-        ts: u64,
         recipient_endpoints: Vec<String>,
     ) -> Result<Vec<String>, LocationError> {
         use tracing::Instrument;
         let null = fix.is_none();
+        // The envelope header is signed but NOT encrypted: the stash, every holder of our read
+        // ticket and every ex-friend reads it. It used to carry `fix.ts`, the moment the position
+        // was MEASURED, which a heartbeat deliberately leaves frozen — so anyone holding the
+        // namespace could read "has not moved since T" (when we arrived, when we went to sleep)
+        // without opening a wrap, which is exactly what `published_delta_s` inside the ciphertext
+        // exists to keep private. The header now says when the envelope was SEALED, which the
+        // replica's own entry timestamp already discloses. Readers take the position's time from
+        // the decrypted fix; the header `ts` is only AAD and a diagnostic.
+        let ts = now_ms();
         let span = tracing::info_span!(
             "docs.write",
             sc.author = %telemetry::short_hex(&self.author),
@@ -6174,13 +6189,13 @@ impl publish::PublishSink for NodeSink<'_> {
     async fn publish_null(
         &self,
         seq: u64,
-        ts: u64,
+        _fix_ts: u64,
         watchers: Vec<String>,
     ) -> Result<publish::Sealed, publish::PublishError> {
         let total = watchers.len();
         let dropped = self
             .node
-            .docs_write_null_ratcheted(seq, ts, watchers)
+            .docs_write_null_ratcheted(seq, watchers)
             .await
             .map_err(|e| publish::PublishError::Send(e.to_string()))?;
         Ok(sealed_from(total, &dropped))

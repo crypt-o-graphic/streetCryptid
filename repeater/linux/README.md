@@ -95,6 +95,14 @@ The move copies into a staging directory, swaps it into place with the key last,
 deletes the source; an interrupted move is finished by running it again. Two different identities
 are never merged or overwritten: it stops and says so.
 
+Root does the move in directories other accounts control (the person's, and the service account's),
+so it never follows a symbolic link there: each directory is opened component by component with
+`O_NOFOLLOW` and used through its descriptor, files are read and created the same way (new files
+`O_EXCL`, 0600, directories 0700), and every file and directory it touches must belong to root or
+to that side's account (the sudo user's, the service's). A link, or someone else's file, stops the
+move with a message naming it, and the source is left as it was. Only a link root owns, in directories only root
+can write (a distribution's own `/home -> var/home`), is followed.
+
 `sudo streetcryptid-repeater uninstall --system` stops and removes the service and moves the
 identity back to the person who ran sudo (`--move-to DIR` to choose, `--keep-state` to leave it in
 `/var/lib`). The system account is left in place. Running `install` again updates the installed

@@ -95,6 +95,38 @@ describe('repeater installer', () => {
     expect(start).toBeGreaterThan(mark);
   });
 
+  test('the script checks what it downloaded before it starts it', () => {
+    // `irm | iex` runs whatever the release serves; the script must not pass that on blindly.
+    const start = script.lastIndexOf('Start-Process -FilePath $dest');
+    const hash = script.indexOf('Get-FileHash -LiteralPath $dest -Algorithm SHA256');
+    const signature = script.indexOf('Get-AuthenticodeSignature -LiteralPath $dest');
+    expect(hash).toBeGreaterThan(0);
+    expect(signature).toBeGreaterThan(0);
+    expect(start).toBeGreaterThan(hash);
+    expect(start).toBeGreaterThan(signature);
+    expect(script).toContain('"$release/$name.sha256"');
+    expect(script).toContain('"$release/SHA256SUMS"');
+    // Downloads go through the one helper that refuses anything but HTTPS from GitHub.
+    expect(script).not.toContain('Invoke-WebRequest');
+    expect(script).toContain("$final.Scheme -ne 'https'");
+  });
+
+  // As the copy buttons see it: guide.js collapses whitespace.
+  const flat = guide.replace(/\s+/g, ' ');
+
+  test('the guide offers a way to read the script before running it', () => {
+    expect(flat).toContain(
+      'irm https://streetcrypt.id/repeater/install.ps1 -OutFile install.ps1; notepad install.ps1'
+    );
+    expect(flat).toContain('-File .\\install.ps1');
+  });
+
+  test('the Linux tab shows how to verify the signed release', () => {
+    expect(flat).toContain(
+      'gh attestation verify streetcryptid-repeater-*-$(uname -m)-linux.tar.gz --repo unrealJune/streetCryptid'
+    );
+  });
+
   test('the commands on the page run the script this site serves', () => {
     expect(guide).toContain('irm https://streetcrypt.id/repeater/install.ps1 | iex');
     expect(files).toContain('repeater/install.ps1');

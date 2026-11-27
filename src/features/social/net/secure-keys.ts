@@ -31,9 +31,26 @@ export interface PersistedKeys {
   recvSecret: string | null;
 }
 
+/**
+ * Remove a legacy copy. Best-effort: a failure leaves it for the next launch to try again, and
+ * the migrated key is what everything reads either way.
+ */
+async function dropLegacy(legacyKey: string): Promise<void> {
+  try {
+    await SecureStore.deleteItemAsync(legacyKey);
+  } catch {
+    // Retried on the next load.
+  }
+}
+
 async function loadAndMigrate(key: string, legacyKey: string): Promise<string | null> {
   const current = await SecureStore.getItemAsync(key, SECURE_STORE_OPTIONS);
-  if (current !== null) return current;
+  if (current !== null) {
+    // Installs that migrated before legacy copies were deleted still hold one. Deleting a key that
+    // is not there is a no-op, so this is also what finishes a migration interrupted below.
+    await dropLegacy(legacyKey);
+    return current;
+  }
 
   const legacy = await SecureStore.getItemAsync(legacyKey);
   if (legacy === null) return null;
@@ -41,6 +58,12 @@ async function loadAndMigrate(key: string, legacyKey: string): Promise<string | 
   // Expo SecureStore updates only the value of an existing keychain item, not kSecAttrAccessible.
   // Writing under a new key is therefore required to migrate old WHEN_UNLOCKED entries.
   await SecureStore.setItemAsync(key, legacy, SECURE_STORE_OPTIONS);
+  // The legacy item is the identity under the weaker accessibility class (readable whenever the
+  // phone is unlocked, and not `THIS_DEVICE_ONLY`, so it rides an encrypted backup to another
+  // device). It goes only once the new copy reads back identical: deleting first and losing the
+  // write would mint a new identity and orphan every friendship.
+  const readBack = await SecureStore.getItemAsync(key, SECURE_STORE_OPTIONS);
+  if (readBack === legacy) await dropLegacy(legacyKey);
   return legacy;
 }
 

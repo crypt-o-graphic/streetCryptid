@@ -34,6 +34,7 @@ pub mod auth;
 pub mod book;
 pub mod config;
 pub mod content;
+pub mod limits;
 pub mod log_redaction;
 pub mod mls;
 pub mod push;

@@ -76,7 +76,7 @@ impl Party {
     fn boot(&mut self) {
         self.manager = None;
         let store = SessionStore::open(&self.dir, &self.seed).expect("open store");
-        self.manager = Some(SessionManager::new(store, self.id));
+        self.manager = Some(SessionManager::new(store, self.id).with_request_key(&self.seed));
     }
 
     /// The process dies and comes back: everything in memory is gone, the disk is not.
@@ -722,6 +722,58 @@ fn an_answered_request_is_never_answered_twice_even_across_a_process_restart() {
             .restarted,
         0,
         "answered is recorded on disk with the restart"
+    );
+}
+
+#[test]
+fn keyed_request_tags_are_recognised_only_by_the_pair() {
+    use iroh_location::restart::{request_tag, RequestKey};
+    let (leader, follower) = two();
+    let other = Party::new("o", 0x55);
+    let request = iroh_location::session_store::RestartRequest {
+        peer: leader.id,
+        ts: 7,
+        origin_at_request: 0,
+    };
+    let follower_key = RequestKey::from_identity_seed(&follower.seed);
+    let leader_key = RequestKey::from_identity_seed(&leader.seed);
+    let other_key = RequestKey::from_identity_seed(&other.seed);
+    let record = ControlRecord::new_keyed(&follower.id, 1, &[], &[request], &follower_key);
+
+    // Both ends compute the same tag; it is not the public, unkeyed one.
+    assert_eq!(
+        follower_key.tag(&leader.id, &follower.id, &leader.id),
+        leader_key.tag(&leader.id, &follower.id, &follower.id),
+    );
+    assert_ne!(record.requests[0].to, request_tag(&leader.id, &follower.id));
+
+    // The leader finds it; the legacy reader does not; a third friend who knows both ids and
+    // holds its own key cannot recognise it as addressed to the leader (or to itself).
+    assert_eq!(
+        record.request_for_keyed(&leader.id, &follower.id, Some(&leader_key)),
+        Some(7)
+    );
+    assert_eq!(record.request_for(&leader.id, &follower.id), None);
+    assert_eq!(
+        record.request_for_keyed(&other.id, &follower.id, Some(&other_key)),
+        None
+    );
+}
+
+#[test]
+fn a_keyed_leader_still_answers_a_legacy_request() {
+    use iroh_location::restart::RequestKey;
+    let (leader, follower) = two();
+    let request = iroh_location::session_store::RestartRequest {
+        peer: leader.id,
+        ts: 9,
+        origin_at_request: 0,
+    };
+    let legacy = ControlRecord::new(&follower.id, 1, &[], &[request]);
+    let leader_key = RequestKey::from_identity_seed(&leader.seed);
+    assert_eq!(
+        legacy.request_for_keyed(&leader.id, &follower.id, Some(&leader_key)),
+        Some(9)
     );
 }
 

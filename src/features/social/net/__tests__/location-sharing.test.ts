@@ -846,7 +846,7 @@ describe('LocationSharingService — native delivery targets', () => {
     expect(registered).toEqual([]);
   });
 
-  it('still grants over HTTP on a binary without the native grant', async () => {
+  it('still grants our own namespaces over HTTP on a binary without the native grant', async () => {
     mockHolder.stashConfig = {
       baseUrl: 'https://stash.example.com',
       ticket: 'ticket-stash',
@@ -865,7 +865,9 @@ describe('LocationSharingService — native delivery targets', () => {
     await svc.addFriend(friend);
 
     expect(registered).toContain('doc-self');
-    expect(registered).toContain('doc-b');
+    // Never a friend's: whether their trail is on the stash is their choice (REPEATERS.md §2.1),
+    // and granting it here registered friends who had opted out.
+    expect(registered).not.toContain('doc-b');
   });
 
   it('stops naming the stash when the user switches back to peer-only relay', async () => {

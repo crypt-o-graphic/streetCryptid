@@ -71,6 +71,12 @@ function getDb(): Promise<SqliteDb | null> {
     if (!mod) return null;
     try {
       const db = await mod.openDatabaseAsync(DB_NAME);
+      // Per connection, so it is set on every open, and before anything below can delete. Without
+      // it SQLite only marks a deleted row's page free, and a removed friend's last fix, a pruned
+      // own point or a forgotten ticket stays readable in the file (and its WAL) until the page is
+      // reused — the erasure `removeFriend` and FORWARD-SECRECY.md §5.3 promise would be logical
+      // only. Content already freed before this build is not scrubbed by it.
+      await db.execAsync('PRAGMA secure_delete = ON;');
       await db.execAsync(
         `CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS self_trail (

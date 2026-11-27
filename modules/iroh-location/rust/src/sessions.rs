@@ -291,6 +291,13 @@ impl std::fmt::Debug for WrapSet {
 }
 
 /// Every friend's ratchet sessions, and the critical section around them.
+/// How many acceptance windows of chain steps one read may spend matching wraps
+/// ([`crate::ratchet::WalkBudget`]). Our own wrap costs at most one window; the rest is headroom
+/// for other recipients' wraps that sit in a newer epoch than ours and so cannot be ruled out
+/// without a DH and a walk. An envelope that needs more is read as not ours (a miss), which the
+/// restart protocol already heals.
+pub const OPEN_WALK_BUDGET_WINDOWS: u64 = 16;
+
 pub struct SessionManager {
     store: SessionStore,
     /// Our endpoint id: decides our role in each pair and goes into every restart transcript.
@@ -314,6 +321,10 @@ pub struct SessionManager {
     /// survives the very restart most likely to have fixed the problem.
     health: Mutex<HashMap<Vec<u8>, PeerHealth>>,
     desync_threshold: u32,
+    /// Keys restart-request tags so only the pair can recognise them
+    /// ([`crate::restart::RequestKey`]). `None` writes the legacy unkeyed tag; the node always
+    /// sets it, tests that do not care leave it unset.
+    request_key: Option<crate::restart::RequestKey>,
 }
 
 /// Per-peer bookkeeping (§4.6).
@@ -397,6 +408,7 @@ impl SessionManager {
             t_lapse_ms: std::sync::atomic::AtomicU64::new(DEFAULT_T_LAPSE_MS),
             health: Mutex::new(HashMap::new()),
             desync_threshold: DEFAULT_DESYNC_THRESHOLD,
+            request_key: None,
         }
     }
 
@@ -430,6 +442,25 @@ impl SessionManager {
 
     pub fn self_id(&self) -> [u8; 32] {
         self.self_id
+    }
+
+    /// The matching allowance for one read: [`OPEN_WALK_BUDGET_WINDOWS`] acceptance windows.
+    fn walk_budget(&self) -> crate::ratchet::WalkBudget {
+        crate::ratchet::WalkBudget::new(
+            OPEN_WALK_BUDGET_WINDOWS.saturating_mul(u64::from(self.window())),
+        )
+    }
+
+    /// Key restart-request tags with our identity (see [`crate::restart::RequestKey`]).
+    pub fn with_request_key(mut self, identity_seed: &[u8; 32]) -> Self {
+        self.request_key = Some(crate::restart::RequestKey::from_identity_seed(
+            identity_seed,
+        ));
+        self
+    }
+
+    pub fn request_key(&self) -> Option<&crate::restart::RequestKey> {
+        self.request_key.as_ref()
     }
 
     /// Our role in the pair with `peer`.
@@ -638,6 +669,8 @@ impl SessionManager {
             };
             let boot = entry.pending_boot;
             let session_id = entry.state.session_id();
+            // Rides the save below: every publish is also when replaced sessions age out.
+            record.prune_archive(now_ms);
 
             // The counter is spent the moment `next_send` returned. If it cannot be written down,
             // the only safe move is to discard the slot — publishing under state we failed to
@@ -694,13 +727,15 @@ impl SessionManager {
         };
         let locators = verified.locators();
         let mut keys = OsRatchetKeys;
+        let mut budget = self.walk_budget();
 
         // 1. The session in use, then the archive.
         for (index, loc) in locators.iter().enumerate() {
-            let in_use = record
-                .current
-                .as_ref()
-                .is_some_and(|entry| entry.state.matches(&loc.header, &loc.kid, self.window()));
+            let in_use = record.current.as_ref().is_some_and(|entry| {
+                entry
+                    .state
+                    .matches_within(&loc.header, &loc.kid, self.window(), &mut budget)
+            });
             if in_use {
                 let entry = record.current.as_mut().expect("checked above");
                 let key = entry
@@ -728,10 +763,11 @@ impl SessionManager {
                 );
                 return Ok(opened.payload);
             }
-            let archived = record
-                .previous
-                .iter()
-                .position(|entry| entry.state.matches(&loc.header, &loc.kid, self.window()));
+            let archived = record.previous.iter().position(|entry| {
+                entry
+                    .state
+                    .matches_within(&loc.header, &loc.kid, self.window(), &mut budget)
+            });
             if let Some(slot) = archived {
                 let entry = &mut record.previous[slot];
                 let key = entry
@@ -764,7 +800,7 @@ impl SessionManager {
                 };
                 // Another recipient's restart header can name a prekey id that happens to exist
                 // here too; only our own derivation reproduces this wrap's kid.
-                if !state.matches(&loc.header, &loc.kid, self.window()) {
+                if !state.matches_within(&loc.header, &loc.kid, self.window(), &mut budget) {
                     continue;
                 }
                 let key = state.accept(&loc.header, now_ms, self.window(), &mut keys)?;
@@ -829,6 +865,7 @@ impl SessionManager {
         };
         let origin = origin_of(&record);
         let mut keys = OsRatchetKeys;
+        let mut budget = self.walk_budget();
         for loc in verified.locators() {
             let Some(boot) = loc.boot else { continue };
             if boot.ts <= origin && !damaged {
@@ -837,7 +874,7 @@ impl SessionManager {
             let Some(mut state) = self.derive_follower_session(author, &boot, now_ms)? else {
                 continue;
             };
-            if !state.matches(&loc.header, &loc.kid, self.window()) {
+            if !state.matches_within(&loc.header, &loc.kid, self.window(), &mut budget) {
                 continue;
             }
             state.prime(&loc.header, now_ms, self.window(), &mut keys)?;
