@@ -10,8 +10,11 @@ SwiftUI window + menu bar + Sparkle updates ──inherited stdio──▶ share
 ## Install and use
 
 Download a `macos-v*` release's `streetcryptid-repeater-<version>-universal-macos.zip`, expand it,
-move **streetCryptid Repeater.app** into Applications, and open it. Only Developer ID signed,
-notarized builds are published by the release workflow. Never disable Gatekeeper to install it.
+move **streetCryptid Repeater.app** into Applications, and open it. Until the project has a
+Developer ID, releases are ad-hoc signed previews (marked pre-release): macOS refuses the first
+open, so open it once, then choose **Open Anyway** in System Settings → Privacy & Security. Never
+disable Gatekeeper to install it. Its updates are still signed (below), and the first Developer ID
+release updates a preview in place.
 
 Complete setup, choosing launch at login, mains-only keep-awake, diagnostics and automatic updates.
 Nothing registers at login or enables diagnostics/updates until you press **Continue**. Scan the
@@ -90,7 +93,13 @@ smoke job and release signer use that same bundle.
 tag namespace. Shared Rust, icon and font inputs count toward macOS releases too.
 
 The release workflow signs all nested Sparkle executables, the host and app with Developer ID,
-notarizes and staples the app, and signs its ZIP with Sparkle's Ed25519 key. An archive, SHA256SUMS
+notarizes and staples the app, and signs its ZIP with Sparkle's Ed25519 key. While no
+`MACOS_CERTIFICATE_P12` is configured it signs them ad-hoc instead (`MACOS_SIGNING=adhoc`), skips
+notarization and publishes a pre-release. Sparkle accepts an update when its archive carries the
+installed app's Ed25519 signature, whatever the code signature, so the feed stays authenticated
+either way; keep the same Sparkle key when Developer ID arrives and previews update to it. An
+ad-hoc app's code identity changes every build, so macOS may ask again for permissions it granted
+(login item, local network) after an update. An archive, SHA256SUMS
 and full corresponding source are published before updating `macos-updates/appcast.xml`. It never
 uses GitHub's repository-wide "latest" release, which belongs to multiple products.
 Older manually tagged releases do not replace the newest feed.
@@ -114,10 +123,17 @@ Release configuration (use repository/environment secrets, never files in source
 | `MACOS_NOTARY_ISSUER`        | Secret              | API issuer ID                                                |
 
 Signing runs only in the protected `production-release` environment on a disposable runner and
-uses a temporary keychain. Missing credentials fail the release; there is no unsigned fallback.
+uses a temporary keychain. A missing Sparkle key fails the release in both modes, and so do
+partial Developer ID credentials; nothing reaches the feed without an update signature.
+
+Create the Sparkle key once, on a Mac, after `swift package --package-path repeater/macos resolve`:
+`repeater/macos/.build/artifacts/sparkle/Sparkle/bin/generate_keys` stores it in the login keychain
+and prints the public key, and `generate_keys -x sparkle.key` exports the private key for the
+secret. Back it up: an app can only be updated by the key it shipped with.
 For an already-configured local signing machine, `just macos::package <version>` takes
 `MACOS_SIGN_IDENTITY`, `MACOS_NOTARY_PROFILE`, `MACOS_SPARKLE_PUBLIC_KEY` and
-`MACOS_SPARKLE_PRIVATE_KEY_FILE` instead. Build with the same public key first.
+`MACOS_SPARKLE_PRIVATE_KEY_FILE` instead (or `MACOS_SIGNING=adhoc` and the two Sparkle variables).
+Build with the same public key first.
 
 ## Acceptance before distribution
 

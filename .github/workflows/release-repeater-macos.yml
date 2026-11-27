@@ -68,6 +68,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     environment: production-release
+    outputs:
+      signing: ${{ steps.sign.outputs.signing }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
       MACOS_SPARKLE_PUBLIC_KEY: ${{ vars.MACOS_SPARKLE_PUBLIC_KEY }}
@@ -83,7 +85,8 @@ jobs:
           mkdir -p repeater/macos/artifacts/universal
           tar -xzf repeater-macos-unsigned.tar.gz -C repeater/macos/artifacts/universal
           swift package --package-path repeater/macos --force-resolved-versions resolve
-      - name: Sign, notarize and sign the update archive
+      - name: Sign the app (notarize with Developer ID) and its update archive
+        id: sign
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -116,12 +119,23 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.version }}
+          SIGNING: ${{ needs.sign.outputs.signing }}
         run: |
           set -euo pipefail
+          about="Native macOS 13+ repeater for Apple Silicon and Intel. Move the app to Applications, open it and complete setup. Source and SHA256SUMS are included."
+          if [[ "$SIGNING" == developer-id ]]; then
+            notes="$about Signed with Developer ID and notarized."
+            preview=()
+          elif [[ "$SIGNING" == adhoc ]]; then
+            notes="$about Preview: not yet signed with a Developer ID or notarized, so macOS asks you to approve it once (open it, then System Settings > Privacy & Security > Open Anyway). Its automatic updates are signed with the project's update key, and a later Developer ID build updates it in place."
+            preview=(--prerelease)
+          else
+            echo "Unknown signing mode: $SIGNING" >&2
+            exit 1
+          fi
           gh release create "$TAG" dist/*.zip dist/*.tar.gz dist/SHA256SUMS \
-            --target "$GITHUB_SHA" --latest=false \
-            --title "streetCryptid macOS repeater $VERSION" \
-            --notes "Native macOS 13+ repeater for Apple Silicon and Intel. Signed and notarized. Move the app to Applications, open it and complete setup. Source and SHA256SUMS are included."
+            --target "$GITHUB_SHA" --latest=false "${preview[@]}" \
+            --title "streetCryptid macOS repeater $VERSION" --notes "$notes"
           if ! gh release view macos-updates >/dev/null 2>&1; then
             gh release create macos-updates --target "$GITHUB_SHA" --prerelease --latest=false \
               --title "macOS repeater update feed" --notes "Sparkle feed only; downloads are on macos-v releases."

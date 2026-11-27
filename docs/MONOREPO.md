@@ -6,7 +6,8 @@
 Swift package, `just macos::*` recipes, `ci-repeater-macos.yml` lane and `macos-v*` releases.
 It uses the Windows stdio protocol in a login-session menu-bar app; no new Rust workspace member
 or protocol is needed. Shared host changes reach Windows, Linux and macOS. Sparkle updates use
-the separate `macos-updates` feed; release archives must be signed and notarized.
+the separate `macos-updates` feed; every update is EdDSA-signed, and archives are Developer ID
+signed and notarized, or ad-hoc signed pre-releases until a Developer ID is configured.
 See `repeater/macos/README.md` for build, signing and acceptance requirements.
 
 ## Status (2026-11-11): done

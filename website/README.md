@@ -21,8 +21,10 @@ website lane short of the image build.
 
 ## Deploying
 
-The macOS tab links only to `macos-v*` releases: a universal, signed and notarized ZIP for macOS
-13+. It explains Applications installation, login-item approval and the login-session lifetime.
+The macOS tab links only to `macos-v*` releases: a universal ZIP for macOS 13+, signed and
+notarized, or an ad-hoc signed pre-release until the project has a Developer ID (the tab explains
+Open Anyway for those). It explains Applications installation, login-item approval and the
+login-session lifetime.
 It does not link to unsigned CI artifacts or claim a first release is already available.
 
 There is no release to cut. Every push to `main` that touches `website/` runs
