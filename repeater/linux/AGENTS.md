@@ -23,6 +23,14 @@ One Rust binary, `streetcryptid-repeater` (crate `streetcryptid-repeater-linux`)
 - Everything Linux-only is behind `#[cfg(target_os = "linux")]`, so the workspace still checks on
   Windows and macOS.
 
+- Updates (`update.rs`) come from `releases/download/linux-updates/latest.json`, which the
+  release workflow advances only after the `linux-v` release exists, and never backwards. The
+  feed's checksum over HTTPS is the whole trust chain (there is no signature yet), so `update.rs`
+  accepts only the exact asset name and tag the workflow writes, and a staged binary must report
+  the feed's version before it replaces anything. A restart that fails puts the previous binary
+  back. `install` writes the timer and its oneshot unit; the system one is sandboxed to write only
+  the binary's directory, and `test-service.sh` proves that sandbox still allows an update's work.
+
 ## Build and test
 
 Always name the package: `cargo test --profile repeater-test -p streetcryptid-repeater-host -p

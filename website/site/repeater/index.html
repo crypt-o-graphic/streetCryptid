@@ -312,6 +312,12 @@
                     signed in. Add <code>--linger</code> to keep it running after you sign out.
                   </li>
                   <li>
+                    It installs new releases by itself, checked against the release's checksums, and
+                    keeps the same identity and settings. Add
+                    <code>--auto-update off</code> to update by hand with
+                    <code>sudo ./streetcryptid-repeater update --system</code>.
+                  </li>
+                  <li>
                     Run <code>./streetcryptid-repeater settings --keep-awake on</code> so the
                     machine doesn't sleep on mains power. Diagnostics stay off unless you add
                     <code>--telemetry on</code>.

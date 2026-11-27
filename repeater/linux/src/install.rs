@@ -16,8 +16,9 @@
 //!   a per-user daemon can never mint a second identity there (`migrate.rs`). `uninstall --system`
 //!   moves it back.
 //!
-//! Re-running `install` updates the installed binary and restarts the daemon: the Windows app's
-//! **Update service**.
+//! Re-running `install` updates the installed binary and restarts the daemon. It also writes a
+//! timer that runs `update` (`update.rs`) every six hours, the Windows repeater's automatic
+//! updates; `--auto-update off` turns it off, and a later `install` leaves it off.
 
 use std::ffi::{CStr, CString};
 use std::io::IsTerminal;
@@ -30,8 +31,12 @@ use streetcryptid_repeater_host::{HostSettings, Settings, SERVICE_MARKER};
 use crate::migrate::{self, Moved};
 use crate::paths::{self, SERVICE_NAME, SYSTEM_STATE_DIR, SYSTEM_USER};
 
-const SYSTEM_LIB_DIR: &str = "/usr/local/lib/streetcryptid-repeater";
+pub(crate) const SYSTEM_LIB_DIR: &str = "/usr/local/lib/streetcryptid-repeater";
 const SYSTEM_UNIT: &str = "/etc/systemd/system/streetcryptid-repeater.service";
+const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
+/// The oneshot `update` and the timer that runs it (`update.rs`).
+const UPDATE_UNIT: &str = "streetcryptid-repeater-update.service";
+const UPDATE_TIMER: &str = "streetcryptid-repeater-update.timer";
 const POLKIT_RULES_DIR: &str = "/etc/polkit-1/rules.d";
 const POLKIT_RULE: &str = "/etc/polkit-1/rules.d/50-streetcryptid-repeater.rules";
 
@@ -54,7 +59,7 @@ pub fn polkit_rule() -> String {
     .join("\n")
 }
 
-const BINARY: &str = "streetcryptid-repeater";
+pub(crate) const BINARY: &str = "streetcryptid-repeater";
 
 pub struct InstallArgs {
     pub system: bool,
@@ -64,6 +69,8 @@ pub struct InstallArgs {
     pub admin: Option<String>,
     pub telemetry: Option<bool>,
     pub keep_awake: Option<bool>,
+    /// Run `update` on a timer; `None` keeps the earlier choice (on for a first install).
+    pub auto_update: Option<bool>,
     pub no_start: bool,
 }
 
@@ -100,7 +107,7 @@ pub fn lookup_user(name: &str) -> Option<User> {
     }
 }
 
-fn is_root() -> bool {
+pub(crate) fn is_root() -> bool {
     // SAFETY: geteuid cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
@@ -265,6 +272,129 @@ pub fn unit_text(exe: &Path, mode: paths::Mode, state_dir: &Path) -> String {
     }
 }
 
+/// The oneshot the update timer starts: `update` from the installed copy. The system one runs as
+/// root, since it replaces a root-owned binary and restarts the service, but may write nowhere
+/// except the binary's own directory.
+pub fn update_unit_text(exe: &Path, system: bool) -> String {
+    let common = format!(
+        "[Unit]\n\
+         Description=Update the streetCryptid repeater\n\
+         Documentation=https://github.com/unrealJune/streetCryptid/tree/main/repeater/linux\n\
+         Wants=network-online.target\n\
+         After=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={exe} update{flag}\n\
+         TimeoutStartSec=15min\n",
+        exe = exe.display(),
+        flag = if system { " --system" } else { "" },
+    );
+    if !system {
+        return common;
+    }
+    format!(
+        "{common}\
+         NoNewPrivileges=yes\n\
+         ProtectSystem=strict\n\
+         ReadWritePaths={SYSTEM_LIB_DIR}\n\
+         ProtectHome=yes\n\
+         PrivateTmp=yes\n\
+         PrivateDevices=yes\n\
+         ProtectKernelTunables=yes\n\
+         ProtectKernelModules=yes\n\
+         ProtectKernelLogs=yes\n\
+         ProtectControlGroups=yes\n\
+         RestrictSUIDSGID=yes\n\
+         LockPersonality=yes\n"
+    )
+}
+
+/// Fifteen minutes after boot (or after `install`), then every six hours, spread over an hour so
+/// a fleet does not fetch at once. `OnActiveSec`, not `OnBootSec`: a boot-relative point already
+/// past would fire the moment `install` starts the timer.
+pub fn update_timer_text() -> String {
+    "[Unit]\n\
+     Description=Check for a new streetCryptid repeater release\n\
+     \n\
+     [Timer]\n\
+     OnActiveSec=15min\n\
+     OnUnitActiveSec=6h\n\
+     RandomizedDelaySec=1h\n\
+     \n\
+     [Install]\n\
+     WantedBy=timers.target\n"
+        .to_string()
+}
+
+fn is_enabled(user: bool, unit: &str) -> bool {
+    let mut command = Command::new("systemctl");
+    if user {
+        command.arg("--user");
+    }
+    command
+        .args(["is-enabled", "--quiet", unit])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What was asked, else what was chosen before: only a timer someone turned off stays off, and a
+/// first install (or one from before there was a timer) turns it on.
+fn auto_update_choice(
+    asked: Option<bool>,
+    unit_dir: &Path,
+    timer_enabled: impl FnOnce() -> bool,
+) -> bool {
+    asked.unwrap_or_else(|| !unit_dir.join(UPDATE_TIMER).exists() || timer_enabled())
+}
+
+/// The update units are written either way, so the timer can also be turned on with systemctl.
+fn write_update_units(unit_dir: &Path, exe: &Path, system: bool) -> Result<()> {
+    write_file(
+        &unit_dir.join(UPDATE_UNIT),
+        &update_unit_text(exe, system),
+        0o644,
+    )?;
+    write_file(&unit_dir.join(UPDATE_TIMER), &update_timer_text(), 0o644)
+}
+
+/// After `daemon-reload`: turn the timer on or off.
+fn set_auto_update(user: bool, on: bool) -> Result<()> {
+    let (update, install) = if user {
+        ("streetcryptid-repeater update", "install")
+    } else {
+        (
+            "sudo streetcryptid-repeater update --system",
+            "install --system",
+        )
+    };
+    if on {
+        systemctl(user, &["enable", "--now", UPDATE_TIMER])?;
+        println!(
+            "It keeps itself up to date: every six hours it installs a new release if there is \
+             one (`{install} --auto-update off` stops that)."
+        );
+    } else {
+        systemctl(user, &["disable", "--now", UPDATE_TIMER])?;
+        println!("Automatic updates are off; `{update}` installs a new release.");
+    }
+    Ok(())
+}
+
+fn remove_update_units(user: bool, unit_dir: &Path) -> Result<()> {
+    if unit_dir.join(UPDATE_TIMER).exists() {
+        let _ = systemctl(user, &["disable", "--now", UPDATE_TIMER]);
+    }
+    for name in [UPDATE_TIMER, UPDATE_UNIT] {
+        let path = unit_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn require_systemd() -> Result<()> {
     if !Path::new("/run/systemd/system").exists() {
         bail!(
@@ -287,18 +417,20 @@ pub fn install(args: InstallArgs) -> Result<()> {
     }
 }
 
-fn user_unit_path() -> Result<PathBuf> {
+fn user_unit_dir() -> Result<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .context("HOME is not set")?;
-    Ok(config
-        .join("systemd/user")
-        .join(format!("{SERVICE_NAME}.service")))
+    Ok(config.join("systemd/user"))
 }
 
-fn user_lib_dir() -> Result<PathBuf> {
+fn user_unit_path() -> Result<PathBuf> {
+    Ok(user_unit_dir()?.join(format!("{SERVICE_NAME}.service")))
+}
+
+pub(crate) fn user_lib_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".local/lib").join(SERVICE_NAME))
 }
@@ -329,11 +461,16 @@ fn install_user(args: InstallArgs) -> Result<()> {
     let exe = install_binary(&user_lib_dir()?)?;
     migrate::create_private_dir(&state)?;
     apply_settings(&state, args.telemetry, args.keep_awake)?;
+    let unit_dir = user_unit_dir()?;
+    let auto_update = auto_update_choice(args.auto_update, &unit_dir, || {
+        is_enabled(true, UPDATE_TIMER)
+    });
     write_file(
         &user_unit_path()?,
         &unit_text(&exe, paths::Mode::User, &state),
         0o644,
     )?;
+    write_update_units(&unit_dir, &exe, false)?;
     systemctl(true, &["daemon-reload"])?;
     systemctl(true, &["enable", SERVICE_NAME])?;
     if args.linger {
@@ -345,6 +482,7 @@ fn install_user(args: InstallArgs) -> Result<()> {
         "Installed the repeater for this account ({}).",
         exe.display()
     );
+    set_auto_update(true, auto_update)?;
     if args.no_start {
         println!("Start it with `systemctl --user start {SERVICE_NAME}`.");
         return Ok(());
@@ -418,11 +556,15 @@ fn install_system(args: InstallArgs) -> Result<()> {
     apply_settings(&state, args.telemetry, args.keep_awake)?;
     migrate::chown_tree(&state, account.uid, account.gid)?;
 
+    let auto_update = auto_update_choice(args.auto_update, Path::new(SYSTEM_UNIT_DIR), || {
+        is_enabled(false, UPDATE_TIMER)
+    });
     write_file(
         Path::new(SYSTEM_UNIT),
         &unit_text(&exe, paths::Mode::Service, &state),
         0o644,
     )?;
+    write_update_units(Path::new(SYSTEM_UNIT_DIR), &exe, true)?;
     // Only where polkit's JavaScript rules are read (polkit 0.106 and later); older systems keep
     // the setting and report that it is not held.
     if Path::new(POLKIT_RULES_DIR).is_dir() {
@@ -447,6 +589,7 @@ fn install_system(args: InstallArgs) -> Result<()> {
         );
     }
     println!("Installed the machine's repeater ({}).", exe.display());
+    set_auto_update(false, auto_update)?;
     if args.no_start {
         println!("Start it with `sudo systemctl start {SERVICE_NAME}`.");
         return Ok(());
@@ -530,6 +673,7 @@ fn uninstall_user() -> Result<()> {
     if unit.exists() {
         std::fs::remove_file(&unit)?;
     }
+    remove_update_units(true, &user_unit_dir()?)?;
     let _ = systemctl(true, &["daemon-reload"]);
     let lib = user_lib_dir()?;
     if lib.exists() {
@@ -551,6 +695,7 @@ fn uninstall_system(args: UninstallArgs) -> Result<()> {
     if Path::new(SYSTEM_UNIT).exists() {
         std::fs::remove_file(SYSTEM_UNIT)?;
     }
+    remove_update_units(false, Path::new(SYSTEM_UNIT_DIR))?;
     let _ = systemctl(false, &["daemon-reload"]);
     let _ = std::fs::remove_file(POLKIT_RULE);
     if Path::new(SYSTEM_LIB_DIR).exists() {
@@ -635,6 +780,56 @@ mod tests {
         ] {
             assert!(unit.contains(line), "missing {line:?}");
         }
+    }
+
+    #[test]
+    fn the_system_update_runs_the_installed_copy_and_writes_only_its_directory() {
+        let unit = update_unit_text(
+            Path::new("/usr/local/lib/streetcryptid-repeater/streetcryptid-repeater"),
+            true,
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/lib/streetcryptid-repeater/streetcryptid-repeater update --system\n"
+        ));
+        for line in [
+            "Type=oneshot",
+            "After=network-online.target",
+            "ProtectSystem=strict",
+            "ReadWritePaths=/usr/local/lib/streetcryptid-repeater\n",
+            "ProtectHome=yes",
+            "NoNewPrivileges=yes",
+        ] {
+            assert!(unit.contains(line), "missing {line:?}");
+        }
+        assert!(
+            !unit.contains("[Install]"),
+            "the timer starts it, nothing else"
+        );
+
+        let user = update_unit_text(
+            Path::new("/home/a/.local/lib/x/streetcryptid-repeater"),
+            false,
+        );
+        assert!(user.contains("streetcryptid-repeater update\n"));
+        assert!(!user.contains("ProtectSystem"));
+
+        let timer = update_timer_text();
+        assert!(timer.contains("OnActiveSec=15min"));
+        assert!(timer.contains("OnUnitActiveSec=6h"));
+        assert!(!timer.contains("OnBootSec"));
+        assert!(timer.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn auto_update_is_on_unless_someone_turned_it_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let unasked = || panic!("nothing to ask systemd about");
+        assert!(auto_update_choice(None, dir.path(), unasked));
+        assert!(!auto_update_choice(Some(false), dir.path(), unasked));
+        std::fs::write(dir.path().join(UPDATE_TIMER), update_timer_text()).unwrap();
+        assert!(auto_update_choice(None, dir.path(), || true));
+        assert!(!auto_update_choice(None, dir.path(), || false));
+        assert!(auto_update_choice(Some(true), dir.path(), || false));
     }
 
     #[test]

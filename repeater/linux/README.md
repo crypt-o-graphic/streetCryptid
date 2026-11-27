@@ -34,6 +34,8 @@ To keep it running, opt in to the daemon:
 sudo ./streetcryptid-repeater install --system   # for the machine, from boot
 ```
 
+An installed daemon keeps itself up to date (see [Updates](#updates)).
+
 ## Commands
 
 | Command                                               | What it does                                                                              |
@@ -46,8 +48,9 @@ sudo ./streetcryptid-repeater install --system   # for the machine, from boot
 | `name [NAME] [--clear]`                               | Show or set the name phones show for this machine (at most 40 chars).                     |
 | `release --yes`                                       | Hand it back: stop carrying everyone, show a new claim code; same identity.               |
 | `watch`                                               | Every protocol line, as JSON, for scripts.                                                |
-| `install [--system]`                                  | Opt in to the systemd daemon (per user, or the machine's).                                |
+| `install [--system] [--auto-update on/off]`           | Opt in to the systemd daemon (per user, or the machine's).                                |
 | `uninstall [--system]`                                | Stop and remove the daemon; the identity is kept.                                         |
+| `update [--system] [--check]`                         | Install the newest release over the daemon and restart it (`--check`: only say).          |
 
 The management commands find the running repeater by themselves: your own first
 (`$XDG_RUNTIME_DIR/streetcryptid-repeater/control.sock`), then the machine's
@@ -97,14 +100,37 @@ are never merged or overwritten: it stops and says so.
 
 `sudo streetcryptid-repeater uninstall --system` stops and removes the service and moves the
 identity back to the person who ran sudo (`--move-to DIR` to choose, `--keep-state` to leave it in
-`/var/lib`). The system account is left in place. Running `install` again updates the installed
-binary and restarts it — the Windows app's **Update service**.
+`/var/lib`). The system account is left in place. Running a newer binary's `install` again updates
+the installed copy and restarts it.
 
 A per-user `install` writes `~/.config/systemd/user/streetcryptid-repeater.service`, runs a copy in
 `~/.local/lib/streetcryptid-repeater/`, and keeps state where `run` does. Without systemd (a
 container, an init-less box) there is nothing to install into: run `streetcryptid-repeater run`
 under whatever supervises processes there; it stops cleanly on SIGTERM and keeps everything it
 needs in `--state-dir`.
+
+## Updates
+
+`install` also turns on `streetcryptid-repeater-update.timer`, the Windows repeater's automatic
+updates: fifteen minutes after boot and every six hours after that (spread over an hour), it runs
+`streetcryptid-repeater update` (`--system` for the machine's), which:
+
+1. reads `latest.json` from the `linux-updates` release on GitHub, and stops there unless it names a
+   newer version than the installed binary reports;
+2. downloads that version's tarball for this architecture over HTTPS and checks it against the
+   SHA-256 the feed gives (the release's `SHA256SUMS`), then checks the binary inside reports the
+   version it should;
+3. swaps it in atomically beside the old one, restarts the daemon if it was running, and puts the
+   old binary back (and restarts that) if the new one does not start.
+
+The identity, settings and claim are untouched. Only the binary changes; units and the system
+account change when you run a newer binary's `install`. The machine's update runs as root (it
+replaces a root-owned binary and restarts the service) in a sandbox that may write nowhere but
+`/usr/local/lib/streetcryptid-repeater`.
+
+`install --auto-update off` turns the timer off, and later installs leave it off until
+`--auto-update on`. `update` runs one by hand, and `update --check` only says what it would do. A
+binary you run with `run` rather than `install` is never replaced: download the new release.
 
 ## Claiming and members
 

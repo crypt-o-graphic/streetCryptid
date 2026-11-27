@@ -154,3 +154,51 @@ jobs:
           gh release create "$TAG" dist/* "${target[@]}" --prerelease --latest=false \
             --title "streetCryptid Linux repeater $VERSION" \
             --notes "The Linux repeater: one binary for the CLI and the opt-in systemd daemon, for x86_64 and aarch64 (glibc 2.35+), built and tested from $COMMIT. Unpack, then \`./streetcryptid-repeater run\` or \`install\`; see README.md. Check downloads against SHA256SUMS."
+      - name: Advance the update feed
+        # `streetcryptid-repeater update` (and the timer `install` turns on) reads
+        # releases/download/linux-updates/latest.json, checks the tarball against it and installs it.
+        # Only after the release above exists, so the feed never names a file that is not there.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p feed previous
+          python3 - <<'PY'
+          import json, os
+          version, tag = os.environ["VERSION"], os.environ["TAG"]
+          sums = dict(reversed(line.split()) for line in open("dist/SHA256SUMS") if line.strip())
+          assets = {}
+          for arch in ("x86_64", "aarch64"):
+              name = f"streetcryptid-repeater-{version}-{arch}-linux.tar.gz"
+              assets[arch] = {"name": name, "sha256": sums[name]}
+          with open("feed/latest.json", "w") as out:
+              json.dump({"version": version, "tag": tag, "assets": assets}, out, indent=2)
+              out.write("\n")
+          PY
+          cat feed/latest.json
+          if ! gh release view linux-updates >/dev/null 2>&1; then
+            gh release create linux-updates --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Linux repeater update feed" \
+              --notes "The update feed only (latest.json); downloads are on linux-v releases."
+          elif gh release download linux-updates --pattern latest.json --dir previous 2>/dev/null; then
+            # A hand-pushed older tag must never move the update feed backwards.
+            advance="$(python3 - <<'PY'
+          import json, os, re
+          def key(v):
+              core, _, pre = v.partition("-")
+              ids = [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")] if pre else []
+              # A release sorts after every prerelease of the same version.
+              return (tuple(map(int, core.split("."))), not pre, ids)
+          current = json.load(open("previous/latest.json"))["version"]
+          print("yes" if key(os.environ["VERSION"]) > key(current) else "no")
+          PY
+            )"
+            if [[ "$advance" != yes ]]; then
+              echo "Published an older release without changing the update feed."
+              exit 0
+            fi
+          fi
+          gh release upload linux-updates feed/latest.json --clobber
