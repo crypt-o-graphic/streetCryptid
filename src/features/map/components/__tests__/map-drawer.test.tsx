@@ -1,7 +1,8 @@
-import { ScrollView, Text, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
 import { CryptidThemes } from '@/constants/cryptid-theme';
+import { GRIP_HEIGHT, TAB_BAR_HEIGHT } from '../../core/drawer-detents';
 import { MapDrawer } from '../map-drawer';
 
 type PanEvent = { translationY: number; velocityY: number };
@@ -53,11 +54,15 @@ jest.mock('react-native-gesture-handler', () => ({
   },
 }));
 jest.mock('react-native-reanimated', () => {
-  const { View } = jest.requireActual('react-native');
+  const { ScrollView, View } = jest.requireActual('react-native');
   const { useRef } = jest.requireActual('react');
   return {
     __esModule: true,
-    default: { View },
+    default: { ScrollView, View },
+    scrollTo: () => {},
+    useAnimatedRef: () => useRef(null),
+    // The handler object itself, so a test can drive the list's offset through its callbacks.
+    useAnimatedScrollHandler: (handlers: object) => handlers,
     useSharedValue: (value: number) => useRef({ value }).current,
     useAnimatedStyle: (factory: () => object) => factory(),
     useDerivedValue: (factory: () => number) => ({ value: factory() }),
@@ -114,12 +119,11 @@ describe('MapDrawer grip', () => {
     return onDetentChange;
   }
 
-  // A roster taller than the screen owns every drag on its own rows, so the grip is the only way
-  // back down. It must therefore ignore the rule the body follows.
+  // The grip is a plain handle whatever the body is doing: it ignores the rules a list drag follows.
   it('lets the grip collapse fully even from a list that owns its own drags', () => {
     const onDetentChange = render('full', 900);
     act(() => {
-      const grip = mockPans[mockPans.length - 2];
+      const grip = mockPans[mockPans.length - 3];
       grip.start?.();
       grip.update?.({ translationY: 700, velocityY: 0 });
       grip.end?.({ translationY: 700, velocityY: 0 });
@@ -127,7 +131,8 @@ describe('MapDrawer grip', () => {
     expect(onDetentChange).toHaveBeenCalledWith('collapsed');
   });
 
-  it('leaves body drags to a list with somewhere to scroll', () => {
+  // Find My's rule: a pull down past the top of the list shrinks the sheet from where it is.
+  it('shrinks the drawer when a list at its top is pulled down', () => {
     const onDetentChange = render('full', 900);
     act(() => {
       const body = mockPans[mockPans.length - 1];
@@ -135,7 +140,57 @@ describe('MapDrawer grip', () => {
       body.update?.({ translationY: 700, velocityY: 0 });
       body.end?.({ translationY: 700, velocityY: 0 });
     });
+    expect(onDetentChange).toHaveBeenCalledWith('collapsed');
+  });
+
+  it('leaves a downward drag to a list that is scrolled down', () => {
+    const onDetentChange = render('full', 900);
+    act(() => {
+      renderer.root.findByType(ScrollView).props.onScroll.onScroll({
+        contentOffset: { y: 300 },
+        contentSize: { height: 900 },
+        layoutMeasurement: { height: 600 },
+      });
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: 200, velocityY: 0 });
+      body.end?.({ translationY: 200, velocityY: 0 });
+    });
     expect(onDetentChange).not.toHaveBeenCalled();
+  });
+
+  // A scroll that runs into the top stops there; only a fresh drag from the top shrinks.
+  it('does not turn a scroll that reaches the top into a resize', () => {
+    const onDetentChange = render('full', 900);
+    const scroll = (y: number) =>
+      renderer.root.findByType(ScrollView).props.onScroll.onScroll({
+        contentOffset: { y },
+        contentSize: { height: 900 },
+        layoutMeasurement: { height: 600 },
+      });
+    act(() => {
+      scroll(100);
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: 100, velocityY: 0 });
+      scroll(-20);
+      body.update?.({ translationY: 300, velocityY: 0 });
+      body.end?.({ translationY: 300, velocityY: 900 });
+    });
+    expect(onDetentChange).not.toHaveBeenCalled();
+    act(() => {
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: 300, velocityY: 0 });
+      body.end?.({ translationY: 300, velocityY: 900 });
+    });
+    expect(onDetentChange).toHaveBeenCalled();
+  });
+
+  it('expands one stop when the grip is tapped', () => {
+    const onDetentChange = render('collapsed');
+    act(() => renderer.root.findByProps({ accessibilityLabel: 'Panel size' }).props.onPress());
+    expect(onDetentChange).toHaveBeenCalledWith('peek');
   });
 
   it('will not scroll a body that fits the detent it is in', () => {
@@ -145,6 +200,15 @@ describe('MapDrawer grip', () => {
 
   it('scrolls a body that does not fit', () => {
     render('full', 900);
+    expect(renderer.root.findByType(ScrollView).props.scrollEnabled).toBe(true);
+  });
+
+  // The roster reported at full on iPhone: the docked sheet's tab row takes the 34pt bottom inset
+  // back as padding inside the drawer, and a list overflowing by less than that was judged to fit,
+  // so every drag on it resized the panel instead of scrolling.
+  it('scrolls at full a list that overflows only into the docked tab row', () => {
+    const full = 844 - 59 - 16;
+    render('full', full - TAB_BAR_HEIGHT - GRIP_HEIGHT - 10);
     expect(renderer.root.findByType(ScrollView).props.scrollEnabled).toBe(true);
   });
 
@@ -210,12 +274,51 @@ describe('MapDrawer body drags', () => {
     });
   }
 
-  // The bug this rule exists for: the drawer resized the very ScrollView the finger was reading,
-  // so the list overscrolled and a friend's pane swapped to its shorter summary mid-drag.
-  it('leaves a downward drag to a body that still has somewhere to scroll', () => {
+  it('shrinks a scrollable body pulled down from the top of its list', () => {
     const onDetentChange = render({ detent: 'mid', maxDetent: 'mid', bodyHeight: 500 });
     dragBodyDown();
+    expect(onDetentChange).toHaveBeenCalledWith('peek');
+  });
+
+  // The roster reported on iOS: full of friends, resting below its top stop, and not scrolling.
+  it('scrolls a list that does not fit, below the top detent too', () => {
+    render({ detent: 'peek', maxDetent: 'mid', bodyHeight: 500 });
+    expect(renderer.root.findByType(ScrollView).props.scrollEnabled).toBe(true);
+  });
+
+  // Growing is the grip's and the header's job once the body is a list; a drag up reads it.
+  it('never grows the drawer from an upward drag on a list', () => {
+    const onDetentChange = render({ detent: 'peek', maxDetent: 'mid', bodyHeight: 500 });
+    act(() => {
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: -400, velocityY: -2000 });
+      body.end?.({ translationY: -400, velocityY: -2000 });
+    });
     expect(onDetentChange).not.toHaveBeenCalled();
+  });
+
+  it('gives a drag back up only as far as where it started', () => {
+    const onDetentChange = render({ detent: 'mid', maxDetent: 'mid', bodyHeight: 500 });
+    act(() => {
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: 60, velocityY: 0 });
+      body.update?.({ translationY: -300, velocityY: 0 });
+      body.end?.({ translationY: -300, velocityY: -2000 });
+    });
+    expect(onDetentChange).not.toHaveBeenCalled();
+  });
+
+  it('still grows from a body drag when the body has nothing to scroll', () => {
+    const onDetentChange = render({ detent: 'peek', maxDetent: 'mid', bodyHeight: 100 });
+    act(() => {
+      const body = mockPans[mockPans.length - 1];
+      body.start?.();
+      body.update?.({ translationY: -400, velocityY: 0 });
+      body.end?.({ translationY: -400, velocityY: 0 });
+    });
+    expect(onDetentChange).toHaveBeenCalledWith('mid');
   });
 
   it('still closes on a downward drag when the body has nothing to scroll', () => {
@@ -345,6 +448,112 @@ describe('MapDrawer — pinned at collapsed', () => {
       measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height: 92 } } });
     });
     expect(renderer.root.findByType(ScrollView).props.scrollEnabled).toBe(false);
+  });
+});
+
+describe('MapDrawer header', () => {
+  let renderer: ReactTestRenderer;
+  afterEach(() => {
+    act(() => renderer?.unmount());
+    mockPans.length = 0;
+  });
+
+  function render(detent: 'peek' | 'full') {
+    const onDetentChange = jest.fn();
+    act(() => {
+      renderer = create(
+        <MapDrawer
+          activeTab="friends"
+          detent={detent}
+          header={<Text>3 NEARBY</Text>}
+          minDetent="collapsed"
+          maxDetent="full"
+          insetBottom={34}
+          insetTop={59}
+          screenHeight={844}
+          signal="#2f9e6a"
+          theme={CryptidThemes.daybreak}
+          onDetentChange={onDetentChange}
+          onSelectTab={jest.fn()}
+        >
+          <Text>Roster</Text>
+        </MapDrawer>
+      );
+    });
+    act(() => {
+      headerHost(renderer).props.onLayout({ nativeEvent: { layout: { height: 34 } } });
+    });
+    act(() => {
+      measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height: 500 } } });
+    });
+    return onDetentChange;
+  }
+
+  function headerHost(r: ReactTestRenderer) {
+    return r.root.findAll((node) => node.props.testID === 'map-drawer-header')[0];
+  }
+
+  it('expands one stop when tapped', () => {
+    const onDetentChange = render('peek');
+    act(() => {
+      headerHost(renderer)
+        .findAll((node) => node.props.accessible === false && node.props.onPress)[0]
+        .props.onPress();
+    });
+    expect(onDetentChange).toHaveBeenCalledWith('mid');
+  });
+
+  it('floats over the list, which starts below it', () => {
+    render('peek');
+    const content = renderer.root.findByType(ScrollView).props.contentContainerStyle;
+    expect(content).toEqual(expect.arrayContaining([{ paddingTop: 34 }]));
+  });
+
+  // Nothing painted behind the title matches liquid glass, so the list ends AT the header instead
+  // of running under a tinted backdrop: its frame moves down by the header's visible height and the
+  // list moves back up by the same, wherever the quick-return has the header.
+  it('clips the list at the header, and leaves the scroll indicator to the platform', () => {
+    render('full');
+    const list = renderer.root.findByType(ScrollView);
+    expect(list.props.showsVerticalScrollIndicator).not.toBe(false);
+    expect(list.props.scrollIndicatorInsets).toEqual({ top: 34 });
+    const shift = (style: unknown) =>
+      (StyleSheet.flatten(style as object) as { transform?: { translateY: number }[] } | undefined)
+        ?.transform?.[0]?.translateY;
+    const clip = () =>
+      renderer.root.findAll(
+        (node) =>
+          typeof node.type !== 'string' &&
+          shift(node.props.style) !== undefined &&
+          node.findAllByType(ScrollView).length > 0 &&
+          node.props.testID !== 'map-drawer-header'
+      )[0];
+    expect(shift(clip().props.style)).toBe(34);
+    expect(shift(renderer.root.findByType(ScrollView).props.style)).toBe(-34);
+    // Ten pixels in: the header has slid up by ten, and the edge with it.
+    act(() => {
+      list.props.onScroll.onScroll({
+        contentOffset: { y: 10 },
+        contentSize: { height: 900 },
+        layoutMeasurement: { height: 600 },
+      });
+    });
+    act(() => {
+      measuredBody(renderer).props.onLayout({ nativeEvent: { layout: { height: 600 } } });
+    });
+    expect(shift(clip().props.style)).toBe(24);
+    expect(shift(renderer.root.findByType(ScrollView).props.style)).toBe(-24);
+  });
+
+  it('is a handle: dragging it down shrinks the drawer', () => {
+    const onDetentChange = render('full');
+    act(() => {
+      const header = mockPans[mockPans.length - 2];
+      header.start?.();
+      header.update?.({ translationY: 700, velocityY: 0 });
+      header.end?.({ translationY: 700, velocityY: 0 });
+    });
+    expect(onDetentChange).toHaveBeenCalledWith('collapsed');
   });
 });
 
