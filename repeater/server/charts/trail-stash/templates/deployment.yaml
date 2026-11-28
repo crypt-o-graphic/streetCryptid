@@ -43,13 +43,32 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if not .Values.repeater.enabled }}
           ports:
             - name: http
               containerPort: {{ .Values.config.port }}
               protocol: TCP
+          {{- end }}
           env:
+            {{- if .Values.repeater.enabled }}
+            # Repeater mode: the replica, blobs, grant book, roster and (unless the Secret holds
+            # one) the identity live on the volume below. No HTTP control API is served.
+            - name: TRAIL_STASH_DATA_DIR
+              value: {{ .Values.repeater.dataDir | quote }}
+            {{- if .Values.repeater.name }}
+            - name: TRAIL_STASH_NAME
+              value: {{ .Values.repeater.name | quote }}
+            {{- end }}
+            {{- if .Values.repeater.peers }}
+            - name: TRAIL_STASH_PEERS
+              value: {{ join "," .Values.repeater.peers | quote }}
+            {{- end }}
+            - name: TRAIL_STASH_PEER_SYNC_INTERVAL_MIN
+              value: {{ .Values.repeater.peerSyncIntervalMin | quote }}
+            {{- else }}
             - name: PORT
               value: {{ .Values.config.port | quote }}
+            {{- end }}
             - name: TRAIL_STASH_RETENTION_HOURS
               value: {{ .Values.config.retentionHours | quote }}
             - name: TRAIL_STASH_PRUNE_INTERVAL_MIN
@@ -88,6 +107,7 @@ spec:
             {{- end }}
             {{- end }}
             # --- secret material ---
+            {{- if not .Values.repeater.enabled }}
             - name: TRAIL_STASH_SECRET_KEY
               valueFrom:
                 secretKeyRef:
@@ -99,6 +119,16 @@ spec:
                   name: {{ include "trail-stash.secretName" . }}
                   key: {{ .Values.secret.keys.psk }}
                   optional: true
+            {{- else if or .Values.secret.existingSecret .Values.secret.secretKey }}
+            # Optional for a repeater: without it the binary keeps a generated key in
+            # <dataDir>/secret.key, on the volume.
+            - name: TRAIL_STASH_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "trail-stash.secretName" . }}
+                  key: {{ .Values.secret.keys.secretKey }}
+                  optional: true
+            {{- end }}
             {{- if .Values.config.push.apnsBundleId }}
             - name: APNS_BEARER
               valueFrom:
@@ -118,6 +148,7 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if not .Values.repeater.enabled }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -134,15 +165,25 @@ spec:
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             # readOnlyRootFilesystem is on; give the runtime a writable /tmp just in case.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.repeater.enabled }}
+            - name: data
+              mountPath: {{ .Values.repeater.dataDir }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.repeater.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.repeater.persistence.existingClaim | default (printf "%s-data" (include "trail-stash.fullname" .)) }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

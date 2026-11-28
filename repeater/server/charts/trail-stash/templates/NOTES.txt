@@ -1,3 +1,15 @@
+{{- if .Values.repeater.enabled }}
+trail-stash is deploying as a REPEATER, release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+1. Claim it. While unclaimed it prints a claim link (and QR) to its log:
+
+   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "trail-stash.fullname" . }} | grep streetcrypt.id/repeater/claim
+
+   Open the link on the owner's phone (Settings > Repeaters).
+
+2. Its identity and roster live on the PVC {{ .Values.repeater.persistence.existingClaim | default (printf "%s-data" (include "trail-stash.fullname" .)) }}. Deleting it means
+   claiming a new repeater; `helm uninstall` leaves it in place.
+{{- else }}
 trail-stash is deploying as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
 1. Provision the dial ticket to the app out of band as EXPO_PUBLIC_TRAIL_STASH_TICKET. The pod
@@ -25,3 +37,4 @@ trail-stash is deploying as release {{ .Release.Name }} in namespace {{ .Release
 3. Expose the control API to phones over TLS via your own reverse proxy (Caddy/nginx/Traefik)
    pointing at svc/{{ include "trail-stash.fullname" . }}:{{ .Values.service.port }}, or set `ingress.enabled=true`.
    iroh QUIC traffic rides the relay — no inbound UDP required.
+{{- end }}

@@ -116,6 +116,8 @@ jobs:
     uses: ./.github/workflows/ci-repeater-linux.yml
     with:
       version: ${{ needs.version.outputs.version }}
+    secrets:
+      REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
 
   publish:
     name: Publish

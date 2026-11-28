@@ -42,6 +42,35 @@ helm install trail-stash oci://ghcr.io/<owner>/charts/trail-stash \
 - **Never auto-generates the key.** A random key per upgrade would silently rotate the ticket and
   break every client, so a missing key is a hard template error.
 
+## Repeater mode
+
+`repeater.enabled=true` runs the same image as a self-hosted repeater (`docs/social/REPEATERS.md`)
+instead of the hosted stash: `TRAIL_STASH_DATA_DIR` points at a PersistentVolumeClaim, grants arrive
+over `streetcryptid/repeater/1`, and no HTTP is served, so the chart renders no port, Service,
+Ingress, probes or helm test. `secret.*` is optional there: without a key the repeater generates
+one into `<dataDir>/secret.key`, so the **volume is its identity**, and the PVC carries
+`helm.sh/resource-policy: keep` so an uninstall does not take it. A relay token still comes from
+the Secret.
+
+```bash
+helm install trail-repeater oci://ghcr.io/crypt-o-graphic/charts/trail-stash \
+  -n trail-repeater --create-namespace \
+  --set repeater.enabled=true --set repeater.name="Attic Pi"
+kubectl -n trail-repeater logs deploy/trail-repeater-trail-stash | grep streetcrypt.id/repeater/claim
+```
+
+Open the claim link on the owner's phone (Settings > Repeaters). An unclaimed repeater prints a
+fresh one whenever a claim window opens.
+
+| Key                            | Default             | Notes                                                           |
+| ------------------------------ | ------------------- | --------------------------------------------------------------- |
+| `repeater.enabled`             | `false`             | Run as a repeater instead of the hosted stash.                  |
+| `repeater.name`                | `""`                | `TRAIL_STASH_NAME`, shown in the app (40 characters at most).   |
+| `repeater.dataDir`             | `/var/lib/repeater` | Where the volume is mounted.                                    |
+| `repeater.peers`               | `[]`                | Extra sibling endpoint tickets; the roster's own are automatic. |
+| `repeater.peerSyncIntervalMin` | `5`                 | Sibling reconcile cadence.                                      |
+| `repeater.persistence.*`       | `2Gi`, RWO          | `existingClaim`, `storageClass`, `accessMode`, `size`.          |
+
 ## Key values
 
 | Key                                         | Default                                      | Notes                                                                                                                               |

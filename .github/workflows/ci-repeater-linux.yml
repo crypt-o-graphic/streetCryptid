@@ -16,6 +16,10 @@ on:
         type: string
         required: false
         default: ''
+    secrets:
+      REPEATER_RELAY_TOKEN:
+        description: Access key compiled in for every default relay (the phone's EXPO_PUBLIC_IROH_RELAY_TOKEN)
+        required: false
   workflow_dispatch:
 
 permissions:
@@ -74,6 +78,11 @@ jobs:
           -p streetcryptid-repeater-host -p streetcryptid-repeater-linux -- --test-threads=4
 
       - name: cargo build
+        env:
+          # Default relays, used while none are saved locally (repeater/host/README.md). Only this
+          # step sees the key; an unset pair builds a host that uses iroh's public relays.
+          SC_REPEATER_RELAY_URLS: ${{ vars.REPEATER_RELAY_URLS }}
+          SC_REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
         run: cargo build --locked --profile desktop-release -p streetcryptid-repeater-linux
 
       - name: Run the daemon and manage it, unprivileged

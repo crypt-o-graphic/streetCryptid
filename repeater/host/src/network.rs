@@ -74,10 +74,24 @@ impl NetworkConfig {
         Ok(())
     }
 
+    /// The relays to start with: the saved list, else this build's defaults, else `None`
+    /// (iroh's public relays).
     pub fn relay_map(&self) -> Result<Option<RelayMap>> {
+        self.relay_map_or(&built_in_relays())
+    }
+
+    fn relay_map_or(&self, built_in: &[Relay]) -> Result<Option<RelayMap>> {
         self.validate()?;
         if self.relays.is_empty() {
-            return Ok(None);
+            if built_in.is_empty() {
+                return Ok(None);
+            }
+            // Validated like a saved list, so a bad build value fails startup, not silently.
+            let fallback = NetworkConfig {
+                relays: built_in.to_vec(),
+                ..Default::default()
+            };
+            return fallback.relay_map_or(&[]);
         }
         let mut configs = Vec::new();
         for relay in &self.relays {
@@ -101,6 +115,29 @@ impl NetworkConfig {
             Some(&self.telemetry_endpoint)
         }
     }
+}
+
+/// Relays compiled in by a release build (`SC_REPEATER_RELAY_URLS`, comma-separated, and one
+/// `SC_REPEATER_RELAY_TOKEN` for all of them, the same pair a phone build gets as
+/// `EXPO_PUBLIC_IROH_RELAY_*`). Used only while no relays are saved locally.
+fn built_in_relays() -> Vec<Relay> {
+    parse_built_in(
+        option_env!("SC_REPEATER_RELAY_URLS"),
+        option_env!("SC_REPEATER_RELAY_TOKEN"),
+    )
+}
+
+fn parse_built_in(urls: Option<&str>, token: Option<&str>) -> Vec<Relay> {
+    let token = token.map(str::trim).filter(|t| !t.is_empty());
+    urls.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| Relay {
+            url: url.to_owned(),
+            auth_token: token.map(str::to_owned),
+        })
+        .collect()
 }
 
 fn checked_url(value: &str) -> Result<url::Url> {
@@ -239,7 +276,7 @@ mod tests {
         let status = serde_json::to_string(&settings.status()).unwrap();
         assert!(!status.contains("test-secret"));
         assert!(settings.status().restart_required);
-        assert!(settings.active().relay_map().unwrap().is_none());
+        assert!(settings.active().relay_map_or(&[]).unwrap().is_none());
         settings.set(config(None)).unwrap();
         let reopened = NetworkSettings::open(dir.path()).unwrap();
         assert!(!reopened.status().restart_required);
@@ -329,6 +366,36 @@ mod tests {
         renamed.relays[0].url = "https://new.example".into();
         settings.set(renamed).unwrap();
         assert!(!settings.status().relays[0].has_auth_token);
+    }
+
+    #[test]
+    fn built_in_relays_apply_only_while_none_are_saved() {
+        let built_in = parse_built_in(
+            Some(" https://a.example, ,https://b.example "),
+            Some("build-key"),
+        );
+        let map = NetworkConfig::default()
+            .relay_map_or(&built_in)
+            .unwrap()
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&"https://b.example".parse().unwrap())
+                .unwrap()
+                .auth_token
+                .as_deref(),
+            Some("build-key")
+        );
+        let saved = config(None).relay_map_or(&built_in).unwrap().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(saved.get(&"https://a.example".parse().unwrap()).is_none());
+        assert!(NetworkConfig::default()
+            .relay_map_or(&parse_built_in(None, Some("k")))
+            .unwrap()
+            .is_none());
+        assert!(parse_built_in(Some("https://a.example"), Some(" "))[0]
+            .auth_token
+            .is_none());
     }
 
     #[test]

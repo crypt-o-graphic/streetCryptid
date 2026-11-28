@@ -1,0 +1,37 @@
+# Developer tooling, pinned to what CI installs (.github/workflows/copilot-setup-steps.yml).
+# `mise install` once, then `mise run setup`. Rust is NOT managed here: rustup reads
+# rust-toolchain.toml (1.97.0), and the EAS and server builds pin the same version from it.
+
+[tools]
+bun = "1.3.14"
+just = "1.57.0"
+node = "24"           # scripts/*.mjs and Expo's CLI; bun is still the package manager
+"aqua:wasm-bindgen/wasm-pack" = "0.15.0"
+"npm:eas-cli" = "21.0.3"   # EAS_CLI_VERSION in release.yml / pr-development-builds.yml
+"aqua:WebAssembly/binaryen" = "version_117"      # wasm-opt, for `just build-wasm`
+
+[env]
+# macOS 27's `strip` (CLT/Xcode 27.2) leaves proc-macro dylibs dyld refuses to load
+# ("mis-aligned LINKEDIT string pool"), so any build of a `strip = true` profile fails in
+# serde/zeroize. Proc macros and build scripts never ship; the shipped artifacts stay stripped.
+CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_STRIP = "false"
+CARGO_PROFILE_DESKTOP_RELEASE_BUILD_OVERRIDE_STRIP = "false"
+
+[tasks.setup]
+description = "Install the Rust toolchain and targets, then JS dependencies"
+run = [
+  "rustup show active-toolchain || rustup toolchain install",
+  "rustup component add rustfmt",
+  "rustup target add wasm32-unknown-unknown aarch64-apple-darwin x86_64-apple-darwin",
+  "bun install --frozen-lockfile",
+]
+
+[tasks."repeater:macos"]
+description = "Build the macOS repeater for this Mac's architecture and open it"
+# The Command Line Tools lack the SwiftUIMacros plugin `@State` needs on the macOS 27 SDK;
+# use Xcode's toolchain even when `xcode-select` points at the CLT.
+env = { DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer" }
+run = [
+  "just macos::build 0.0.0 $(uname -m)",
+  "open \"repeater/macos/artifacts/$(uname -m)/streetCryptid Repeater.app\"",
+]

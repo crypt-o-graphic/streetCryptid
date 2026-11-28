@@ -6,7 +6,7 @@
 . "$(dirname "$0")/lib.sh"
 Q="$1"; H="${2:-24}"; STEP="${3:-900}"
 NOW=$(date +%s); START=$((NOW - H*3600))
-grafana_curl /api/datasources/proxy/uid/mimir-streetcryptid/api/v1/query_range -G \
+grafana_curl /api/datasources/proxy/uid/prometheus/api/v1/query_range -G \
   --data-urlencode "query=$Q" \
   --data-urlencode "start=$START" \
   --data-urlencode "end=$NOW" \
