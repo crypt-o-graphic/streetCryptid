@@ -169,3 +169,28 @@ affinity: {}
 extraEnv: []
 #  - name: RUST_BACKTRACE
 #    value: "1"
+
+# ---------------------------------------------------------------------------
+# Repeater mode. The same image, run as a self-hosted repeater (docs/social/REPEATERS.md) instead
+# of the hosted stash: it keeps the replica, blobs, grant book and roster on a volume, takes grants
+# over `streetcryptid/repeater/1` from the phones its roster carries, and serves NO HTTP — so the
+# chart drops the port, Service, Ingress, probes and helm test. An unclaimed repeater prints a claim
+# link (and QR) to its log every time a new claim window opens:
+#
+#   kubectl -n <ns> logs deploy/<release> | grep streetcrypt.id
+#
+# Open it on the owner's phone (Settings > Repeaters). Its identity is `secret.secretKey` /
+# existingSecret's key when one is set, otherwise a key it generates once into <dataDir>/secret.key.
+# Either way the volume is what makes it the same repeater after a restart.
+# ---------------------------------------------------------------------------
+repeater:
+  enabled: false
+  name: '' # TRAIL_STASH_NAME — shown in the app wherever the machine is; 40 characters at most
+  dataDir: /var/lib/repeater # TRAIL_STASH_DATA_DIR
+  peers: [] # TRAIL_STASH_PEERS — endpoint tickets of extra siblings (the roster's own are automatic)
+  peerSyncIntervalMin: 5 # TRAIL_STASH_PEER_SYNC_INTERVAL_MIN
+  persistence:
+    existingClaim: '' # use this PVC instead of creating one
+    storageClass: '' # empty ⇒ the cluster default
+    accessMode: ReadWriteOnce
+    size: 2Gi

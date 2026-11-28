@@ -1,3 +1,4 @@
+{{- if not .Values.repeater.enabled }}
 apiVersion: v1
 kind: Pod
 metadata:
@@ -17,3 +18,4 @@ spec:
         - -c
         - |
           wget -q -T 5 -O- "http://{{ include "trail-stash.fullname" . }}:{{ .Values.service.port }}/healthz" && echo " OK"
+{{- end }}

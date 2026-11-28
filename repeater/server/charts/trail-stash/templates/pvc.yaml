@@ -1,0 +1,21 @@
+{{- if and .Values.repeater.enabled (not .Values.repeater.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "trail-stash.fullname" . }}-data
+  labels:
+    {{- include "trail-stash.labels" . | nindent 4 }}
+  annotations:
+    # The volume holds the repeater's identity: lose it and every phone has to claim a new
+    # repeater. Uninstalling the release leaves it behind on purpose.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ .Values.repeater.persistence.accessMode }}
+  {{- with .Values.repeater.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.repeater.persistence.size }}
+{{- end }}
