@@ -5,7 +5,13 @@ Windows, macOS and Linux use this shared host. **Network and collector** in Wind
 the same configuration.
 
 - Set up to eight iroh relay URLs, each with its own optional bearer access key.
-  An empty list restores iroh's public defaults; a nonempty list replaces them.
+  An empty list restores the build's default relays; a nonempty list replaces them.
+  A release build's defaults are compiled in from `SC_REPEATER_RELAY_URLS` (comma-separated) and
+  `SC_REPEATER_RELAY_TOKEN` (one key for all of them), the same pair a phone build gets as
+  `EXPO_PUBLIC_IROH_RELAY_URLS` / `_TOKEN`. CI fills them from the `REPEATER_RELAY_URLS`
+  variable and the `REPEATER_RELAY_TOKEN` secret (macOS so far). A build without them, and every
+  local build, uses iroh's public relays. The compiled-in key is extractable from the binary, as
+  it is from the phone app: it is a limited-scope client token, not an administrator credential.
 - Set an **OTLP HTTP base URL**, for example `https://collector.example/otlp`.
   The exporter appends `/v1/traces` and `/v1/logs`. Blank restores the build's
   `SC_REPEATER_OTEL_ENDPOINT` default (or no collector if there is none).

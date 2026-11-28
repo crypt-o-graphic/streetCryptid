@@ -157,7 +157,7 @@ struct RepeaterView: View {
         if model.configured, model.host.snapshot?.network != nil {
           Section("Network & collector") {
             Text(
-              "No custom relays uses the public defaults. Keys stay on this machine; a blank key keeps the saved one for that URL."
+              "No custom relays uses this build's default relays. Keys stay on this machine; a blank key keeps the saved one for that URL."
             )
             .font(.caption).foregroundStyle(.secondary)
             ForEach($model.relays) { $relay in

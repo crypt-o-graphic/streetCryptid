@@ -63,6 +63,8 @@ jobs:
     uses: ./.github/workflows/ci-repeater-macos.yml
     with:
       version: ${{ needs.version.outputs.version }}
+    secrets:
+      REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
   sign:
     needs: [version, build]
     runs-on: macos-15

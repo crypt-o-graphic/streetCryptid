@@ -105,6 +105,9 @@ Release configuration (use repository/environment secrets, never files in source
 | Name                         | Kind                | Value                                                        |
 | ---------------------------- | ------------------- | ------------------------------------------------------------ |
 | `MACOS_SPARKLE_PUBLIC_KEY`   | Repository variable | Public key printed by Sparkle `generate_keys`                |
+| `REPEATER_OTEL_ENDPOINT`     | Repository variable | Default OTLP collector compiled into the host                |
+| `REPEATER_RELAY_URLS`        | Repository variable | Default relays, comma-separated (phone's relay URL list)     |
+| `REPEATER_RELAY_TOKEN`       | Secret              | Access key for those relays (phone's relay token)            |
 | `MACOS_SPARKLE_PRIVATE_KEY`  | Secret              | Exported Sparkle private key file's contents                 |
 | `MACOS_CERTIFICATE_P12`      | Secret              | Base64 Developer ID Application certificate with private key |
 | `MACOS_CERTIFICATE_PASSWORD` | Secret              | P12 password                                                 |

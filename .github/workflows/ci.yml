@@ -88,6 +88,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.macos == 'true'
     uses: ./.github/workflows/ci-repeater-macos.yml
+    secrets:
+      REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
 
   website:
     name: Website
