@@ -37,6 +37,9 @@ on:
       # metadata. Only a release passes it; every other build stays an unsigned preview.
       sign-params:
         required: false
+      REPEATER_RELAY_TOKEN:
+        description: Access key compiled in for every default relay (the phone's EXPO_PUBLIC_IROH_RELAY_TOKEN)
+        required: false
   workflow_dispatch:
     inputs:
       dev-drive:
@@ -180,6 +183,11 @@ jobs:
 
       - name: Test, publish and package matching native binaries
         working-directory: ${{ env.REPO_DIR }}
+        env:
+          # Default relays, used while none are saved locally (repeater/host/README.md). Only this
+          # step sees the key; an unset pair builds a host that uses iroh's public relays.
+          SC_REPEATER_RELAY_URLS: ${{ vars.REPEATER_RELAY_URLS }}
+          SC_REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
         run: |
           .\repeater\windows\scripts\build.ps1 -Architecture '${{ matrix.arch }}' `
             -Test -Package -Version $env:REPEATER_VERSION -SkipFormat:('${{ matrix.arch }}' -eq 'arm64')

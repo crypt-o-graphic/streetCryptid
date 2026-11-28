@@ -76,12 +76,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.windows == 'true'
     uses: ./.github/workflows/ci-repeater-windows.yml
+    secrets:
+      REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
 
   linux:
     name: Repeater linux
     needs: changes
     if: needs.changes.outputs.linux == 'true'
     uses: ./.github/workflows/ci-repeater-linux.yml
+    secrets:
+      REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
 
   macos:
     name: Repeater macOS

@@ -145,7 +145,7 @@
                         <Expander x:Name="NetworkPanel" Header="Network and collector" HorizontalAlignment="Stretch">
                             <ScrollViewer MaxHeight="320">
                             <StackPanel Spacing="8">
-                                <TextBlock Text="No custom relays uses public defaults. Blank keys keep the saved key for that URL."
+                                <TextBlock Text="No custom relays uses this build's default relays. Blank keys keep the saved key for that URL."
                                            TextWrapping="Wrap" />
                                 <StackPanel x:Name="NetworkRelays" Spacing="12" />
                                 <Button Content="ADD RELAY" Click="AddRelayClicked" />

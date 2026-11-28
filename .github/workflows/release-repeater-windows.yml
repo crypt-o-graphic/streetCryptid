@@ -120,6 +120,7 @@ jobs:
       version: ${{ needs.version.outputs.version }}
     secrets:
       sign-params: ${{ secrets.REPEATER_SIGN_PARAMS }}
+      REPEATER_RELAY_TOKEN: ${{ secrets.REPEATER_RELAY_TOKEN }}
 
   publish:
     name: Publish
